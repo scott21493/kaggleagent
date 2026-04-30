@@ -194,6 +194,13 @@ class ScoreboardStore:
 
         Returns 0/0.0 for every field when there are no experiments yet.
         """
+        # NOTE: This SQL uses LIKE prefix matching ('codex%', 'claude%')
+        # while BudgetGovernor._is_codex/_is_claude (governor.py) uses
+        # substring matching ("codex" in name). For the PR2 stub providers
+        # (stub_codex, stub_claude) both produce identical counts, but a
+        # future provider name like "mock_codex_v2" would be classified
+        # differently by the two paths. PR7's provider-family registry
+        # should unify both call sites — see governor.py TODO(PR7).
         conn = self._require_conn()
         row = conn.execute(
             "SELECT "

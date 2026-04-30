@@ -48,3 +48,27 @@ def test_budget_unknown_action_rejected(fixture_workspace: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["budget", "reset"])
     assert result.exit_code != 0
+
+
+def test_budget_status_with_no_run_yet(fixture_workspace: Path) -> None:
+    """`arena budget status` works before any init-fixture call.
+    Exercises the run_id is None branch, returning all-zero accumulators."""
+    runner = CliRunner()
+    result = runner.invoke(app, ["budget", "status"])
+    assert result.exit_code == 0, result.output
+    assert "provider_calls: 0 / 12" in result.output
+    assert "kill_switch:" in result.output
+
+
+def test_budget_status_shows_kill_switch_active(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the kill switch is active, the snapshot prints kill_switch: ACTIVE."""
+    monkeypatch.delenv(KILL_SWITCH_ENV, raising=False)
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["kill"])
+    result = runner.invoke(app, ["budget", "status"])
+    assert result.exit_code == 0, result.output
+    assert "kill_switch:" in result.output
+    assert "ACTIVE" in result.output
