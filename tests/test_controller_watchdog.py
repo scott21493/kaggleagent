@@ -150,3 +150,21 @@ def test_wrap_invoke_raises_shell_command_breaker_on_misbehaving_provider(
     with pytest.raises(BudgetExceeded) as exc:
         watchdog.wrap_invoke(_MockProvider(shell_commands=100), _packet())
     assert exc.value.breaker is Breaker.SHELL_COMMAND
+
+
+def test_check_can_invoke_kill_switch_wins_over_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When BOTH the kill switch is active AND the budget would block
+    (e.g. 13th call), KillSwitchActive must win — Task 7's CLI catches
+    each exception type differently. Locks in the precedence so a future
+    refactor cannot silently flip them."""
+    monkeypatch.setenv(KILL_SWITCH_ENV, "1")
+    monkeypatch.chdir(tmp_path)
+    governor = BudgetGovernor(
+        Phase0HardCeilings(),
+        accumulators=RunAccumulators(provider_calls=12),
+    )
+    watchdog = Watchdog(governor=governor)
+    with pytest.raises(KillSwitchActive):
+        watchdog.check_can_invoke("stub_codex")

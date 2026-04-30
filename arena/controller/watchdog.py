@@ -52,6 +52,8 @@ class Watchdog:
         per-task and per-run ceilings. Caller should have already called
         check_can_invoke(adapter.name); this method skips the kill-switch
         and pre-invoke checks."""
+        # No re-check of the kill switch here: see PR2 plan §8. PR7 will
+        # add per-event polling for long-running subprocess providers.
         result = adapter.invoke(packet)
         self._governor.record_post_invoke(
             adapter.name,
