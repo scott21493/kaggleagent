@@ -7,11 +7,12 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from arena.budget.governor import BudgetGovernor, RunAccumulators
+from arena.budget.governor import BudgetExceeded, BudgetGovernor, RunAccumulators
 from arena.budget.kill_switch import KillSwitch
 from arena.budget.policy import Phase0HardCeilings
 from arena.controller.planner import create_calibration_task_packet
 from arena.controller.task_queue import TaskQueue
+from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import validate_fixture_manifest
@@ -117,13 +118,50 @@ def plan(slug: str) -> None:
 
 @app.command("run-next")
 def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None:
-    """Pop the next task from the queue, invoke the provider, persist the experiment."""
+    """Pop the next task from the queue, invoke the provider through the
+    watchdog (kill switch + budget governor), persist the experiment.
+
+    Pre-dequeue checks (kill switch + run-level caps) raise without
+    touching the queue, so a blocked invoke leaves the task retryable
+    after `arena unkill --human-confirm` or after the run-level usage
+    drops (won't happen in PR2 since accumulators are persistent within
+    a run, but the structure is forward-compatible).
+    """
     run_id = _latest_run_id()
     if run_id is None:
         raise typer.BadParameter(f"no run for {slug}")
 
     # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the queue.
     adapter = _get_provider(provider)
+
+    # Build the governor seeded with this run's accumulated usage.
+    ceilings = Phase0HardCeilings.from_env()
+    store = _store()
+    totals = store.get_run_usage_totals(slug, run_id)
+    accumulators = RunAccumulators(
+        provider_calls=int(totals["provider_calls"]),
+        codex_calls=int(totals["codex_calls"]),
+        claude_calls=int(totals["claude_calls"]),
+        wall_seconds=float(totals["wall_seconds"]),
+        input_chars=int(totals["input_chars"]),
+        output_chars=int(totals["output_chars"]),
+        waste_events=int(totals["waste_events"]),
+    )
+    governor = BudgetGovernor(ceilings, accumulators=accumulators)
+    watchdog = Watchdog(governor=governor)
+
+    # Pre-dequeue: kill switch + run-level cap check. Block here means the
+    # queue is untouched and the task can be retried.
+    try:
+        watchdog.check_can_invoke(adapter.name)
+    except KillSwitchActive as exc:
+        console.print(f"[red]kill switch active; task left in queue: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except BudgetExceeded as exc:
+        console.print(
+            f"[red]pre-invoke budget block ({exc.breaker.value}); task left in queue: {exc}[/red]"
+        )
+        raise typer.Exit(code=2) from exc
 
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
     packet = queue.dequeue()
@@ -138,7 +176,23 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         )
 
     create_workspace(WORKTREE_ROOT, packet["competition_slug"], packet["experiment_id"])
-    result = adapter.invoke(packet)
+
+    # Post-dequeue: invoke + post-invoke per-task cap check. A breaker here
+    # persists a status=blocked row because the task DID run and consume
+    # budget — there is no clean way to unwind that.
+    try:
+        result = watchdog.wrap_invoke(adapter, packet)
+    except BudgetExceeded as exc:
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=exc.breaker.value,
+            message=str(exc),
+        )
+        console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
 
     results_dir = RUNS_ROOT / run_id / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -146,7 +200,7 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         json.dumps(result.to_dict(), indent=2), encoding="utf-8"
     )
 
-    _store().insert_experiment(
+    store.insert_experiment(
         experiment_id=packet["experiment_id"],
         run_id=run_id,
         competition_slug=packet["competition_slug"],
@@ -160,8 +214,46 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         artifact_paths=result.artifacts,
         trace_path=None,
         created_at=result.finished_at,
+        input_chars=result.usage_proxy["input_chars"],
+        output_chars=result.usage_proxy["output_chars"],
+        wall_seconds=result.usage_proxy["wall_seconds"],
+        shell_commands=result.usage_proxy["shell_commands"],
+        failed_commands=result.usage_proxy["failed_commands"],
+        waste_events=result.usage_proxy["waste_events"],
     )
     console.print(f"[green]ran {packet['task_id']} on {provider}[/green]")
+
+
+def _persist_blocked_experiment(
+    *,
+    store: ScoreboardStore,
+    packet: dict,
+    run_id: str,
+    adapter: ProviderAdapter,
+    breaker_or_reason: str,
+    message: str,
+) -> None:
+    """Persist a status=blocked experiment row carrying the breaker name as
+    the first artifact path entry. Only called when the watchdog raises
+    AFTER dequeue (post-invoke cap violation). PR4's event log will
+    replace this with a structured event when it lands."""
+    now = datetime.now(UTC).isoformat(timespec="seconds")
+    artifact_paths = [f"<blocked:{breaker_or_reason}>", f"<message:{message[:200]}>"]
+    store.insert_experiment(
+        experiment_id=packet["experiment_id"],
+        run_id=run_id,
+        competition_slug=packet["competition_slug"],
+        task_id=packet["task_id"],
+        experiment_type="calibration",
+        provider=adapter.name,
+        provider_version=adapter.version,
+        status="blocked",
+        metric_name="roc_auc",
+        valid_submission=None,
+        artifact_paths=artifact_paths,
+        trace_path=None,
+        created_at=now,
+    )
 
 
 @app.command("evaluate")

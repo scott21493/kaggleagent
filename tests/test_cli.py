@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from arena.cli import app
@@ -133,3 +135,108 @@ def test_run_next_with_unknown_provider_does_not_dequeue(fixture_workspace):
 
     # Queue still has the original task (not dequeued by the failed CLI invocation).
     assert len(list(queue_dir.glob("*.json"))) == 1
+
+
+def test_run_next_trips_shell_command_breaker_on_misbehaving_provider(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion #1: a misbehaving stub provider that emits 100
+    shell command events trips ShellCommandBreaker; run halts with status=blocked.
+
+    We don't have a misbehaving real provider, so monkeypatch StubCodexProvider
+    to return shell_commands=100 in its usage_proxy.
+    """
+    from datetime import UTC, datetime
+
+    from arena.cli import app
+    from arena.providers.base import ProviderResult
+    from arena.providers.parser import build_result
+    from arena.providers.stub_codex import StubCodexProvider
+    from arena.scoreboard.store import ScoreboardStore
+
+    original_invoke = StubCodexProvider.invoke
+
+    def misbehaving_invoke(self: StubCodexProvider, task_packet: dict) -> ProviderResult:
+        result = original_invoke(self, task_packet)
+        # Mutate the usage_proxy to simulate a runaway provider.
+        # Frozen dataclass — rebuild via build_result.
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        return build_result(
+            task_id=result.task_id,
+            provider=result.provider,
+            provider_version=result.provider_version,
+            status=result.status,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
+            artifacts=result.artifacts,
+            input_chars=result.usage_proxy["input_chars"],
+            output_chars=result.usage_proxy["output_chars"],
+            wall_seconds=result.usage_proxy["wall_seconds"],
+            shell_commands=100,  # exceeds 35 ceiling
+            failed_commands=result.usage_proxy["failed_commands"],
+            waste_events=result.usage_proxy["waste_events"],
+            started_at=result.started_at,
+            finished_at=now,
+        )
+
+    monkeypatch.setattr(StubCodexProvider, "invoke", misbehaving_invoke)
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    result = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert result.exit_code != 0
+    assert "ShellCommandBreaker" in result.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    exp = store.get_latest_experiment("tabular_binary_v1")
+    assert exp is not None
+    assert exp["status"] == "blocked"
+    assert "<blocked:ShellCommandBreaker>" in exp["artifact_paths"]
+    store.close()
+
+
+def test_run_next_halted_by_kill_switch_leaves_task_retryable(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion #2: kill switch active before run-next halts
+    the task without dequeueing. After unkill --human-confirm, retrying
+    run-next succeeds. No status=blocked experiment is persisted because
+    the task never started."""
+    from arena.budget.kill_switch import KILL_SWITCH_ENV, KillSwitch
+    from arena.cli import app
+    from arena.scoreboard.store import ScoreboardStore
+
+    monkeypatch.delenv(KILL_SWITCH_ENV, raising=False)
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+
+    runs = sorted((fixture_workspace / "runs").iterdir())
+    queue_dir = runs[0] / "queue"
+    assert len(list(queue_dir.glob("*.json"))) == 1, "task not enqueued by plan"
+
+    KillSwitch.activate()
+    blocked = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert blocked.exit_code != 0
+    assert "kill switch" in blocked.output.lower()
+    # Queue still has the task — pre-dequeue check fired.
+    assert len(list(queue_dir.glob("*.json"))) == 1, (
+        "kill-switched run must NOT dequeue; task left in queue"
+    )
+
+    # Unkill and retry succeeds.
+    runner.invoke(app, ["unkill", "--human-confirm"])
+    success = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert success.exit_code == 0, success.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    exp = store.get_latest_experiment("tabular_binary_v1")
+    assert exp is not None
+    # The retry's experiment is "completed", and there is no <blocked:KillSwitch>
+    # row from the first attempt because it never dequeued.
+    assert exp["status"] == "completed"
+    store.close()
