@@ -141,13 +141,13 @@ from __future__ import annotations
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schemas"
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_schema(name: str) -> dict:
     """Load `<name>.schema.json` from the repo's top-level schemas/ directory.
 
@@ -234,14 +234,14 @@ Expected: `ImportError: cannot import name 'validate'`.
 # arena/schemas/validate.py
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 from jsonschema import Draft202012Validator
 
 from arena.schemas.loader import load_schema
 
 
-@lru_cache(maxsize=None)
+@cache
 def _validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(load_schema(name))
 
