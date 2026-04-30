@@ -29,7 +29,7 @@ class TaskQueue:
         if not files:
             return None
         path = files[0]
-        packet = json.loads(path.read_text(encoding="utf-8"))
+        packet: dict = json.loads(path.read_text(encoding="utf-8"))
         path.unlink()
         return packet
 

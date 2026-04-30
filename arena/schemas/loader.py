@@ -23,4 +23,5 @@ def load_schema(name: str) -> dict:
     if not _NAME_RE.fullmatch(name):
         raise ValueError(f"invalid schema name: {name!r}; must match {_NAME_RE.pattern}")
     path = SCHEMA_DIR / f"{name}.schema.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    schema: dict = json.loads(path.read_text(encoding="utf-8"))
+    return schema
