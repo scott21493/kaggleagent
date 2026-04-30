@@ -118,13 +118,23 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     run_id = _latest_run_id()
     if run_id is None:
         raise typer.BadParameter(f"no run for {slug}")
+
+    # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the queue.
+    adapter = _get_provider(provider)
+
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
     packet = queue.dequeue()
     if packet is None:
         raise typer.BadParameter(f"queue is empty for {run_id}")
 
+    if packet["provider"] != adapter.name:
+        raise typer.BadParameter(
+            f"packet provider {packet['provider']!r} does not match --provider "
+            f"{adapter.name!r}; task {packet['task_id']} was dequeued — run "
+            f"`arena plan {slug}` to recover"
+        )
+
     create_workspace(WORKTREE_ROOT, packet["competition_slug"], packet["experiment_id"])
-    adapter = _get_provider(provider)
     result = adapter.invoke(packet)
 
     results_dir = RUNS_ROOT / run_id / "results"

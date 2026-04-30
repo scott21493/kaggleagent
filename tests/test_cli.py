@@ -108,3 +108,28 @@ def test_evaluate_updates_score(fixture_workspace):
     # sklearn's roc_auc_score with all-equal scores is exactly 0.5.
     assert exp["score"] == 0.5
     assert exp["valid_submission"] == 1
+
+
+def test_run_next_with_unknown_provider_does_not_dequeue(fixture_workspace):
+    """Validating --provider before dequeue prevents queue corruption on typo."""
+    from typer.testing import CliRunner
+
+    from arena.cli import app
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+
+    # Confirm queue has the single task before run-next is attempted.
+    runs = sorted((fixture_workspace / "runs").iterdir())
+    queue_dir = runs[0] / "queue"
+    assert len(list(queue_dir.glob("*.json"))) == 1
+
+    # A bad --provider must fail without dequeueing.
+    result = runner.invoke(
+        app, ["run-next", "tabular_binary_v1", "--provider", "definitely_not_a_provider"]
+    )
+    assert result.exit_code != 0
+
+    # Queue still has the original task (not dequeued by the failed CLI invocation).
+    assert len(list(queue_dir.glob("*.json"))) == 1
