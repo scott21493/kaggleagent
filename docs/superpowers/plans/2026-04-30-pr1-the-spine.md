@@ -33,7 +33,7 @@ If PR0 has not landed, the agent must complete it first or this plan's coverage 
 | `arena/schemas/loader.py` | Load JSON schemas from disk, cache |
 | `arena/schemas/validate.py` | Validate dicts against named schemas, cache validators |
 | `arena/scoreboard/store.py` | SQLite store: applies migrations, inserts/updates runs and experiments |
-| `arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql` | Adds the 14 missing experiment fields from design-v2 §7 |
+| `arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql` | Adds the 15 missing experiment fields from design-v2 §7 |
 | `arena/controller/__init__.py` | Package marker |
 | `arena/controller/state.py` | Phase enum + transitions table + `transition()` helper |
 | `arena/controller/task_queue.py` | File-backed FIFO task queue with schema validation |
@@ -537,7 +537,7 @@ git add arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql ar
 git commit -m "$(cat <<'EOF'
 feat(scoreboard): SQLite store with migration 0002 (design-v2 §7 fields)
 
-Adds the 14 missing experiment fields (competition_slug, task_id,
+Adds the 15 missing experiment fields (competition_slug, task_id,
 provider, provider_version, valid_submission, wall_seconds, input/output
 chars, shell/failed commands, waste events, artifact_paths, trace_path,
 created_at, experiment_type) via an explicit ALTER TABLE migration.
