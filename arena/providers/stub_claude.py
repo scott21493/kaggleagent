@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+from arena.providers.base import ProviderAdapter, ProviderResult
+from arena.providers.parser import build_result
+from arena.schemas.validate import validate
+
+_VERSION = "stub_claude.v1"
+
+
+class StubClaudeProvider(ProviderAdapter):
+    """Deterministic stand-in for Claude during Phase 0 CI and local stub runs.
+
+    PR1 lands the skeleton only — invoke() validates the packet, writes empty
+    scrubbed stdout/stderr trace files into the workspace, and returns a
+    schema-valid ProviderResult with no artifacts. PR5 extends invoke() to
+    emit paper_digest.json / fusion_proposal.json; PR6 extends it for
+    review.json.
+    """
+
+    def __init__(self, workspace_root: str | Path) -> None:
+        self._workspace_root = Path(workspace_root)
+
+    @property
+    def name(self) -> str:
+        return "stub_claude"
+
+    @property
+    def version(self) -> str:
+        return _VERSION
+
+    def invoke(self, task_packet: dict) -> ProviderResult:
+        validate("task_packet", task_packet)
+        slug = task_packet["competition_slug"]
+        exp_id = task_packet["experiment_id"]
+        if exp_id is None:
+            raise ValueError("StubClaudeProvider requires task_packet.experiment_id to be set")
+        task_id = task_packet["task_id"]
+
+        workspace = self._workspace_root / slug / exp_id
+        workspace.mkdir(parents=True, exist_ok=True)
+        stdout_path = workspace / f"{task_id}.stub_claude.stdout.scrubbed"
+        stderr_path = workspace / f"{task_id}.stub_claude.stderr.scrubbed"
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text("", encoding="utf-8")
+
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        return build_result(
+            task_id=task_id,
+            provider=self.name,
+            provider_version=self.version,
+            status="success",
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            artifacts=[],
+            input_chars=0,
+            output_chars=0,
+            wall_seconds=0.0,
+            shell_commands=0,
+            failed_commands=0,
+            waste_events=0,
+            started_at=now,
+            finished_at=now,
+        )

@@ -33,7 +33,7 @@ If PR0 has not landed, the agent must complete it first or this plan's coverage 
 | `arena/schemas/loader.py` | Load JSON schemas from disk, cache |
 | `arena/schemas/validate.py` | Validate dicts against named schemas, cache validators |
 | `arena/scoreboard/store.py` | SQLite store: applies migrations, inserts/updates runs and experiments |
-| `arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql` | Adds the 14 missing experiment fields from design-v2 §7 |
+| `arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql` | Adds the 15 missing experiment fields from design-v2 §7 |
 | `arena/controller/__init__.py` | Package marker |
 | `arena/controller/state.py` | Phase enum + transitions table + `transition()` helper |
 | `arena/controller/task_queue.py` | File-backed FIFO task queue with schema validation |
@@ -141,13 +141,13 @@ from __future__ import annotations
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 SCHEMA_DIR = Path(__file__).resolve().parents[2] / "schemas"
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_schema(name: str) -> dict:
     """Load `<name>.schema.json` from the repo's top-level schemas/ directory.
 
@@ -234,14 +234,14 @@ Expected: `ImportError: cannot import name 'validate'`.
 # arena/schemas/validate.py
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 
 from jsonschema import Draft202012Validator
 
 from arena.schemas.loader import load_schema
 
 
-@lru_cache(maxsize=None)
+@cache
 def _validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(load_schema(name))
 
@@ -537,7 +537,7 @@ git add arena/scoreboard/migrations/0002_extend_experiments_for_design_v2.sql ar
 git commit -m "$(cat <<'EOF'
 feat(scoreboard): SQLite store with migration 0002 (design-v2 §7 fields)
 
-Adds the 14 missing experiment fields (competition_slug, task_id,
+Adds the 15 missing experiment fields (competition_slug, task_id,
 provider, provider_version, valid_submission, wall_seconds, input/output
 chars, shell/failed commands, waste events, artifact_paths, trace_path,
 created_at, experiment_type) via an explicit ALTER TABLE migration.
@@ -610,10 +610,11 @@ from __future__ import annotations
 # arena/controller/state.py
 from __future__ import annotations
 
-from enum import Enum
+import itertools
+from enum import StrEnum
 
 
-class Phase(str, Enum):
+class Phase(StrEnum):
     NEW = "NEW"
     FIXTURE_INITIALIZED = "FIXTURE_INITIALIZED"
     PLAN_CREATED = "PLAN_CREATED"
@@ -678,7 +679,7 @@ _FORWARD = [
 
 ALLOWED_TRANSITIONS: dict[Phase, set[Phase]] = {}
 
-for src, dst in zip(_FORWARD, _FORWARD[1:], strict=False):
+for src, dst in itertools.pairwise(_FORWARD):
     # Each forward step is allowed; from any forward step you can also enter a BLOCKED_* state.
     ALLOWED_TRANSITIONS.setdefault(src, set()).add(dst)
     for blocked in _BLOCKED:
