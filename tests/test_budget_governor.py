@@ -146,3 +146,32 @@ def test_status_snapshot_reports_accumulators_and_ceilings() -> None:
     assert snap["codex_calls"] == {"used": 2, "ceiling": 6}
     assert snap["claude_calls"] == {"used": 1, "ceiling": 6}
     assert snap["input_chars"] == {"used": 1000, "ceiling": 900_000}
+
+
+def test_record_post_invoke_raises_on_waste_events_per_task() -> None:
+    g = BudgetGovernor(Phase0HardCeilings())  # waste_events_per_task=3
+    g.check_pre_invoke("stub_codex")
+    with pytest.raises(BudgetExceeded) as exc:
+        g.record_post_invoke(
+            "stub_codex",
+            _usage(waste_events=10),  # > 3
+            task_id="task_0001",
+        )
+    assert exc.value.breaker is Breaker.WASTE_EVENT
+    assert "task_0001" in str(exc.value)
+
+
+def test_record_post_invoke_raises_on_output_chars_total() -> None:
+    g = BudgetGovernor(
+        Phase0HardCeilings(),
+        accumulators=RunAccumulators(output_chars=240_000),
+    )
+    g.check_pre_invoke("stub_codex")
+    with pytest.raises(BudgetExceeded) as exc:
+        g.record_post_invoke(
+            "stub_codex",
+            _usage(output_chars=20_000),  # 240k + 20k > 250k total
+            task_id="task_0001",
+        )
+    # Same coarse-proxy mapping as input_chars: PROVIDER_CALL.
+    assert exc.value.breaker is Breaker.PROVIDER_CALL

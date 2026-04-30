@@ -28,6 +28,10 @@ class RunAccumulators:
     output_chars: int = 0
 
 
+# TODO(PR7): switch to exact-match or a provider-family registry once
+# real Codex/Claude adapters land. Substring matching is acceptable for
+# PR2 (only stub_codex and stub_claude exist and partition cleanly), but
+# a name like "claude_codex_hybrid" would match both helpers.
 def _is_codex(provider_name: str) -> bool:
     return "codex" in provider_name
 
@@ -44,6 +48,14 @@ class BudgetGovernor:
     task_id)` updates accumulators with the returned UsageProxy and raises
     if any per-task or per-run cap is now exceeded.
 
+    Ordering semantics in record_post_invoke:
+      - Per-task caps raise BEFORE accumulators update. The failing
+        invoke is excluded from run totals — the run can recover or be
+        diagnosed without polluted numbers.
+      - Per-run caps raise AFTER accumulators update. The failing invoke
+        IS included in the cumulative totals — the error message reflects
+        accurate run-level usage.
+
     The governor is per-process. The CLI passes in starting accumulators
     (typically summed from the scoreboard) so persistent counts survive
     across `arena run-next` invocations within one run.
@@ -59,6 +71,14 @@ class BudgetGovernor:
 
     @property
     def accumulators(self) -> RunAccumulators:
+        """Return the live RunAccumulators instance (not a copy).
+
+        Treat as read-only. Mutating the returned object directly will
+        corrupt governor state and bypass cap checks. PR2 callers (the
+        Watchdog and the budget-status CLI) only read this value; PR4
+        may need a snapshot/copy mechanism if event observers want to
+        peek without affecting state.
+        """
         return self._accum
 
     def check_pre_invoke(self, provider_name: str) -> None:
