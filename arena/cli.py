@@ -6,6 +6,8 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from arena.controller.planner import create_calibration_task_packet
+from arena.controller.task_queue import TaskQueue
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import validate_fixture_manifest
 from arena.providers.base import ProviderAdapter
@@ -80,3 +82,22 @@ def init_fixture(slug: str) -> None:
     started_at = datetime.now(UTC).isoformat(timespec="seconds")
     _store().insert_run(run_id=run_id, started_at=started_at, status="initialized")
     console.print(f"[green]initialized {run_id}[/green]")
+
+
+@app.command("plan")
+def plan(slug: str) -> None:
+    """Create a calibration task packet for the latest run."""
+    run_id = _latest_run_id_for(slug)
+    if run_id is None:
+        raise typer.BadParameter(f"no initialized run for {slug}; run init-fixture first")
+    queue = TaskQueue(RUNS_ROOT / run_id / "queue")
+    if queue.size() > 0:
+        raise typer.BadParameter(f"queue is non-empty for {run_id}")
+    packet = create_calibration_task_packet(
+        competition_slug=slug,
+        task_id="task_0001",
+        experiment_id="exp_0001",
+        provider="stub_codex",
+    )
+    queue.enqueue(packet)
+    console.print(f"[green]planned task_0001 for {run_id}[/green]")
