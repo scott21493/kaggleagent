@@ -8,11 +8,19 @@ from arena.providers.base import UsageProxy
 
 
 class BudgetExceeded(Exception):
-    """Raised when a hard ceiling is exceeded. Carries the breaker that fired."""
+    """Raised when a hard ceiling is exceeded. Carries the breaker that fired
+    and (when available) the UsageProxy snapshot from the offending invoke,
+    so callers can persist accurate usage on a blocked row."""
 
-    def __init__(self, breaker: Breaker, message: str) -> None:
+    def __init__(
+        self,
+        breaker: Breaker,
+        message: str,
+        usage_proxy: UsageProxy | None = None,
+    ) -> None:
         super().__init__(message)
         self.breaker = breaker
+        self.usage_proxy = usage_proxy
 
 
 @dataclass
@@ -119,12 +127,14 @@ class BudgetGovernor:
                 Breaker.WALL_CLOCK,
                 f"task {task_id} ran {usage['wall_seconds']:.1f}s on {provider_name!r} "
                 f"(per-call ceiling {per_call_seconds}s)",
+                usage_proxy=usage,
             )
         if usage["shell_commands"] > self._ceilings.shell_commands_per_task:
             raise BudgetExceeded(
                 Breaker.SHELL_COMMAND,
                 f"task {task_id} emitted {usage['shell_commands']} shell commands "
                 f"(ceiling {self._ceilings.shell_commands_per_task})",
+                usage_proxy=usage,
             )
         if usage["failed_commands"] > self._ceilings.failed_commands_per_task:
             raise BudgetExceeded(
@@ -132,12 +142,14 @@ class BudgetGovernor:
                 f"task {task_id} accumulated {usage['failed_commands']} failed "
                 f"commands (ceiling {self._ceilings.failed_commands_per_task}); "
                 f"breaker matches WasteDetector.check_task_caps",
+                usage_proxy=usage,
             )
         if usage["waste_events"] > self._ceilings.waste_events_per_task:
             raise BudgetExceeded(
                 Breaker.WASTE_EVENT,
                 f"task {task_id} emitted {usage['waste_events']} waste events "
                 f"(ceiling {self._ceilings.waste_events_per_task})",
+                usage_proxy=usage,
             )
 
         # Update accumulators.
@@ -158,12 +170,14 @@ class BudgetGovernor:
                 Breaker.WALL_CLOCK,
                 f"run wall clock {self._accum.wall_seconds:.1f}s exceeded ceiling "
                 f"{run_wall_seconds_cap}s after task {task_id}",
+                usage_proxy=usage,
             )
         if self._accum.waste_events > self._ceilings.waste_events_per_run:
             raise BudgetExceeded(
                 Breaker.WASTE_EVENT,
                 f"run waste events {self._accum.waste_events} exceeded ceiling "
                 f"{self._ceilings.waste_events_per_run} after task {task_id}",
+                usage_proxy=usage,
             )
         if self._accum.input_chars > self._ceilings.input_chars_total:
             # No dedicated input-chars breaker; map to PROVIDER_CALL as coarse proxy.
@@ -171,12 +185,14 @@ class BudgetGovernor:
                 Breaker.PROVIDER_CALL,
                 f"run input chars {self._accum.input_chars} exceeded ceiling "
                 f"{self._ceilings.input_chars_total} after task {task_id}",
+                usage_proxy=usage,
             )
         if self._accum.output_chars > self._ceilings.output_chars_total:
             raise BudgetExceeded(
                 Breaker.PROVIDER_CALL,
                 f"run output chars {self._accum.output_chars} exceeded ceiling "
                 f"{self._ceilings.output_chars_total} after task {task_id}",
+                usage_proxy=usage,
             )
 
     def status(self) -> dict:

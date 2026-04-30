@@ -274,3 +274,64 @@ def test_run_next_with_valid_but_wrong_provider_leaves_task_in_queue(
     # Retry with the correct provider succeeds.
     success = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
     assert success.exit_code == 0, success.output
+
+
+def test_run_next_post_invoke_block_persists_usage_that_tripped_it(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When wrap_invoke raises BudgetExceeded, the blocked experiment
+    row must record the actual usage_proxy fields (not zeros) so that a
+    subsequent `arena budget status` reflects the consumed budget.
+
+    Regression for the P1 bug where blocked rows were persisted with
+    default 0 usage, causing budget status to underreport."""
+    from datetime import UTC, datetime
+
+    from arena.cli import app
+    from arena.providers.base import ProviderResult
+    from arena.providers.parser import build_result
+    from arena.providers.stub_codex import StubCodexProvider
+    from arena.scoreboard.store import ScoreboardStore
+
+    original_invoke = StubCodexProvider.invoke
+
+    def runaway_input_chars(self: StubCodexProvider, task_packet: dict) -> ProviderResult:
+        result = original_invoke(self, task_packet)
+        now = datetime.now(UTC).isoformat(timespec="seconds")
+        return build_result(
+            task_id=result.task_id,
+            provider=result.provider,
+            provider_version=result.provider_version,
+            status=result.status,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
+            artifacts=result.artifacts,
+            input_chars=950_000,  # exceeds per-run input_chars_total=900_000
+            output_chars=result.usage_proxy["output_chars"],
+            wall_seconds=result.usage_proxy["wall_seconds"],
+            shell_commands=result.usage_proxy["shell_commands"],
+            failed_commands=result.usage_proxy["failed_commands"],
+            waste_events=result.usage_proxy["waste_events"],
+            started_at=result.started_at,
+            finished_at=now,
+        )
+
+    monkeypatch.setattr(StubCodexProvider, "invoke", runaway_input_chars)
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    result = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert result.exit_code != 0
+    assert "ProviderCallBreaker" in result.output  # input_chars overflow maps to PROVIDER_CALL
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    exp = store.get_latest_experiment("tabular_binary_v1")
+    assert exp is not None
+    assert exp["status"] == "blocked"
+    # Critical assertion: the blocked row carries the offending usage,
+    # not default zeros.
+    assert exp["input_chars"] == 950_000
+    store.close()

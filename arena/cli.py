@@ -16,7 +16,7 @@ from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import validate_fixture_manifest
-from arena.providers.base import ProviderAdapter
+from arena.providers.base import ProviderAdapter, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
 from arena.scoreboard.store import ScoreboardStore
@@ -193,6 +193,7 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
             adapter=adapter,
             breaker_or_reason=exc.breaker.value,
             message=str(exc),
+            usage_proxy=exc.usage_proxy,
         )
         console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
         raise typer.Exit(code=2) from exc
@@ -235,13 +236,21 @@ def _persist_blocked_experiment(
     adapter: ProviderAdapter,
     breaker_or_reason: str,
     message: str,
+    usage_proxy: UsageProxy | None = None,
 ) -> None:
     """Persist a status=blocked experiment row carrying the breaker name as
     the first artifact path entry. Only called when the watchdog raises
     AFTER dequeue (post-invoke cap violation). PR4's event log will
-    replace this with a structured event when it lands."""
+    replace this with a structured event when it lands.
+
+    If usage_proxy is provided (always the case for post-invoke
+    BudgetExceeded), persist the offending usage so `arena budget status`
+    correctly reflects the consumed budget. Without it, the blocked row
+    would silently underreport consumed chars/wall/waste.
+    """
     now = datetime.now(UTC).isoformat(timespec="seconds")
     artifact_paths = [f"<blocked:{breaker_or_reason}>", f"<message:{message[:200]}>"]
+    usage: dict = dict(usage_proxy) if usage_proxy is not None else {}
     store.insert_experiment(
         experiment_id=packet["experiment_id"],
         run_id=run_id,
@@ -256,6 +265,12 @@ def _persist_blocked_experiment(
         artifact_paths=artifact_paths,
         trace_path=None,
         created_at=now,
+        input_chars=int(usage.get("input_chars", 0)),
+        output_chars=int(usage.get("output_chars", 0)),
+        wall_seconds=float(usage.get("wall_seconds", 0.0)),
+        shell_commands=int(usage.get("shell_commands", 0)),
+        failed_commands=int(usage.get("failed_commands", 0)),
+        waste_events=int(usage.get("waste_events", 0)),
     )
 
 
