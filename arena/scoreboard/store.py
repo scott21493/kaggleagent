@@ -149,6 +149,14 @@ class ScoreboardStore:
         )
         conn.commit()
 
+    def update_experiment_validation(self, experiment_id: str, *, valid_submission: bool) -> None:
+        conn = self._require_conn()
+        conn.execute(
+            "UPDATE experiments SET valid_submission = ? WHERE experiment_id = ?",
+            (int(valid_submission), experiment_id),
+        )
+        conn.commit()
+
     def get_latest_experiment(self, competition_slug: str) -> dict[str, Any] | None:
         conn = self._require_conn()
         row = conn.execute(

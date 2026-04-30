@@ -142,3 +142,35 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         created_at=result.finished_at,
     )
     console.print(f"[green]ran {packet['task_id']} on {provider}[/green]")
+
+
+@app.command("evaluate")
+def evaluate(
+    slug: str,
+    latest: bool = typer.Option(False, "--latest", help="Evaluate the latest experiment"),
+) -> None:
+    """Score the latest experiment's submission against hidden labels."""
+    if not latest:
+        raise typer.BadParameter("only --latest is supported in PR1")
+
+    store = _store()
+    exp = store.get_latest_experiment(slug)
+    if exp is None:
+        raise typer.BadParameter(f"no experiment recorded for {slug}")
+    raw_paths = exp["artifact_paths"]
+    artifacts: list[str] = json.loads(raw_paths) if raw_paths else []
+    submission = next((p for p in artifacts if p.endswith("submission.csv")), None)
+    if submission is None:
+        raise typer.BadParameter("no submission.csv among experiment artifacts")
+
+    hidden = FIXTURES_ROOT / slug / "hidden_labels.csv"
+    eval_result = evaluate_fixture_submission(submission, hidden)
+    if not eval_result.valid_submission:
+        console.print(f"[red]invalid submission: {eval_result.error}[/red]")
+        raise typer.Exit(code=1)
+    assert eval_result.score is not None  # narrow Optional[float] -> float for mypy
+
+    experiment_id: str = exp["experiment_id"]
+    store.update_experiment_score(experiment_id, score=eval_result.score)
+    store.update_experiment_validation(experiment_id, valid_submission=True)
+    console.print(f"score={eval_result.score:.6f}")

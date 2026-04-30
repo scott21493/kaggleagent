@@ -142,3 +142,47 @@ def test_run_next_invokes_provider_and_persists_experiment(tmp_path, monkeypatch
     assert exp["provider"] == "stub_codex"
     assert exp["score"] is None  # evaluate hasn't run yet
     assert exp["status"] == "completed"
+
+
+def test_evaluate_updates_score(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from arena.cli import app
+    from arena.scoreboard.store import ScoreboardStore
+
+    fixture_src = Path(__file__).resolve().parent.parent / "fixtures" / "tabular_binary_v1"
+    target = tmp_path / "fixtures" / "tabular_binary_v1"
+    target.mkdir(parents=True)
+    for name in [
+        "train.csv",
+        "test.csv",
+        "sample_submission.csv",
+        "hidden_labels.csv",
+        "competition.yaml",
+        "rules.md",
+        "fixture_manifest.yaml",
+    ]:
+        (target / name).write_bytes((fixture_src / name).read_bytes())
+    (target / "paper_bundle").mkdir()
+    for name in ["method_note_001.md", "method_note_002.md"]:
+        (target / "paper_bundle" / name).write_bytes(
+            (fixture_src / "paper_bundle" / name).read_bytes()
+        )
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    result = runner.invoke(app, ["evaluate", "tabular_binary_v1", "--latest"])
+    assert result.exit_code == 0, result.output
+
+    store = ScoreboardStore(tmp_path / "scoreboard.sqlite")
+    store.connect()
+    exp = store.get_latest_experiment("tabular_binary_v1")
+    assert exp is not None
+    assert exp["score"] is not None
+    # Constant 0.5 predictions yield ROC-AUC ~ 0.5; allow a tolerance because
+    # sklearn's roc_auc_score with all-equal scores is exactly 0.5.
+    assert exp["score"] == 0.5
+    assert exp["valid_submission"] == 1
