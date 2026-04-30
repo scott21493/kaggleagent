@@ -126,6 +126,13 @@ class BudgetGovernor:
                 f"task {task_id} emitted {usage['shell_commands']} shell commands "
                 f"(ceiling {self._ceilings.shell_commands_per_task})",
             )
+        if usage["failed_commands"] > self._ceilings.failed_commands_per_task:
+            raise BudgetExceeded(
+                Breaker.REPEATED_FAILURE,
+                f"task {task_id} accumulated {usage['failed_commands']} failed "
+                f"commands (ceiling {self._ceilings.failed_commands_per_task}); "
+                f"breaker matches WasteDetector.check_task_caps",
+            )
         if usage["waste_events"] > self._ceilings.waste_events_per_task:
             raise BudgetExceeded(
                 Breaker.WASTE_EVENT,

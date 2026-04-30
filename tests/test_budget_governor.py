@@ -175,3 +175,21 @@ def test_record_post_invoke_raises_on_output_chars_total() -> None:
         )
     # Same coarse-proxy mapping as input_chars: PROVIDER_CALL.
     assert exc.value.breaker is Breaker.PROVIDER_CALL
+
+
+def test_record_post_invoke_raises_on_failed_commands_per_task() -> None:
+    """A provider returning failed_commands above the per-task ceiling
+    must trip REPEATED_FAILURE even when shell_commands and waste_events
+    are zero — closes a P1 cap-enforcement gap that allowed a misbehaving
+    provider to report 100 failed commands silently."""
+    g = BudgetGovernor(Phase0HardCeilings())  # failed_commands_per_task=5
+    g.check_pre_invoke("stub_codex")
+    with pytest.raises(BudgetExceeded) as exc:
+        g.record_post_invoke(
+            "stub_codex",
+            _usage(failed_commands=100, shell_commands=0, waste_events=0),
+            task_id="task_0001",
+        )
+    assert exc.value.breaker is Breaker.REPEATED_FAILURE
+    assert "task_0001" in str(exc.value)
+    assert "100 failed" in str(exc.value)
