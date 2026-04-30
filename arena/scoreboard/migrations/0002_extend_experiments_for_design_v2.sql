@@ -1,0 +1,15 @@
+ALTER TABLE experiments ADD COLUMN competition_slug TEXT;
+ALTER TABLE experiments ADD COLUMN task_id TEXT;
+ALTER TABLE experiments ADD COLUMN experiment_type TEXT;
+ALTER TABLE experiments ADD COLUMN provider TEXT;
+ALTER TABLE experiments ADD COLUMN provider_version TEXT;
+ALTER TABLE experiments ADD COLUMN valid_submission INTEGER;
+ALTER TABLE experiments ADD COLUMN wall_seconds REAL;
+ALTER TABLE experiments ADD COLUMN input_chars INTEGER;
+ALTER TABLE experiments ADD COLUMN output_chars INTEGER;
+ALTER TABLE experiments ADD COLUMN shell_commands INTEGER;
+ALTER TABLE experiments ADD COLUMN failed_commands INTEGER;
+ALTER TABLE experiments ADD COLUMN waste_events INTEGER;
+ALTER TABLE experiments ADD COLUMN artifact_paths TEXT;
+ALTER TABLE experiments ADD COLUMN trace_path TEXT;
+ALTER TABLE experiments ADD COLUMN created_at TEXT;
