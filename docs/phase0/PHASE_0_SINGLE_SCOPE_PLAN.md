@@ -646,6 +646,18 @@ If a provider removes or tightens a flag, such as non-interactive execution or f
 
 ## 8. Implementation backlog with testable acceptance criteria
 
+### Issue 0 — Controller skeleton
+
+Definition of done:
+
+- `arena/controller/` package exists with `state.py`, `task_queue.py`, `planner.py`, `worktree.py`.
+- `Phase` enum mirrors `task_packet.schema.json` `phase` enum exactly; `transition(src, dst)` raises on disallowed edges.
+- `TaskQueue` is a file-backed FIFO that schema-validates packets on enqueue.
+- `create_calibration_task_packet(...)` returns a deterministic, schema-valid task packet whose `role=implementation` and `phase=CALIBRATION_TASK_CREATED`.
+- `create_workspace(worktree_root, slug, exp_id)` is idempotent.
+- Tests cover state transitions, queue FIFO behavior + persistence, planner schema validity, and worktree idempotency.
+- Implemented as part of PR1 ("The Spine") of the [implementation DAG](../superpowers/specs/2026-04-30-phase-0-implementation-dag-design.md) §5; see [PR1 plan](../superpowers/plans/2026-04-30-pr1-the-spine.md) Tasks 3-6.
+
 ### Issue 1 — Repo scaffold and CI
 
 Definition of done:
