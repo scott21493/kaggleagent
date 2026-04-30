@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from arena.providers.base import ProviderResult, ProviderStatus
+from arena.providers.base import ProviderResult, ProviderStatus, UsageProxy
 
 
 def build_result(
@@ -35,14 +35,14 @@ def build_result(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
         artifacts=artifacts,
-        usage_proxy={
-            "input_chars": input_chars,
-            "output_chars": output_chars,
-            "wall_seconds": wall_seconds,
-            "shell_commands": shell_commands,
-            "failed_commands": failed_commands,
-            "waste_events": waste_events,
-        },
+        usage_proxy=UsageProxy(
+            input_chars=input_chars,
+            output_chars=output_chars,
+            wall_seconds=wall_seconds,
+            shell_commands=shell_commands,
+            failed_commands=failed_commands,
+            waste_events=waste_events,
+        ),
         started_at=started_at,
         finished_at=finished_at,
     )

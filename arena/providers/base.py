@@ -2,9 +2,24 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, TypedDict
 
 ProviderStatus = Literal["success", "failure", "blocked", "killed", "interrupted"]
+
+
+class UsageProxy(TypedDict):
+    """Six required deterministic usage counters per provider invocation.
+
+    Values are not billing estimates; they are operational guardrail
+    metrics the budget governor (PR2) compares against task ceilings.
+    """
+
+    input_chars: int
+    output_chars: int
+    wall_seconds: float
+    shell_commands: int
+    failed_commands: int
+    waste_events: int
 
 
 @dataclass(frozen=True)
@@ -13,6 +28,13 @@ class ProviderResult:
 
     Mirrors provider_result.schema.json. The to_dict() method emits the
     schema-valid JSON shape (with schema_version filled in).
+
+    Mutability note: the dataclass is frozen, but `usage_proxy` (TypedDict
+    underneath = dict) and `artifacts` (list) are mutable in place. Callers
+    must treat ProviderResult instances as immutable once constructed and
+    never mutate the contained collections; downstream consumers cache and
+    serialize them, and in-place mutation can cause spooky-action-at-a-
+    distance bugs across consumers.
     """
 
     task_id: str
@@ -22,7 +44,7 @@ class ProviderResult:
     stdout_path: str
     stderr_path: str
     artifacts: list[str]
-    usage_proxy: dict
+    usage_proxy: UsageProxy
     started_at: str
     finished_at: str
 
