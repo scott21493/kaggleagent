@@ -67,6 +67,11 @@ _FORWARD = [
     Phase.PHASE0_COMPLETE,
 ]
 
+# PHASE0_COMPLETE is intentionally terminal: once the run is complete, no
+# transitions out (including to BLOCKED_*) are allowed. itertools.pairwise
+# below naturally yields no edges from the last element of _FORWARD; this
+# is the intended semantics, not an accident.
+
 ALLOWED_TRANSITIONS: dict[Phase, set[Phase]] = {}
 
 for src, dst in itertools.pairwise(_FORWARD):
