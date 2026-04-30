@@ -259,3 +259,35 @@ def test_get_run_usage_totals_only_sums_specified_run(tmp_path: Path) -> None:
     assert totals_2["input_chars"] == 2000
     assert totals_2["provider_calls"] == 1
     store.close()
+
+
+def test_get_next_experiment_id_increments_across_runs(tmp_path: Path) -> None:
+    """experiment_id must be unique across runs in the same scoreboard
+    so the PRIMARY KEY constraint isn't violated on a second
+    init-fixture/plan/run-next sequence."""
+    store = ScoreboardStore(tmp_path / "s.sqlite")
+    store.connect()
+
+    # Empty scoreboard -> exp_0001.
+    assert store.get_next_experiment_id("tabular_binary_v1") == "exp_0001"
+
+    store.insert_run(run_id="run_1", started_at="2026-04-30T10:00:00", status="initialized")
+    store.insert_experiment(
+        experiment_id="exp_0001",
+        run_id="run_1",
+        competition_slug="tabular_binary_v1",
+        task_id="task_0001",
+        experiment_type="calibration",
+        provider="stub_codex",
+        provider_version="stub_codex.v1",
+        status="completed",
+        metric_name="roc_auc",
+        artifact_paths=[],
+        created_at="2026-04-30T10:01:00",
+    )
+    # After exp_0001, next is exp_0002 even on a different run.
+    assert store.get_next_experiment_id("tabular_binary_v1") == "exp_0002"
+
+    # Different slug starts fresh at exp_0001.
+    assert store.get_next_experiment_id("tabular_binary_v2") == "exp_0001"
+    store.close()

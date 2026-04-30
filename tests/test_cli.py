@@ -335,3 +335,41 @@ def test_run_next_post_invoke_block_persists_usage_that_tripped_it(
     # not default zeros.
     assert exp["input_chars"] == 950_000
     store.close()
+
+
+def test_two_init_fixture_plan_run_next_sequences_in_one_scoreboard(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two complete init-fixture -> plan -> run-next sequences against the
+    same scoreboard must produce distinct experiment_ids (exp_0001 and
+    exp_0002). Regression for the P2 bug where the second run-next
+    failed with `UNIQUE constraint failed: experiments.experiment_id`
+    because plan() always hardcoded `exp_0001`."""
+    from arena.cli import app
+    from arena.scoreboard.store import ScoreboardStore
+
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    runner = CliRunner()
+
+    # First sequence.
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    r1 = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert r1.exit_code == 0, r1.output
+
+    # Second sequence — same scoreboard.
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    r2 = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert r2.exit_code == 0, r2.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    # Direct SQL — the store doesn't expose a list_experiments_by_slug method.
+    rows = store._conn.execute(
+        "SELECT experiment_id FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
+        ("tabular_binary_v1",),
+    ).fetchall()
+    exp_ids = [r["experiment_id"] for r in rows]
+    assert exp_ids == ["exp_0001", "exp_0002"], f"expected fresh exp_ids per run; got {exp_ids}"
+    store.close()

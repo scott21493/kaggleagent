@@ -106,14 +106,19 @@ def plan(slug: str) -> None:
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
     if queue.size() > 0:
         raise typer.BadParameter(f"queue is non-empty for {run_id}")
+
+    # experiment_id increments across runs — the PRIMARY KEY in
+    # experiments would collide if every plan() hardcoded "exp_0001".
+    exp_id = _store().get_next_experiment_id(slug)
+
     packet = create_calibration_task_packet(
         competition_slug=slug,
         task_id="task_0001",
-        experiment_id="exp_0001",
+        experiment_id=exp_id,
         provider="stub_codex",
     )
     queue.enqueue(packet)
-    console.print(f"[green]planned task_0001 for {run_id}[/green]")
+    console.print(f"[green]planned task_0001 ({exp_id}) for {run_id}[/green]")
 
 
 @app.command("run-next")

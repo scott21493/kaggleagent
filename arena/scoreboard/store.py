@@ -227,3 +227,27 @@ class ScoreboardStore:
                 "waste_events": 0,
             }
         )
+
+    def get_next_experiment_id(self, competition_slug: str) -> str:
+        """Return the next available experiment_id for `competition_slug`,
+        in the form `exp_NNNN`. Scans existing experiments for the slug,
+        finds the maximum trailing-digit suffix, increments by 1.
+
+        Used by `arena plan` so a second `init-fixture` for the same slug
+        produces a fresh exp_id rather than colliding with an existing
+        primary key. Returns `exp_0001` on an empty scoreboard.
+        """
+        import re
+
+        conn = self._require_conn()
+        rows = conn.execute(
+            "SELECT experiment_id FROM experiments WHERE competition_slug = ?",
+            (competition_slug,),
+        ).fetchall()
+        max_n = 0
+        pattern = re.compile(r"^exp_(\d+)$")
+        for row in rows:
+            m = pattern.match(row["experiment_id"])
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return f"exp_{max_n + 1:04d}"
