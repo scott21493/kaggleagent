@@ -63,6 +63,11 @@ def assert_sandbox_allowed(attempt: SandboxAttempt) -> None:
     providers). Providers and subprocess wrappers call this to register
     intent without needing to know whether the watchdog has activated a
     sandbox.
+
+    WARNING: production callers must ensure a runner is activated via
+    runner.context() before calling. There is no runtime check that
+    enforcement is actually in effect — a forgotten activation produces
+    silent allow.
     """
     runner = get_active_sandbox()
     if runner is not None:
@@ -99,22 +104,26 @@ class SandboxRunner:
                     attempt,
                     f"sandbox network egress denied: {attempt.target}",
                 )
-        elif attempt.kind is SandboxAttemptKind.PROTECTED_WRITE and is_protected_write(
-            attempt.target, self._policy
-        ):
-            raise SandboxViolation(
-                Breaker.PROTECTED_FILE,
-                attempt,
-                f"sandbox protected-file write denied: {attempt.target}",
-            )
+        elif attempt.kind is SandboxAttemptKind.PROTECTED_WRITE:
+            if is_protected_write(attempt.target, self._policy):
+                raise SandboxViolation(
+                    Breaker.PROTECTED_FILE,
+                    attempt,
+                    f"sandbox protected-file write denied: {attempt.target}",
+                )
+        else:
+            # Defensive: every SandboxAttemptKind member must have a branch above.
+            # If a future PR adds a kind without updating this dispatch, fail loudly
+            # rather than silently allowing the attempt.
+            raise AssertionError(f"unhandled SandboxAttemptKind: {attempt.kind!r}")
 
     @contextmanager
     def context(self) -> Iterator[SandboxRunner]:
         """Context manager: set this runner as active for the duration of the block.
 
-        Idempotent on exception (deactivates even on raise). Uses contextvars
-        rather than thread-local so the runner is correctly scoped under any
-        async or threaded callers in future PRs.
+        Exception-safe: deactivates the sandbox even if the block raises.
+        Uses contextvars rather than thread-local so the runner is correctly
+        scoped under any async or threaded callers in future PRs.
         """
         token = _active_sandbox.set(self)
         try:
