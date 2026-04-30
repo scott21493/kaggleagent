@@ -23,7 +23,8 @@ def test_is_secret_read_flags_kaggle_creds(tmp_path: Path) -> None:
 
 def test_is_secret_read_flags_dotenv(tmp_path: Path) -> None:
     p = _policy(tmp_path)
-    target = Path(".env").resolve()
+    # The .env at workspace_root is blocked
+    target = (tmp_path / ".env").resolve()
     assert is_secret_read(target, p) is True
 
 
@@ -57,7 +58,8 @@ def test_is_protected_write_rejects_outside_worktree(tmp_path: Path) -> None:
 
 def test_is_protected_write_rejects_dotenv_write(tmp_path: Path) -> None:
     p = _policy(tmp_path)
-    assert is_protected_write(Path(".env").resolve(), p) is True
+    # The .env at workspace_root is protected
+    assert is_protected_write((tmp_path / ".env").resolve(), p) is True
 
 
 # --- Regression tests for the P1 plan-review fix -----------------------------

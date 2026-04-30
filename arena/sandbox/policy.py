@@ -10,15 +10,18 @@ def _resolve(p: Path) -> Path:
     return Path(p).expanduser().resolve()
 
 
-def _default_blocked_paths() -> frozenset[Path]:
+def _default_blocked_paths(workspace_root: Path | None = None) -> frozenset[Path]:
     """Canonical secret/credential paths that providers must never read."""
     home = Path("~").expanduser().resolve()
+    env_path = (
+        _resolve(workspace_root / ".env") if workspace_root is not None else _resolve(Path(".env"))
+    )
     return frozenset(
         {
             home / ".kaggle",
             home / ".codex",
             home / ".claude",
-            _resolve(Path(".env")),
+            env_path,
         }
     )
 
@@ -41,8 +44,9 @@ class SandboxPolicy:
         credential caches, .env). Reads against these trip SecretAccessBreaker.
         Reads outside this set are unrestricted (providers may load OS libs,
         read fixtures, etc.).
-    `allowed_network_domains`: hostnames the provider MAY egress to. Empty
-        means deny-all (Phase 0 default per
+    `allowed_network_domains`: hostnames the provider MAY egress to. Matching
+        is EXACT (no wildcards): an entry of `example.com` does NOT cover
+        `api.example.com`. Empty means deny-all (Phase 0 default per
         docs/security/SECURITY_COST_REPRODUCIBILITY_SPEC.md §5).
 
     Built per-packet by `from_packet` and held by a per-call `SandboxRunner`;
@@ -84,8 +88,14 @@ class SandboxPolicy:
         resolved against `workspace_root` (typically `Path.cwd()` for the
         CLI; `tmp_path` for tests).
 
-        The blocked paths come from `_default_blocked_paths()`; the network
+        The blocked paths come from `_default_blocked_paths(workspace_root)`
+        (so .env is workspace_root/.env, not CWD-relative); the network
         allowlist comes from `ARENA_NETWORK_DOMAINS_ALLOWED`.
         """
-        allowed = frozenset(workspace_root / p for p in packet["allowed_paths"])
-        return cls.for_writes(allowed)
+        allowed = frozenset(_resolve(workspace_root / p) for p in packet["allowed_paths"])
+        domains = _split_csv(os.environ.get("ARENA_NETWORK_DOMAINS_ALLOWED"))
+        return cls(
+            allowed_writes=allowed,
+            blocked_paths=_default_blocked_paths(workspace_root=workspace_root),
+            allowed_network_domains=domains,
+        )

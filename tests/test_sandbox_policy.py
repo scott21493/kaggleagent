@@ -58,6 +58,18 @@ def test_for_writes_treats_empty_or_missing_as_deny_all(
     assert p2.allowed_network_domains == frozenset()
 
 
+def test_from_packet_resolves_dotenv_against_workspace_root(tmp_path: Path) -> None:
+    """The .env entry in blocked_paths must be workspace_root/.env, not
+    CWD-relative — so a sandbox built from a packet still blocks .env reads
+    when the CLI runs from a different directory."""
+    p = SandboxPolicy.from_packet(
+        _packet("worktrees/tabular_binary_v1/exp_0001/"),
+        workspace_root=tmp_path,
+    )
+    expected_env = (tmp_path / ".env").resolve()
+    assert expected_env in p.blocked_paths
+
+
 def test_frozen_dataclass(tmp_path: Path) -> None:
     p = SandboxPolicy.for_writes(frozenset({tmp_path}))
     with pytest.raises(dataclasses.FrozenInstanceError):
