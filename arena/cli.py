@@ -36,7 +36,14 @@ def _new_run_id() -> str:
     return "run_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _latest_run_id_for(slug: str) -> str | None:
+def _latest_run_id() -> str | None:
+    """Return the most recent run_id by lex-sorted directory name.
+
+    Phase 0 single-fixture assumption: there is at most one fixture per
+    branch, so the lex-greatest run_id under runs/ is the active one.
+    PR2+ that introduces a second fixture should add a slug filter (or
+    join against the runs table by competition_slug).
+    """
     if not RUNS_ROOT.exists():
         return None
     runs = sorted(RUNS_ROOT.glob("run_*"))
@@ -89,7 +96,7 @@ def init_fixture(slug: str) -> None:
 @app.command("plan")
 def plan(slug: str) -> None:
     """Create a calibration task packet for the latest run."""
-    run_id = _latest_run_id_for(slug)
+    run_id = _latest_run_id()
     if run_id is None:
         raise typer.BadParameter(f"no initialized run for {slug}; run init-fixture first")
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
@@ -108,7 +115,7 @@ def plan(slug: str) -> None:
 @app.command("run-next")
 def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None:
     """Pop the next task from the queue, invoke the provider, persist the experiment."""
-    run_id = _latest_run_id_for(slug)
+    run_id = _latest_run_id()
     if run_id is None:
         raise typer.BadParameter(f"no run for {slug}")
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
