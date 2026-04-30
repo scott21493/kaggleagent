@@ -7,6 +7,9 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from arena.budget.governor import BudgetGovernor, RunAccumulators
+from arena.budget.kill_switch import KillSwitch
+from arena.budget.policy import Phase0HardCeilings
 from arena.controller.planner import create_calibration_task_packet
 from arena.controller.task_queue import TaskQueue
 from arena.controller.worktree import create_workspace
@@ -191,3 +194,61 @@ def evaluate(
     store.update_experiment_score(experiment_id, score=eval_result.score)
     store.update_experiment_validation(experiment_id, valid_submission=True)
     console.print(f"score={eval_result.score:.6f}")
+
+
+@app.command("kill")
+def kill() -> None:
+    """Activate the kill switch. In-flight tasks halt at the next watchdog poll."""
+    KillSwitch.activate()
+    console.print("[yellow]kill switch ACTIVATED[/yellow]")
+
+
+@app.command("unkill")
+def unkill(
+    human_confirm: bool = typer.Option(False, "--human-confirm", help="Required to deactivate"),
+) -> None:
+    """Deactivate the kill switch. Requires --human-confirm to prevent accidental scripting."""
+    if not human_confirm:
+        raise typer.BadParameter("--human-confirm is required to deactivate the kill switch")
+    KillSwitch.deactivate()
+    console.print("[green]kill switch deactivated[/green]")
+
+
+@app.command("budget")
+def budget_status(
+    action: str = typer.Argument(..., help="Subcommand: status"),
+    slug: str = typer.Option("tabular_binary_v1", "--slug", help="Competition slug"),
+) -> None:
+    """Show current budget accumulators against ceilings for the latest run.
+
+    Phase 0 supports `arena budget status` only; future actions
+    (`arena budget reset`, etc.) are PR2+ work.
+    """
+    if action != "status":
+        raise typer.BadParameter(f"unknown budget action: {action!r}; only 'status' is supported")
+
+    ceilings = Phase0HardCeilings.from_env()
+    run_id = _latest_run_id()
+    if run_id is None:
+        # No runs yet — show all-zero accumulators against ceilings.
+        accumulators = RunAccumulators()
+    else:
+        totals = _store().get_run_usage_totals(slug, run_id)
+        accumulators = RunAccumulators(
+            provider_calls=int(totals["provider_calls"]),
+            codex_calls=int(totals["codex_calls"]),
+            claude_calls=int(totals["claude_calls"]),
+            wall_seconds=float(totals["wall_seconds"]),
+            input_chars=int(totals["input_chars"]),
+            output_chars=int(totals["output_chars"]),
+            waste_events=int(totals["waste_events"]),
+        )
+    governor = BudgetGovernor(ceilings, accumulators=accumulators)
+    snap = governor.status()
+    kill_active = KillSwitch.is_active()
+    console.print(f"[bold]Budget status for {slug}[/bold]")
+    for key, val in snap.items():
+        console.print(f"  {key}: {val['used']} / {val['ceiling']}")
+    color = "red" if kill_active else "green"
+    state = "ACTIVE" if kill_active else "inactive"
+    console.print(f"  kill_switch: [{color}]{state}[/{color}]")

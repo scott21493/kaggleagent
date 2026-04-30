@@ -148,3 +148,114 @@ def test_methods_raise_runtime_error_when_not_connected(tmp_path: Path) -> None:
         store.experiment_columns()
     with pytest.raises(RuntimeError, match="connect"):
         store.get_run("anything")
+
+
+def test_insert_experiment_accepts_usage_proxy(tmp_path: Path) -> None:
+    store = ScoreboardStore(tmp_path / "s.sqlite")
+    store.connect()
+    store.insert_run(run_id="run_test", started_at="2026-04-30T10:00:00", status="initialized")
+    store.insert_experiment(
+        experiment_id="exp_0001",
+        run_id="run_test",
+        competition_slug="tabular_binary_v1",
+        task_id="task_0001",
+        experiment_type="calibration",
+        provider="stub_codex",
+        provider_version="stub_codex.v1",
+        status="completed",
+        metric_name="roc_auc",
+        valid_submission=True,
+        artifact_paths=["worktrees/tabular_binary_v1/exp_0001/submission.csv"],
+        created_at="2026-04-30T10:01:00",
+        input_chars=120,
+        output_chars=80,
+        wall_seconds=0.5,
+        shell_commands=2,
+        failed_commands=0,
+        waste_events=0,
+    )
+    row = store.get_latest_experiment("tabular_binary_v1")
+    assert row is not None
+    assert row["input_chars"] == 120
+    assert row["wall_seconds"] == pytest.approx(0.5)
+    store.close()
+
+
+def test_get_run_usage_totals_sums_within_run(tmp_path: Path) -> None:
+    store = ScoreboardStore(tmp_path / "s.sqlite")
+    store.connect()
+    store.insert_run(run_id="run_t", started_at="2026-04-30T10:00:00", status="initialized")
+    for i, (provider, chars) in enumerate(
+        [("stub_codex", 100), ("stub_codex", 200), ("stub_claude", 50)]
+    ):
+        store.insert_experiment(
+            experiment_id=f"exp_{i:04d}",
+            run_id="run_t",
+            competition_slug="tabular_binary_v1",
+            task_id=f"task_{i:04d}",
+            experiment_type="calibration",
+            provider=provider,
+            provider_version=f"{provider}.v1",
+            status="completed",
+            metric_name="roc_auc",
+            artifact_paths=[],
+            created_at=f"2026-04-30T10:0{i + 1}:00",
+            input_chars=chars,
+        )
+    totals = store.get_run_usage_totals("tabular_binary_v1", "run_t")
+    assert totals["provider_calls"] == 3
+    assert totals["codex_calls"] == 2
+    assert totals["claude_calls"] == 1
+    assert totals["input_chars"] == 350
+    store.close()
+
+
+def test_get_run_usage_totals_only_sums_specified_run(tmp_path: Path) -> None:
+    """Two runs for the same slug must not bleed into each other's totals.
+    A fresh init-fixture must start with zero accumulators."""
+    store = ScoreboardStore(tmp_path / "s.sqlite")
+    store.connect()
+
+    # Run 1: 1 experiment with 1000 input_chars.
+    store.insert_run(run_id="run_1", started_at="2026-04-30T10:00:00", status="initialized")
+    store.insert_experiment(
+        experiment_id="exp_0001",
+        run_id="run_1",
+        competition_slug="tabular_binary_v1",
+        task_id="task_0001",
+        experiment_type="calibration",
+        provider="stub_codex",
+        provider_version="stub_codex.v1",
+        status="completed",
+        metric_name="roc_auc",
+        artifact_paths=[],
+        created_at="2026-04-30T10:01:00",
+        input_chars=1000,
+    )
+
+    # Run 2: 1 experiment with 2000 input_chars.
+    store.insert_run(run_id="run_2", started_at="2026-04-30T11:00:00", status="initialized")
+    store.insert_experiment(
+        experiment_id="exp_0002",
+        run_id="run_2",
+        competition_slug="tabular_binary_v1",
+        task_id="task_0001",
+        experiment_type="calibration",
+        provider="stub_codex",
+        provider_version="stub_codex.v1",
+        status="completed",
+        metric_name="roc_auc",
+        artifact_paths=[],
+        created_at="2026-04-30T11:01:00",
+        input_chars=2000,
+    )
+
+    # Each run sees only its own totals.
+    totals_1 = store.get_run_usage_totals("tabular_binary_v1", "run_1")
+    assert totals_1["input_chars"] == 1000
+    assert totals_1["provider_calls"] == 1
+
+    totals_2 = store.get_run_usage_totals("tabular_binary_v1", "run_2")
+    assert totals_2["input_chars"] == 2000
+    assert totals_2["provider_calls"] == 1
+    store.close()
