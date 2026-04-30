@@ -109,20 +109,30 @@ class ScoreboardStore:
         artifact_paths: list[str] | None = None,
         trace_path: str | None = None,
         created_at: str,
+        # New in PR2:
+        input_chars: int = 0,
+        output_chars: int = 0,
+        wall_seconds: float = 0.0,
+        shell_commands: int = 0,
+        failed_commands: int = 0,
+        waste_events: int = 0,
     ) -> None:
         """Insert a new experiment row.
 
         `artifact_paths` is JSON-encoded into the TEXT column; readers must
         `json.loads()` the result. `created_at` should be ISO-8601 so that
-        `get_latest_experiment` orders correctly.
+        `get_latest_experiment` orders correctly. Usage-proxy fields default
+        to zero for callers (e.g. tests) that don't care about budget data.
         """
         conn = self._require_conn()
         conn.execute(
             "INSERT INTO experiments ("
             "experiment_id, run_id, competition_slug, task_id, experiment_type,"
             " provider, provider_version, status, metric_name, valid_submission,"
-            " artifact_paths, trace_path, created_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " artifact_paths, trace_path, created_at,"
+            " input_chars, output_chars, wall_seconds,"
+            " shell_commands, failed_commands, waste_events"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 experiment_id,
                 run_id,
@@ -137,6 +147,12 @@ class ScoreboardStore:
                 json.dumps(artifact_paths or []),
                 trace_path,
                 created_at,
+                input_chars,
+                output_chars,
+                wall_seconds,
+                shell_commands,
+                failed_commands,
+                waste_events,
             ),
         )
         conn.commit()
@@ -165,3 +181,73 @@ class ScoreboardStore:
             (competition_slug,),
         ).fetchone()
         return dict(row) if row else None
+
+    def get_run_usage_totals(self, competition_slug: str, run_id: str) -> dict[str, Any]:
+        """Sum the usage_proxy fields across all experiments belonging to
+        `run_id` for `competition_slug`. Used to seed
+        `BudgetGovernor.accumulators` and drive `arena budget status`.
+
+        Filtering by run_id is important: a fresh `arena init-fixture`
+        starts a new run with zero accumulators, even if the same slug had
+        prior runs in the scoreboard. Without the run_id filter, ceilings
+        would carry over and `run-next` could trip caps prematurely.
+
+        Returns 0/0.0 for every field when there are no experiments yet.
+        """
+        # NOTE: This SQL uses LIKE prefix matching ('codex%', 'claude%')
+        # while BudgetGovernor._is_codex/_is_claude (governor.py) uses
+        # substring matching ("codex" in name). For the PR2 stub providers
+        # (stub_codex, stub_claude) both produce identical counts, but a
+        # future provider name like "mock_codex_v2" would be classified
+        # differently by the two paths. PR7's provider-family registry
+        # should unify both call sites — see governor.py TODO(PR7).
+        conn = self._require_conn()
+        row = conn.execute(
+            "SELECT "
+            " COALESCE(SUM(CASE WHEN provider LIKE 'stub_codex%' OR provider LIKE 'codex%' THEN 1 ELSE 0 END), 0) AS codex_calls,"
+            " COALESCE(SUM(CASE WHEN provider LIKE 'stub_claude%' OR provider LIKE 'claude%' THEN 1 ELSE 0 END), 0) AS claude_calls,"
+            " COALESCE(COUNT(*), 0) AS provider_calls,"
+            " COALESCE(SUM(input_chars), 0) AS input_chars,"
+            " COALESCE(SUM(output_chars), 0) AS output_chars,"
+            " COALESCE(SUM(wall_seconds), 0.0) AS wall_seconds,"
+            " COALESCE(SUM(waste_events), 0) AS waste_events"
+            " FROM experiments WHERE competition_slug = ? AND run_id = ?",
+            (competition_slug, run_id),
+        ).fetchone()
+        return (
+            dict(row)
+            if row
+            else {
+                "provider_calls": 0,
+                "codex_calls": 0,
+                "claude_calls": 0,
+                "input_chars": 0,
+                "output_chars": 0,
+                "wall_seconds": 0.0,
+                "waste_events": 0,
+            }
+        )
+
+    def get_next_experiment_id(self, competition_slug: str) -> str:
+        """Return the next available experiment_id for `competition_slug`,
+        in the form `exp_NNNN`. Scans existing experiments for the slug,
+        finds the maximum trailing-digit suffix, increments by 1.
+
+        Used by `arena plan` so a second `init-fixture` for the same slug
+        produces a fresh exp_id rather than colliding with an existing
+        primary key. Returns `exp_0001` on an empty scoreboard.
+        """
+        import re
+
+        conn = self._require_conn()
+        rows = conn.execute(
+            "SELECT experiment_id FROM experiments WHERE competition_slug = ?",
+            (competition_slug,),
+        ).fetchall()
+        max_n = 0
+        pattern = re.compile(r"^exp_(\d+)$")
+        for row in rows:
+            m = pattern.match(row["experiment_id"])
+            if m:
+                max_n = max(max_n, int(m.group(1)))
+        return f"exp_{max_n + 1:04d}"
