@@ -10,15 +10,15 @@ from arena.fixture.manifest import validate_fixture_manifest
 
 
 def main() -> None:
-    validate_fixture_manifest('fixtures/tabular_binary_v1')
+    validate_fixture_manifest("fixtures/tabular_binary_v1")
     result = evaluate_fixture_submission(
-        'fixtures/tabular_binary_v1/sample_submission.csv',
-        'fixtures/tabular_binary_v1/hidden_labels.csv',
+        "fixtures/tabular_binary_v1/sample_submission.csv",
+        "fixtures/tabular_binary_v1/hidden_labels.csv",
     )
     if not result.valid_submission:
-        raise SystemExit(result.error or 'fixture sample submission invalid')
-    print(f'fixture smoke score={result.score:.6f}')
+        raise SystemExit(result.error or "fixture sample submission invalid")
+    print(f"fixture smoke score={result.score:.6f}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
