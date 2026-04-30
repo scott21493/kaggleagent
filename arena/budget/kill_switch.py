@@ -37,6 +37,18 @@ class KillSwitch:
     - .arena/KILL_SWITCH file exists relative to CWD;
     - ARENA_KILL_SWITCH=1 environment variable is set.
 
+    Precedence: ARENA_KILL_SWITCH=1 wins. deactivate() removes the file
+    but cannot clear an operator-set env var; the operator must unset it
+    explicitly. This is intentional — env vars are an operator override
+    (e.g. set in CI to globally disable provider calls) and a manual
+    `arena unkill` should not be able to flip an operator-set kill.
+
+    Path assumption: KILL_SWITCH_FILE is CWD-relative. Phase 0 harness
+    components run from repo root, so the file lives at
+    <repo>/.arena/KILL_SWITCH. If a future caller invokes from a different
+    CWD, it will create/check a different file silently — Phase 0
+    accepts this; Phase 1's runbook should pin a canonical path.
+
     All methods are static — there is no per-instance state. The CLI
     `arena kill` calls activate(); `arena unkill --human-confirm` calls
     deactivate(); the watchdog polls is_active() before every provider
