@@ -1,0 +1,8 @@
+schema_version: fixture_manifest.v1
+files:
+  train.csv: ce662da7f3c06e3b360924e0f64272632cece7289b5354e0a80496ca00833a64
+  test.csv: b11153a6af293d98b552d9eeccfd11c0acc26f1f4f4492780bc1dda17112cc8e
+  hidden_labels.csv: 0873f5c25f9836688e323e2fc74c1e0a422fed21743d37d64fdd2eb493e83995
+  sample_submission.csv: 60c86ee58e52c1a92f3b0823a75dcc0f92733e745be5085823149f6e65af02b8
+  rules.md: 6132ec7fb7bd283ce798593d233eb4c61a6ae25e9bdaeee29a8fc4b74b092ffd
+  competition.yaml: 83ac3ef5f85687ddd025d40fd5639b5ac8efd3b869dbe82b39000f4255cfab78

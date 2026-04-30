@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/strategist_recommendation.schema.json",
+  "title": "StrategistRecommendation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "recommendation_id", "competition_slug", "reason", "summary", "recommended_tasks", "risks", "tasks_to_stop"],
+  "properties": {
+    "schema_version": {"const": "strategist_recommendation.v1"},
+    "recommendation_id": {"type": "string", "pattern": "^strat_[0-9]{4,}$"},
+    "competition_slug": {"type": "string"},
+    "reason": {"enum": ["queue_empty", "plateau", "human_requested", "repeated_failure", "phase_transition"]},
+    "summary": {"type": "string", "minLength": 10},
+    "recommended_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task_type", "priority", "rationale", "expected_cost", "risk", "smallest_test", "stop_condition"],
+        "properties": {
+          "task_type": {"type": "string"},
+          "priority": {"enum": ["low", "medium", "high"]},
+          "rationale": {"type": "string", "minLength": 10},
+          "expected_cost": {"enum": ["tiny", "small", "medium", "large"]},
+          "risk": {"enum": ["low", "medium", "high"]},
+          "smallest_test": {"type": "string", "minLength": 10},
+          "stop_condition": {"type": "string", "minLength": 10}
+        }
+      }
+    },
+    "risks": {"type": "array", "items": {"type": "string"}},
+    "tasks_to_stop": {"type": "array", "items": {"type": "string"}}
+  }
+}

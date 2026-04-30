@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/research_review.schema.json",
+  "title": "ResearchReview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "review_id", "competition_slug", "subject_id", "decision", "summary", "strengths", "weaknesses", "required_fixes", "follow_up_recommendations", "risk_level"],
+  "properties": {
+    "schema_version": {"const": "research_review.v1"},
+    "review_id": {"type": "string", "pattern": "^rr_[0-9]{4,}$"},
+    "competition_slug": {"type": "string"},
+    "subject_id": {"type": "string"},
+    "decision": {"enum": ["accept", "reject", "revise", "run_proxy", "stop"]},
+    "summary": {"type": "string", "minLength": 10},
+    "strengths": {"type": "array", "items": {"type": "string"}},
+    "weaknesses": {"type": "array", "items": {"type": "string"}},
+    "required_fixes": {"type": "array", "items": {"type": "string"}},
+    "follow_up_recommendations": {"type": "array", "items": {"type": "string"}},
+    "risk_level": {"enum": ["low", "medium", "high"]}
+  }
+}

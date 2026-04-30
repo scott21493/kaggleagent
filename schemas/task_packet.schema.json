@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/task_packet.schema.json",
+  "title": "TaskPacket",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "competition_slug",
+    "provider",
+    "role",
+    "phase",
+    "objective",
+    "inputs",
+    "allowed_paths",
+    "blocked_paths",
+    "budgets",
+    "required_outputs",
+    "success_criteria"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "task_packet.v1"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^task_[0-9]{4,}$"
+    },
+    "competition_slug": {
+      "type": "string"
+    },
+    "experiment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "type": "string"
+    },
+    "role": {
+      "enum": [
+        "implementation",
+        "review",
+        "advisory_planning",
+        "research_proxy",
+        "deterministic",
+        "fix"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "NEW",
+        "FIXTURE_INITIALIZED",
+        "PLAN_CREATED",
+        "CALIBRATION_TASK_CREATED",
+        "CALIBRATION_IMPLEMENTED",
+        "CALIBRATION_EVALUATED",
+        "CALIBRATION_REVIEWED",
+        "RESEARCH_QUESTION_CREATED",
+        "METHOD_DIGEST_CREATED",
+        "FUSION_PROPOSAL_CREATED",
+        "FUSION_PROXY_IMPLEMENTED",
+        "FUSION_PROXY_EVALUATED",
+        "FUSION_PROXY_REVIEWED",
+        "MEMORY_PROPOSAL_CREATED",
+        "SELF_IMPROVEMENT_SCAN_COMPLETED",
+        "HARNESS_EVAL_COMPLETED",
+        "PHASE0_COMPLETE",
+        "BLOCKED_AUTH",
+        "BLOCKED_BUDGET",
+        "BLOCKED_SANDBOX",
+        "BLOCKED_SCHEMA",
+        "BLOCKED_SECRET_ACCESS",
+        "BLOCKED_NETWORK",
+        "BLOCKED_PROTECTED_FILE",
+        "BLOCKED_KILL_SWITCH",
+        "BLOCKED_REPRODUCIBILITY",
+        "NEEDS_HUMAN"
+      ]
+    },
+    "objective": {
+      "type": "string",
+      "minLength": 10
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocked_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_wall_minutes",
+        "max_shell_commands",
+        "max_failed_commands",
+        "max_input_chars",
+        "max_output_chars"
+      ],
+      "properties": {
+        "max_wall_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_shell_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_failed_commands": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_input_chars": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_chars": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "required_outputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "success_criteria": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

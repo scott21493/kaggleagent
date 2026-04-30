@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  phase0-stub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install '.[dev]'
+      - name: Lint
+        run: ruff check .
+      - name: Format check
+        run: ruff format --check .
+      - name: Type check
+        run: mypy arena
+      - name: Validate JSON schemas as schemas
+        run: python scripts/validate_schemas.py
+      - name: Prompt delimiter structural check
+        run: python scripts/validate_prompt_delimiters.py
+      - name: Fixture manifest and smoke check
+        run: python scripts/fixture_smoke.py
+      - name: Sandbox policy static check
+        run: python scripts/static_sandbox_policy_check.py
+      - name: Memory proposal schema check
+        run: python scripts/validate_memory_examples.py
+      - name: Scoreboard migration check
+        run: python scripts/check_migrations.py
+      - name: Tests with coverage gate
+        run: pytest --cov=arena --cov-report=term-missing -q
+      - name: Dependency vulnerability audit
+        run: pip-audit

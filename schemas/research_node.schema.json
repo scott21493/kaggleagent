@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/research_node.schema.json",
+  "title": "ResearchNode",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "node_id", "competition_slug", "node_type", "parent_ids", "status", "summary", "evidence_refs", "created_at"],
+  "properties": {
+    "schema_version": {"const": "research_node.v1"},
+    "node_id": {"type": "string", "pattern": "^rn_[0-9]{4,}$"},
+    "competition_slug": {"type": "string"},
+    "node_type": {"enum": ["question", "digest", "fusion", "proxy_experiment", "ablation", "failure_analysis", "memory_update"]},
+    "parent_ids": {"type": "array", "items": {"type": "string"}},
+    "status": {"enum": ["proposed", "queued", "running", "completed", "rejected", "blocked"]},
+    "summary": {"type": "string", "minLength": 5},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

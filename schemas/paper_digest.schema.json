@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/paper_digest.schema.json",
+  "title": "PaperDigest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "digest_id",
+    "source_id",
+    "title",
+    "source_type",
+    "trusted_status",
+    "mechanisms",
+    "assumptions",
+    "datasets_or_tasks",
+    "metrics",
+    "implementation_clues",
+    "failure_modes",
+    "applicability",
+    "citations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "paper_digest.v1"
+    },
+    "digest_id": {
+      "type": "string",
+      "pattern": "^pd_[0-9]{4,}$"
+    },
+    "source_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_type": {
+      "enum": [
+        "local_method_note",
+        "paper",
+        "abstract",
+        "kaggle_writeup",
+        "other"
+      ]
+    },
+    "trusted_status": {
+      "enum": [
+        "trusted_fixture",
+        "quarantined_untrusted",
+        "human_verified",
+        "local_method_note"
+      ]
+    },
+    "mechanisms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "why_it_might_help"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 2
+          },
+          "description": {
+            "type": "string",
+            "minLength": 10
+          },
+          "why_it_might_help": {
+            "type": "string",
+            "minLength": 10
+          }
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "datasets_or_tasks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "implementation_clues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "failure_modes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "competition_slug",
+        "fit",
+        "reason"
+      ],
+      "properties": {
+        "competition_slug": {
+          "type": "string"
+        },
+        "fit": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 10
+        }
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ref",
+          "summary"
+        ],
+        "properties": {
+          "ref": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

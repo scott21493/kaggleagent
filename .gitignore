@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual env
+.venv/
+venv/
+ENV/
+env/
+
+# Testing / type checking caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific local-only state
+.env
+.env.local
+.arena/
+worktrees/
+artifacts/
+traces/
+competitions/*/data/
+competitions/*/predictions/
+competitions/*/models/
+competitions/*/submissions/
+
+# Note: .secrets.baseline IS committed (it is the detect-secrets baseline).

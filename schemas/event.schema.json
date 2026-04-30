@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/event.schema.json",
+  "title": "HarnessEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "timestamp",
+    "run_id",
+    "severity",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "event.v1"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[0-9]{4,}$"
+    },
+    "event_type": {
+      "enum": [
+        "run_started",
+        "run_finished",
+        "task_created",
+        "task_started",
+        "task_finished",
+        "provider_invoked",
+        "provider_output_captured",
+        "provider_version_recorded",
+        "schema_validated",
+        "shell_command_observed",
+        "file_read_observed",
+        "file_write_observed",
+        "blocked_path_attempted",
+        "network_attempted",
+        "waste_event_detected",
+        "breaker_triggered",
+        "score_recorded",
+        "review_recorded",
+        "memory_proposal_created",
+        "self_improvement_scan_completed"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "enum": [
+        "debug",
+        "info",
+        "warning",
+        "error",
+        "critical"
+      ]
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_version": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "command": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "breaker": {
+          "enum": [
+            "ProviderCallBreaker",
+            "WallClockBreaker",
+            "ShellCommandBreaker",
+            "RepeatedFailureBreaker",
+            "WasteEventBreaker",
+            "SecretAccessBreaker",
+            "NetworkEgressBreaker",
+            "ProtectedFileBreaker",
+            "SchemaViolationBreaker",
+            "AuthFailureBreaker"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "score": {
+          "type": "number"
+        },
+        "metric_name": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "schema_name": {
+          "type": "string"
+        },
+        "review_id": {
+          "type": "string"
+        },
+        "memory_update_id": {
+          "type": "string"
+        },
+        "proposal_id": {
+          "type": "string"
+        },
+        "experiment_id": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "network_domain": {
+          "type": "string"
+        },
+        "previous_hash": {
+          "type": "string"
+        },
+        "new_hash": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string"
+        },
+        "usage_proxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "provider_calls": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "input_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output_chars": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "wall_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "shell_commands": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "failed_commands": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "waste_events": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "breaker_triggered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": [
+              "breaker",
+              "evidence"
+            ],
+            "properties": {
+              "breaker": {
+                "enum": [
+                  "ProviderCallBreaker",
+                  "WallClockBreaker",
+                  "ShellCommandBreaker",
+                  "RepeatedFailureBreaker",
+                  "WasteEventBreaker",
+                  "SecretAccessBreaker",
+                  "NetworkEgressBreaker",
+                  "ProtectedFileBreaker",
+                  "SchemaViolationBreaker",
+                  "AuthFailureBreaker"
+                ]
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/fusion_proposal.schema.json",
+  "title": "FusionProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "fusion_id",
+    "competition_slug",
+    "title",
+    "hypothesis",
+    "mechanisms_combined",
+    "implementation_plan",
+    "smallest_proxy_test",
+    "ablation_plan",
+    "resource_estimate",
+    "risks",
+    "stop_condition",
+    "source_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "fusion_proposal.v1"
+    },
+    "fusion_id": {
+      "type": "string",
+      "pattern": "^fusion_[0-9]{4,}$"
+    },
+    "competition_slug": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 5
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 20
+    },
+    "mechanisms_combined": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mechanism_name",
+          "source_ref",
+          "role_in_fusion"
+        ],
+        "properties": {
+          "mechanism_name": {
+            "type": "string",
+            "minLength": 2
+          },
+          "source_ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role_in_fusion": {
+            "type": "string",
+            "minLength": 10
+          }
+        }
+      }
+    },
+    "implementation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files_to_create_or_modify",
+        "algorithm_steps",
+        "dependencies",
+        "expected_outputs"
+      ],
+      "properties": {
+        "files_to_create_or_modify": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "algorithm_steps": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "string",
+            "minLength": 5
+          }
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "expected_outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "smallest_proxy_test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "description",
+        "dataset_slice",
+        "metric",
+        "success_threshold",
+        "max_runtime_minutes"
+      ],
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 20
+        },
+        "dataset_slice": {
+          "type": "string",
+          "minLength": 3
+        },
+        "metric": {
+          "type": "string",
+          "minLength": 1
+        },
+        "success_threshold": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "metric",
+            "comparator",
+            "value"
+          ],
+          "properties": {
+            "metric": {
+              "type": "string",
+              "minLength": 1
+            },
+            "comparator": {
+              "enum": [
+                ">=",
+                ">",
+                "<=",
+                "<"
+              ]
+            },
+            "value": {
+              "type": "number"
+            }
+          }
+        },
+        "max_runtime_minutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        }
+      }
+    },
+    "ablation_plan": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "remove_or_change",
+          "expected_signal"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "remove_or_change": {
+            "type": "string"
+          },
+          "expected_signal": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "resource_estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cost_class",
+        "gpu_required",
+        "max_runtime_minutes"
+      ],
+      "properties": {
+        "cost_class": {
+          "enum": [
+            "tiny",
+            "small",
+            "medium",
+            "large"
+          ]
+        },
+        "gpu_required": {
+          "type": "boolean"
+        },
+        "max_runtime_minutes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "stop_condition": {
+      "type": "string",
+      "minLength": 10
+    },
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

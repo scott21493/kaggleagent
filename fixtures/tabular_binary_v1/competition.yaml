@@ -1,0 +1,8 @@
+slug: tabular_binary_v1
+problem_type: tabular_binary_classification
+metric: roc_auc
+higher_is_better: true
+target_column: target
+id_column: id
+external_data_allowed: false
+kaggle_submissions_allowed: 0

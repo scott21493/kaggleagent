@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/provider_result.schema.json",
+  "title": "ProviderResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "provider", "provider_version", "status", "stdout_path", "stderr_path", "artifacts", "usage_proxy", "started_at", "finished_at"],
+  "properties": {
+    "schema_version": {"const": "provider_result.v1"},
+    "task_id": {"type": "string"},
+    "provider": {"type": "string"},
+    "provider_version": {"type": "string"},
+    "status": {"enum": ["success", "failure", "blocked", "killed", "interrupted"]},
+    "stdout_path": {"type": "string"},
+    "stderr_path": {"type": "string"},
+    "artifacts": {"type": "array", "items": {"type": "string"}},
+    "usage_proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_chars", "output_chars", "wall_seconds", "shell_commands", "failed_commands", "waste_events"],
+      "properties": {
+        "input_chars": {"type": "integer", "minimum": 0},
+        "output_chars": {"type": "integer", "minimum": 0},
+        "wall_seconds": {"type": "number", "minimum": 0},
+        "shell_commands": {"type": "integer", "minimum": 0},
+        "failed_commands": {"type": "integer", "minimum": 0},
+        "waste_events": {"type": "integer", "minimum": 0}
+      }
+    },
+    "started_at": {"type": "string", "format": "date-time"},
+    "finished_at": {"type": "string", "format": "date-time"}
+  }
+}

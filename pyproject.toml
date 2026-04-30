@@ -1,0 +1,217 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kaggle-agent-arena"
+version = "0.1.0"
+description = "Autonomous local Kaggle competition lab using subscription-based coding agents, human-gated submissions, and self-improving experiment infrastructure."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+authors = [
+  { name = "Kaggle Agent Arena Team" }
+]
+keywords = [
+  "kaggle",
+  "agents",
+  "codex",
+  "claude-code",
+  "machine-learning",
+  "experiments",
+  "automation",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Build Tools",
+]
+
+# Keep core dependencies small. Phase 0 should run the fake fixture harness without GPU packages.
+dependencies = [
+  "typer>=0.12,<1.0",
+  "rich>=13.7,<15.0",
+  "pydantic>=2.7,<3.0",
+  "pydantic-settings>=2.2,<3.0",
+  "pyyaml>=6.0,<7.0",
+  "jsonschema>=4.22,<5.0",
+  "pandas>=2.0,<3.0",
+  "numpy>=1.26,<3.0",
+  "scikit-learn>=1.4,<2.0",
+  "sqlalchemy>=2.0,<3.0",
+  "psutil>=5.9,<8.0",
+  "gitpython>=3.1,<4.0",
+  "python-dotenv>=1.0,<2.0",
+  "tqdm>=4.66,<5.0",
+  "joblib>=1.3,<2.0",
+  "packaging>=24.0,<26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9.0",
+  "pytest-cov>=5.0,<8.0",
+  "pytest-mock>=3.14,<4.0",
+  "pytest-xdist>=3.6,<4.0",
+  "ruff>=0.6,<1.0",
+  "mypy>=1.10,<2.0",
+  "pre-commit>=3.7,<5.0",
+  "pip-audit>=2.7,<3.0",
+  "types-PyYAML>=6.0",
+  "types-jsonschema>=4.0",
+  "types-requests>=2.31",
+]
+
+# Traditional Kaggle ML stack. Install only after the Phase 0 fixture loop passes.
+ml = [
+  "lightgbm>=4.0,<5.0",
+  "xgboost>=2.0,<4.0",
+  "catboost>=1.2,<2.0",
+  "optuna>=3.6,<5.0",
+]
+
+# Data/file tooling that can be deferred until real competitions.
+data = [
+  "pyarrow>=15.0,<23.0",
+  "fastparquet>=2024.2.0",
+  "polars>=1.0,<2.0",
+  "duckdb>=1.0,<2.0",
+]
+
+# GPU/deep-learning dependencies are intentionally optional because CUDA/PyTorch install commands
+# are machine-specific. Install from official PyTorch instructions for the local CUDA version when ready.
+gpu = [
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "torchaudio>=2.3",
+  "accelerate>=0.30,<2.0",
+]
+
+nlp = [
+  "transformers>=4.40,<6.0",
+  "sentence-transformers>=3.0,<6.0",
+  "datasets>=2.20,<5.0",
+]
+
+vision = [
+  "pillow>=10.0,<13.0",
+  "opencv-python>=4.9,<5.0",
+  "albumentations>=1.4,<3.0",
+  "timm>=1.0,<2.0",
+]
+
+kaggle = [
+  "kaggle>=1.6,<2.0",
+]
+
+docs = [
+  "mkdocs>=1.6,<2.0",
+  "mkdocs-material>=9.5,<11.0",
+]
+
+all = [
+  "kaggle-agent-arena[dev,ml,data,nlp,vision,kaggle,docs]",
+]
+
+[project.scripts]
+arena = "arena.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["arena"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+respect-gitignore = true
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle errors
+  "F",    # pyflakes
+  "I",    # import sorting
+  "B",    # bugbear
+  "UP",   # pyupgrade
+  "SIM",  # simplify
+  "C4",   # comprehensions
+  "PIE",  # misc lint improvements
+  "RUF",  # ruff-specific checks
+]
+ignore = [
+  "E501", # line length is handled by formatter and pragmatic review
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+  ".git",
+  ".venv",
+  "competitions/*/data",
+  "competitions/*/models",
+  "competitions/*/predictions",
+  "competitions/*/submissions",
+  "worktrees",
+]
+addopts = [
+  "--strict-markers",
+  "--strict-config",
+  "--disable-warnings",
+]
+markers = [
+  "unit: fast unit tests",
+  "integration: integration tests that may touch subprocesses or git",
+  "fixture: tests that use fake competition fixtures",
+  "gpu: tests requiring a local GPU",
+  "slow: slow tests that should not run in normal Phase 0 checks",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["arena"]
+omit = [
+  "tests/*",
+  "competitions/*",
+  "worktrees/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 70
+
+[tool.mypy]
+python_version = "3.11"
+plugins = []
+warn_unused_configs = true
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+ignore_missing_imports = true
+exclude = [
+  "^competitions/",
+  "^worktrees/",
+  "^fixtures/",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+# Intentionally empty. Keep provider CLIs such as Codex, Claude Code, Gemini, and Kimi
+# installed/authenticated outside Python packaging because this project uses subscriptions,
+# not OpenAI/Anthropic/Gemini/Kimi model APIs.

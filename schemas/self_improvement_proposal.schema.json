@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/self_improvement_proposal.schema.json",
+  "title": "SelfImprovementProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "proposal_id", "problem", "evidence_refs", "proposed_change", "risk_level", "protected_files_touched", "tests_to_add", "rollback_plan", "champion_challenger_plan", "requires_human_approval"],
+  "properties": {
+    "schema_version": {"const": "self_improvement_proposal.v1"},
+    "proposal_id": {"type": "string", "pattern": "^sip_[0-9]{4,}$"},
+    "problem": {"type": "string", "minLength": 10},
+    "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "proposed_change": {"type": "string", "minLength": 10},
+    "risk_level": {"enum": ["low", "medium", "high", "critical"]},
+    "protected_files_touched": {"type": "array", "items": {"type": "string"}},
+    "tests_to_add": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "rollback_plan": {"type": "string", "minLength": 10},
+    "champion_challenger_plan": {"type": "string", "minLength": 10},
+    "requires_human_approval": {"type": "boolean"}
+  }
+}

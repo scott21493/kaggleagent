@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/review.schema.json",
+  "title": "Review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "review_id", "subject_id", "reviewer", "decision", "summary", "findings", "required_fixes", "risk_level"],
+  "properties": {
+    "schema_version": {"const": "review.v1"},
+    "review_id": {"type": "string", "pattern": "^rev_[0-9]{4,}$"},
+    "subject_id": {"type": "string"},
+    "reviewer": {"type": "string"},
+    "decision": {"enum": ["merge", "reject", "fix_required", "rerun", "human_review_required"]},
+    "summary": {"type": "string"},
+    "findings": {"type": "array", "items": {"type": "string"}},
+    "required_fixes": {"type": "array", "items": {"type": "string"}},
+    "risk_level": {"enum": ["low", "medium", "high", "critical"]}
+  }
+}

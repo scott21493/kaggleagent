@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/research_question.schema.json",
+  "title": "ResearchQuestion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "question_id", "competition_slug", "question", "motivation", "expected_mechanisms", "expected_cost", "risk", "smallest_test", "stop_condition", "source_refs"],
+  "properties": {
+    "schema_version": {"const": "research_question.v1"},
+    "question_id": {"type": "string", "pattern": "^rq_[0-9]{4,}$"},
+    "competition_slug": {"type": "string", "minLength": 1},
+    "question": {"type": "string", "minLength": 10},
+    "motivation": {"type": "string", "minLength": 10},
+    "expected_mechanisms": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 3}},
+    "expected_cost": {"enum": ["tiny", "small", "medium", "large"]},
+    "risk": {"enum": ["low", "medium", "high"]},
+    "smallest_test": {"type": "string", "minLength": 10},
+    "stop_condition": {"type": "string", "minLength": 10},
+    "source_refs": {"type": "array", "items": {"type": "string"}}
+  }
+}

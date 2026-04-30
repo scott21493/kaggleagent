@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/usage_snapshot.schema.json",
+  "title": "UsageSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "snapshot_id", "provider", "timestamp", "source", "usage_proxy", "budget_mode"],
+  "properties": {
+    "schema_version": {"const": "usage_snapshot.v1"},
+    "snapshot_id": {"type": "string"},
+    "provider": {"type": "string"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "source": {"enum": ["provider_reported", "manual", "proxy_estimate", "stub"]},
+    "usage_proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_calls", "input_chars", "output_chars", "wall_seconds"],
+      "properties": {
+        "provider_calls": {"type": "integer", "minimum": 0},
+        "input_chars": {"type": "integer", "minimum": 0},
+        "output_chars": {"type": "integer", "minimum": 0},
+        "wall_seconds": {"type": "number", "minimum": 0}
+      }
+    },
+    "budget_mode": {"enum": ["green", "yellow", "orange", "red", "killed"]}
+  }
+}

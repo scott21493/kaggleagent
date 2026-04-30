@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kaggle-agent-arena.local/schemas/experiment.schema.json",
+  "title": "Experiment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "competition_slug", "task_id", "experiment_type", "hypothesis", "status", "metrics", "artifacts", "created_at"],
+  "properties": {
+    "schema_version": {"const": "experiment.v1"},
+    "experiment_id": {"type": "string", "pattern": "^exp_[0-9]{4,}$"},
+    "competition_slug": {"type": "string"},
+    "task_id": {"type": "string"},
+    "experiment_type": {"enum": ["calibration", "research_proxy", "ablation", "debug", "harness_eval"]},
+    "hypothesis": {"type": "string"},
+    "status": {"enum": ["planned", "running", "completed", "failed", "blocked", "killed"]},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid_submission", "score", "metric_name"],
+      "properties": {
+        "valid_submission": {"type": "boolean"},
+        "score": {"type": ["number", "null"]},
+        "metric_name": {"type": "string"}
+      }
+    },
+    "artifacts": {"type": "array", "items": {"type": "string"}},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}
