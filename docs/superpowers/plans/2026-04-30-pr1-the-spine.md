@@ -610,10 +610,11 @@ from __future__ import annotations
 # arena/controller/state.py
 from __future__ import annotations
 
-from enum import Enum
+import itertools
+from enum import StrEnum
 
 
-class Phase(str, Enum):
+class Phase(StrEnum):
     NEW = "NEW"
     FIXTURE_INITIALIZED = "FIXTURE_INITIALIZED"
     PLAN_CREATED = "PLAN_CREATED"
@@ -678,7 +679,7 @@ _FORWARD = [
 
 ALLOWED_TRANSITIONS: dict[Phase, set[Phase]] = {}
 
-for src, dst in zip(_FORWARD, _FORWARD[1:], strict=False):
+for src, dst in itertools.pairwise(_FORWARD):
     # Each forward step is allowed; from any forward step you can also enter a BLOCKED_* state.
     ALLOWED_TRANSITIONS.setdefault(src, set()).add(dst)
     for blocked in _BLOCKED:
