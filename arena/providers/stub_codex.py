@@ -19,6 +19,13 @@ class StubCodexProvider(ProviderAdapter):
     constant 0.5 target predictions for every row in test.csv. The score
     against hidden_labels will be ~0.5 (random); the goal is to prove the
     pipeline, not to win the fixture.
+
+    Path assumption: invoke() reads `fixtures/<slug>/test.csv` relative to
+    the current working directory. The Phase 0 CLI invokes from repo root
+    (see Task 10's `arena init-fixture`), so this is consistent with the
+    rest of the harness. If a future caller needs to invoke from elsewhere,
+    add a `fixture_root` constructor argument and thread it through the
+    `inputs` resolution.
     """
 
     def __init__(self, workspace_root: str | Path) -> None:

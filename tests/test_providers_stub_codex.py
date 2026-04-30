@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from arena.controller.planner import create_calibration_task_packet
 from arena.providers.stub_codex import StubCodexProvider
@@ -38,3 +39,20 @@ def test_invoke_writes_valid_submission(tmp_path: Path, monkeypatch) -> None:
     assert df["target"].between(0, 1).all()
     test_df = pd.read_csv(target_dir / "test.csv")
     assert len(df) == len(test_df)
+
+
+def test_invoke_rejects_missing_experiment_id(tmp_path: Path) -> None:
+    """invoke() requires experiment_id to be set, even though the schema
+    permits null. Hand-built packets that skip exp_id must fail loudly."""
+    packet = create_calibration_task_packet(
+        competition_slug="tabular_binary_v1",
+        task_id="task_0001",
+        experiment_id="exp_0001",
+        provider="stub_codex",
+    )
+    packet["experiment_id"] = None  # schema-valid but invalid for this provider
+
+    provider = StubCodexProvider(workspace_root=tmp_path / "worktrees")
+
+    with pytest.raises(ValueError, match="experiment_id"):
+        provider.invoke(packet)
