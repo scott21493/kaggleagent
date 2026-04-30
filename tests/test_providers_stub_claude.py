@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.schemas.validate import validate
 
@@ -45,3 +47,15 @@ def test_invoke_writes_real_empty_trace_files(tmp_path: Path) -> None:
     stderr = Path(result.stderr_path)
     assert stdout.exists() and stdout.read_text() == ""
     assert stderr.exists() and stderr.read_text() == ""
+
+
+def test_invoke_rejects_missing_experiment_id(tmp_path: Path) -> None:
+    """invoke() requires experiment_id to be set, even though the schema
+    permits null. Hand-built packets that skip exp_id must fail loudly.
+    Mirrors the equivalent test on StubCodexProvider."""
+    packet = _packet()
+    packet["experiment_id"] = None  # schema-valid but invalid for this provider
+
+    provider = StubClaudeProvider(workspace_root=tmp_path / "worktrees")
+    with pytest.raises(ValueError, match="experiment_id"):
+        provider.invoke(packet)
