@@ -164,16 +164,19 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         raise typer.Exit(code=2) from exc
 
     queue = TaskQueue(RUNS_ROOT / run_id / "queue")
-    packet = queue.dequeue()
-    if packet is None:
+    peeked = queue.peek()
+    if peeked is None:
         raise typer.BadParameter(f"queue is empty for {run_id}")
 
-    if packet["provider"] != adapter.name:
+    if peeked["provider"] != adapter.name:
         raise typer.BadParameter(
-            f"packet provider {packet['provider']!r} does not match --provider "
-            f"{adapter.name!r}; task {packet['task_id']} was dequeued — run "
-            f"`arena plan {slug}` to recover"
+            f"packet provider {peeked['provider']!r} does not match --provider "
+            f"{adapter.name!r}; task {peeked['task_id']} left in queue — retry "
+            f"with `--provider {peeked['provider']}`"
         )
+
+    packet = queue.dequeue()
+    assert packet is not None  # peek confirmed presence
 
     create_workspace(WORKTREE_ROOT, packet["competition_slug"], packet["experiment_id"])
 

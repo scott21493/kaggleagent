@@ -240,3 +240,37 @@ def test_run_next_halted_by_kill_switch_leaves_task_retryable(
     # row from the first attempt because it never dequeued.
     assert exp["status"] == "completed"
     store.close()
+
+
+def test_run_next_with_valid_but_wrong_provider_leaves_task_in_queue(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid provider name that doesn't match the planned packet's
+    provider field must NOT dequeue the task. Regression for the P1 bug
+    where --provider stub_claude against a stub_codex-planned packet
+    consumed the queued file and left run-next with nothing to retry."""
+    from arena.cli import app
+
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])  # plans for stub_codex
+
+    runs = sorted((fixture_workspace / "runs").iterdir())
+    queue_dir = runs[0] / "queue"
+    assert len(list(queue_dir.glob("*.json"))) == 1, "task not enqueued by plan"
+
+    # Wrong-but-valid provider: stub_claude against a stub_codex-planned packet.
+    result = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_claude"])
+    assert result.exit_code != 0
+    assert "does not match" in result.output
+    assert "left in queue" in result.output
+
+    # Queue still has the task.
+    assert len(list(queue_dir.glob("*.json"))) == 1, (
+        "valid-but-wrong --provider must NOT dequeue; task left in queue"
+    )
+
+    # Retry with the correct provider succeeds.
+    success = runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    assert success.exit_code == 0, success.output

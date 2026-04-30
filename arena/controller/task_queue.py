@@ -35,3 +35,16 @@ class TaskQueue:
 
     def size(self) -> int:
         return len(list(self._dir.glob("*.json")))
+
+    def peek(self) -> dict | None:
+        """Return the next packet without removing it from the queue.
+
+        Symmetric with dequeue() but non-destructive. Used by callers that
+        need to validate the packet (e.g. provider match) before committing
+        to consume it. Returns None if the queue is empty.
+        """
+        files = sorted(self._dir.glob("*.json"))
+        if not files:
+            return None
+        packet: dict = json.loads(files[0].read_text(encoding="utf-8"))
+        return packet

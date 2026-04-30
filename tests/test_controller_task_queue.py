@@ -57,3 +57,18 @@ def test_queue_persists_across_instances(tmp_path: Path) -> None:
     qdir = tmp_path / "queue"
     TaskQueue(qdir).enqueue(_packet("task_0001"))
     assert TaskQueue(qdir).size() == 1
+
+
+def test_peek_returns_packet_without_removing(tmp_path: Path) -> None:
+    queue = TaskQueue(tmp_path / "queue")
+    queue.enqueue(_packet("task_0001"))
+    peeked = queue.peek()
+    assert peeked is not None
+    assert peeked["task_id"] == "task_0001"
+    # Queue is unchanged.
+    assert queue.size() == 1
+
+
+def test_peek_returns_none_on_empty(tmp_path: Path) -> None:
+    queue = TaskQueue(tmp_path / "queue")
+    assert queue.peek() is None
