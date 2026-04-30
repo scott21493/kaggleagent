@@ -94,3 +94,49 @@ def test_is_protected_write_rejects_workspace_root_write(tmp_path: Path) -> None
     p = _policy(tmp_path)
     target = tmp_path / "stray_output.txt"
     assert is_protected_write(target, p) is True
+
+
+def test_is_secret_read_flags_packet_hidden_labels(tmp_path: Path) -> None:
+    """Packet's blocked_paths must be honored — hidden labels are read-blocked
+    even though they're not in the canonical _default_blocked_paths set.
+
+    Regression for the P1 plan-review fix #2: from_packet was dropping the
+    packet's own blocked_paths, leaving fixtures/<slug>/hidden_labels.csv
+    readable. This is a leak — a provider could read the held-out labels and
+    bypass evaluation."""
+    p = SandboxPolicy.from_packet(
+        {
+            "allowed_paths": ["worktrees/tabular_binary_v1/exp_0001/"],
+            "blocked_paths": ["fixtures/tabular_binary_v1/hidden_labels.csv"],
+        },
+        workspace_root=tmp_path,
+    )
+    target = tmp_path / "fixtures" / "tabular_binary_v1" / "hidden_labels.csv"
+    assert is_secret_read(target, p) is True
+
+
+def test_is_secret_read_flags_packet_blocked_with_tilde(tmp_path: Path) -> None:
+    """Packet blocked_paths entries starting with ~ are user-home-relative
+    (planner emits them this way for the secret stores). Verify they resolve
+    correctly even when workspace_root is not the home dir."""
+    p = SandboxPolicy.from_packet(
+        {
+            "allowed_paths": ["worktrees/tabular_binary_v1/exp_0001/"],
+            "blocked_paths": ["~/.kaggle/"],
+        },
+        workspace_root=tmp_path,
+    )
+    target = Path("~/.kaggle/kaggle.json").expanduser()
+    assert is_secret_read(target, p) is True
+
+
+def test_from_packet_handles_missing_blocked_paths_key(tmp_path: Path) -> None:
+    """Synthetic test packets may omit blocked_paths entirely — the policy
+    must still build, falling back to default blocked_paths only."""
+    p = SandboxPolicy.from_packet(
+        {"allowed_paths": ["worktrees/tabular_binary_v1/exp_0001/"]},
+        workspace_root=tmp_path,
+    )
+    # Default blocked still in place: ~/.kaggle/ entry is preserved.
+    target = Path("~/.kaggle/kaggle.json").expanduser()
+    assert is_secret_read(target, p) is True

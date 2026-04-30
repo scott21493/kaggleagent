@@ -40,10 +40,14 @@ class SandboxPolicy:
         from the dequeued packet's `allowed_paths` (e.g.,
         `worktrees/tabular_binary_v1/exp_0001/`). Anything outside — including
         sibling worktrees and fixtures — trips ProtectedFileBreaker.
-    `blocked_paths`: directories the provider MUST NOT read (secret stores,
-        credential caches, .env). Reads against these trip SecretAccessBreaker.
-        Reads outside this set are unrestricted (providers may load OS libs,
-        read fixtures, etc.).
+    `blocked_paths`: directories the provider MUST NOT read. Two sources:
+        the four canonical secret stores (~/.kaggle, ~/.codex, ~/.claude,
+        .env — installed by every policy via _default_blocked_paths) PLUS
+        any per-packet `blocked_paths` entries (e.g.,
+        fixtures/<slug>/hidden_labels.csv — held-out evaluation labels).
+        Reads against any entry trip SecretAccessBreaker. Reads outside this
+        set are unrestricted (providers may load OS libs, read the rest of
+        fixtures/, etc.).
     `allowed_network_domains`: hostnames the provider MAY egress to. Matching
         is EXACT (no wildcards): an entry of `example.com` does NOT cover
         `api.example.com`. Empty means deny-all (Phase 0 default per
@@ -88,14 +92,23 @@ class SandboxPolicy:
         resolved against `workspace_root` (typically `Path.cwd()` for the
         CLI; `tmp_path` for tests).
 
-        The blocked paths come from `_default_blocked_paths(workspace_root)`
-        (so .env is workspace_root/.env, not CWD-relative); the network
-        allowlist comes from `ARENA_NETWORK_DOMAINS_ALLOWED`.
+        `packet["blocked_paths"]` is a list of paths the provider must NOT
+        read. Entries starting with `~` are user-home-relative (e.g.,
+        `~/.kaggle/`); other entries are workspace-relative (e.g.,
+        `fixtures/<slug>/hidden_labels.csv`). They are merged with the
+        canonical four-secret-store defaults.
+
+        The network allowlist comes from `ARENA_NETWORK_DOMAINS_ALLOWED`.
         """
         allowed = frozenset(_resolve(workspace_root / p) for p in packet["allowed_paths"])
+        packet_blocked = frozenset(
+            _resolve(p) if str(p).startswith("~") else _resolve(workspace_root / p)
+            for p in packet.get("blocked_paths", [])
+        )
+        blocked = _default_blocked_paths(workspace_root=workspace_root) | packet_blocked
         domains = _split_csv(os.environ.get("ARENA_NETWORK_DOMAINS_ALLOWED"))
         return cls(
             allowed_writes=allowed,
-            blocked_paths=_default_blocked_paths(workspace_root=workspace_root),
+            blocked_paths=blocked,
             allowed_network_domains=domains,
         )
