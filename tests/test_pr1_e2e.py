@@ -46,7 +46,7 @@ def test_pr1_full_loop_on_clean_workspace(fixture_workspace: Path) -> None:
     assert exp["status"] == "completed"
 
     # Acceptance criterion: ProviderResult on disk is schema-valid.
-    runs = sorted((fixture_workspace / "runs").iterdir())
+    runs = sorted(p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_"))
     result_path = runs[0] / "results" / "task_0001.json"
     payload = json.loads(result_path.read_text())
     validate("provider_result", payload)

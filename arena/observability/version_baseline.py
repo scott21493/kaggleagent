@@ -10,11 +10,11 @@ def record_provider_version(
     competition_slug: str,
     provider: str,
     version: str,
-    root: str | Path = ".baselines",
+    root: str | Path = "runs/.baselines",
 ) -> tuple[bool, str | None]:
     """Record a provider+version pair against the per-slug baseline.
 
-    The baseline file lives at `<root>/<competition_slug>/provider_versions.json`.
+    The baseline file lives at `runs/.baselines/<competition_slug>/provider_versions.json`.
     Maps `{provider: version}`. SCOPED PER SLUG (not per run_id) so drift
     is detected across `arena init-fixture` cycles — a fresh run that
     introduces a new provider version is correctly flagged.
