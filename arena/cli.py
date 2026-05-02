@@ -16,6 +16,8 @@ from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import validate_fixture_manifest
+from arena.observability.replay import replay_run
+from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
 from arena.observability.version_baseline import record_provider_version
 from arena.providers.base import ProviderAdapter, UsageProxy
@@ -377,6 +379,27 @@ def evaluate(
     experiment_id: str = exp["experiment_id"]
     store.update_experiment_score(experiment_id, score=eval_result.score)
     store.update_experiment_validation(experiment_id, valid_submission=True)
+
+    # PR4: emit score_recorded into the run's trace store so `arena replay`
+    # can reconstruct the actual evaluated score. Pull the run_id off the
+    # experiment row (run_next persisted it). When run_id is missing
+    # (e.g., a manually-seeded experiment from a fixture-smoke test) the
+    # emit is skipped — no run, no trace dir.
+    run_id_for_event = exp["run_id"]
+    if run_id_for_event:
+        evaluate_trace_store = TraceStore(run_id=run_id_for_event, root=TRACES_ROOT)
+        evaluate_trace_store.emit(
+            event_type="score_recorded",
+            severity="info",
+            task_id=exp["task_id"],
+            payload={
+                "score": eval_result.score,
+                "metric_name": exp["metric_name"] or "",
+                "experiment_id": experiment_id,
+                "status": "valid" if eval_result.valid_submission else "invalid",
+            },
+        )
+
     console.print(f"score={eval_result.score:.6f}")
 
 
@@ -436,3 +459,31 @@ def budget_status(
     color = "red" if kill_active else "green"
     state = "ACTIVE" if kill_active else "inactive"
     console.print(f"  kill_switch: [{color}]{state}[/{color}]")
+
+
+@app.command()
+def replay(run_id: str) -> None:
+    """Reconstruct a run's view from its event traces."""
+    view = replay_run(run_id=run_id)
+    console.print(f"[green]Run {view.run_id}: {len(view.tasks)} task(s)[/green]")
+    if view.fixture_manifest_hash:
+        console.print(f"fixture_manifest_hash: {view.fixture_manifest_hash}")
+    for task in view.tasks:
+        breakers = ", ".join(task.breakers) or "none"
+        console.print(
+            f"  {task.task_id}: status={task.status} score={task.score} "
+            f"provider={task.provider}@{task.provider_version} breakers={breakers}"
+        )
+    if view.breaker_counts:
+        for breaker, count in sorted(view.breaker_counts.items()):
+            console.print(f"[red]{breaker}: {count}[/red]")
+
+
+@app.command()
+def report(competition_slug: str) -> None:
+    """Render a markdown run report for the latest run of `competition_slug`."""
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(f"no run for {competition_slug}")
+    view = replay_run(run_id=run_id)
+    print(render_run_report(view))
