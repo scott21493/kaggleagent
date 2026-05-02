@@ -47,7 +47,11 @@ class TraceStore:
                 for line in jsonl.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
                         continue
-                    event = json.loads(line)
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        # Corrupt or partially-written line — skip and continue.
+                        continue
                     eid = event.get("event_id", "")
                     if eid.startswith("evt_"):
                         try:
@@ -57,7 +61,7 @@ class TraceStore:
                         if n > max_seen:
                             max_seen = n
             except OSError:
-                # Truncated trace from a crashed run — ignore and keep scanning.
+                # Truncated or unreadable trace file — skip and continue.
                 continue
         return max_seen
 
@@ -83,7 +87,13 @@ class TraceStore:
         task_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate, scrub, and append one event. Returns the event dict
-        (post-scrub) so the caller can include it in error messages."""
+        (post-scrub) so the caller can include it in error messages.
+
+        On ValidationError the counter rolls back so subsequent emits
+        produce contiguous evt_NNNN ids — no gaps in the trace.
+        """
+        from jsonschema import ValidationError
+
         event = make_event(
             event_type=event_type,
             run_id=self._run_id,
@@ -92,7 +102,14 @@ class TraceStore:
             payload=self._scrub_payload(payload),
             task_id=task_id,
         )
-        validate_event(event)
+        try:
+            validate_event(event)
+        except ValidationError:
+            # Roll back the counter so the failed event_id is reusable —
+            # otherwise replay sees gaps and downstream tooling has to
+            # accommodate non-contiguous ids.
+            self._counter -= 1
+            raise
         log_path = self._log_path(task_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as handle:

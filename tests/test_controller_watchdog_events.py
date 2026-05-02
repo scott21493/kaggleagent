@@ -90,6 +90,35 @@ class _SecretReadProvider(_SuccessProvider):
         return super().invoke(task_packet)
 
 
+class _OverShellCommandsProvider(_SuccessProvider):
+    """Provider whose usage_proxy claims 100 shell commands — far above
+    Phase0HardCeilings.shell_commands_per_task (35), so record_post_invoke
+    raises BudgetExceeded(Breaker.SHELL_COMMAND)."""
+
+    def invoke(self, task_packet: dict) -> ProviderResult:
+        result = super().invoke(task_packet)
+        # Replace the empty usage_proxy with cap-busting values.
+        return ProviderResult(
+            task_id=result.task_id,
+            provider=result.provider,
+            provider_version=result.provider_version,
+            status=result.status,
+            stdout_path=result.stdout_path,
+            stderr_path=result.stderr_path,
+            artifacts=result.artifacts,
+            usage_proxy={
+                "input_chars": 0,
+                "output_chars": 0,
+                "wall_seconds": 0.0,
+                "shell_commands": 100,  # >> 35 cap
+                "failed_commands": 0,
+                "waste_events": 0,
+            },
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+        )
+
+
 def test_wrap_invoke_emits_provider_invoked_and_task_finished(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -147,3 +176,33 @@ def test_wrap_invoke_emits_no_events_when_event_emitter_is_none(
     result = watchdog.wrap_invoke(_SuccessProvider(), _packet())
     assert result.status == "success"
     assert not (tmp_path / "traces").exists()
+
+
+def test_wrap_invoke_emits_breaker_triggered_on_budget_exceeded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-invoke BudgetExceeded path also emits breaker_triggered.
+    Evidence semantics differ from SandboxViolation: BudgetExceeded gives
+    the formatted exc message rather than a structured target path."""
+    from arena.budget.governor import BudgetExceeded
+
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.chdir(tmp_path)
+    governor = BudgetGovernor(Phase0HardCeilings())
+    watchdog = Watchdog(governor=governor)
+    store = TraceStore(run_id="run_x", root=tmp_path / "traces")
+
+    with pytest.raises(BudgetExceeded):
+        watchdog.wrap_invoke(_OverShellCommandsProvider(), _packet(), event_emitter=store)
+
+    log = tmp_path / "traces" / "run_x" / "task_0001" / "events.jsonl"
+    events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    types = [e["event_type"] for e in events]
+    # provider_invoked fired before invoke; breaker_triggered fired after
+    # record_post_invoke raised. task_finished is NOT emitted on this path.
+    assert types == ["provider_invoked", "breaker_triggered"]
+    breaker_evt = next(e for e in events if e["event_type"] == "breaker_triggered")
+    assert breaker_evt["payload"]["breaker"] == "ShellCommandBreaker"
+    assert breaker_evt["payload"]["evidence"]  # non-empty
+    # Evidence is a freeform string from str(exc), not a structured path.
+    assert isinstance(breaker_evt["payload"]["evidence"][0], str)

@@ -133,3 +133,45 @@ def test_event_id_counter_resume_handles_empty_run_dir(tmp_path: Path) -> None:
     log = (tmp_path / "fresh_run" / "run.jsonl").read_text(encoding="utf-8")
     first = json.loads(log.strip())
     assert first["event_id"] == "evt_0001"
+
+
+def test_event_id_counter_resume_skips_corrupt_jsonl_lines(tmp_path: Path) -> None:
+    """A corrupt JSONL line (truncated write, manual edit) must NOT crash
+    TraceStore construction. The scan skips bad lines and resumes from the
+    highest valid evt_NNNN id found."""
+    run_dir = tmp_path / "run_x"
+    run_dir.mkdir()
+    # Write a mix of valid + corrupt lines.
+    valid_event = '{"schema_version":"event.v1","event_id":"evt_0007","event_type":"run_started","timestamp":"2026-05-02T12:00:00+00:00","run_id":"run_x","task_id":null,"severity":"info","payload":{}}'
+    (run_dir / "run.jsonl").write_text(
+        valid_event + "\n{ this is not json\n",  # second line corrupt
+        encoding="utf-8",
+    )
+    # Should NOT raise.
+    store = TraceStore(run_id="run_x", root=tmp_path)
+    store.emit(event_type="task_started", severity="info", task_id="task_0001", payload={})
+    log = (tmp_path / "run_x" / "task_0001" / "events.jsonl").read_text(encoding="utf-8")
+    new_event = json.loads(log.strip())
+    # Counter resumed past evt_0007 from the valid line — corrupt line skipped.
+    assert new_event["event_id"] == "evt_0008"
+
+
+def test_emit_rollback_counter_on_validation_error(tmp_path: Path) -> None:
+    """When emit raises ValidationError, the counter must roll back so the
+    next successful emit gets the same evt_NNNN id (no gap)."""
+    from jsonschema import ValidationError
+
+    store = TraceStore(run_id="run_x", root=tmp_path)
+    store.emit(event_type="run_started", severity="info", payload={})  # evt_0001
+    with pytest.raises(ValidationError):
+        store.emit(
+            event_type="not_a_real_event",  # type: ignore[arg-type]
+            severity="info",
+            task_id="task_0001",
+            payload={},
+        )
+    # Counter rolled back; next emit gets evt_0002 (not evt_0003).
+    store.emit(event_type="task_started", severity="info", task_id="task_0001", payload={})
+    log = (tmp_path / "run_x" / "task_0001" / "events.jsonl").read_text(encoding="utf-8")
+    new_event = json.loads(log.strip())
+    assert new_event["event_id"] == "evt_0002"

@@ -46,6 +46,9 @@ class Watchdog:
         self._kill_switch = kill_switch
 
     def check_can_invoke(self, provider_name: str) -> None:
+        """Pre-dequeue check. Raises KillSwitchActive if the kill switch is
+        active, or BudgetExceeded if the next provider call would exceed
+        run-level call counts. Does not touch the queue."""
         if self._kill_switch.is_active():
             raise KillSwitchActive(f"kill switch active; refusing to invoke {provider_name!r}")
         self._governor.check_pre_invoke(provider_name)
@@ -58,6 +61,24 @@ class Watchdog:
         sandbox: SandboxRunner | None = None,
         event_emitter: TraceStore | None = None,
     ) -> ProviderResult:
+        """Invoke the provider with optional sandbox and trace emission.
+
+        Caller should have already called check_can_invoke(adapter.name);
+        this method skips the kill-switch and pre-invoke checks (no
+        re-check during invoke per PR2 plan §8; PR7 will add per-event
+        polling for long-running subprocess providers).
+
+        When `sandbox` is set, activates it via runner.context() for the
+        duration of adapter.invoke; SandboxViolation propagates and
+        record_post_invoke is correctly skipped.
+
+        When `event_emitter` is set, emits provider_invoked before invoke
+        and task_finished after a successful record_post_invoke.
+        SandboxViolation and BudgetExceeded both emit breaker_triggered
+        events (with breaker + evidence) before re-raising. The trace
+        always shows a complete causal chain: provider_invoked -> either
+        task_finished OR breaker_triggered, never both.
+        """
         sandbox_ctx: AbstractContextManager[object] = (
             sandbox.context() if sandbox is not None else nullcontext()
         )
