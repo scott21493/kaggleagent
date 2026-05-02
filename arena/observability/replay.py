@@ -27,6 +27,18 @@ class RunReplayView:
     breaker_counts: dict[str, int]
 
 
+def _event_id_numeric(evt: dict) -> int:
+    """Extract the integer suffix from an evt_NNNN id for numeric sort.
+    Lexicographic sort would put evt_10000 before evt_9999."""
+    eid = evt.get("event_id", "")
+    if eid.startswith("evt_"):
+        try:
+            return int(eid[len("evt_") :])
+        except ValueError:
+            return 0
+    return 0
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -64,7 +76,7 @@ def replay_run(*, run_id: str, root: str | Path = "traces") -> RunReplayView:
     for task_dir in sorted(p for p in run_root.iterdir() if p.is_dir()):
         all_events.extend(_read_jsonl(task_dir / "events.jsonl"))
 
-    all_events.sort(key=lambda e: e["event_id"])
+    all_events.sort(key=_event_id_numeric)
 
     fixture_hash: str | None = None
     summaries: dict[str, TaskSummary] = {}
@@ -102,7 +114,10 @@ def replay_run(*, run_id: str, root: str | Path = "traces") -> RunReplayView:
                 summary.breakers.append(breaker)
                 breaker_counter[breaker] += 1
 
-    tasks = sorted(summaries.values(), key=lambda s: s.first_event_id)
+    tasks = sorted(
+        summaries.values(),
+        key=lambda s: _event_id_numeric({"event_id": s.first_event_id}),
+    )
     return RunReplayView(
         run_id=run_id,
         fixture_manifest_hash=fixture_hash,

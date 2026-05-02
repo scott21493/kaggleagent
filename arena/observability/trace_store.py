@@ -10,6 +10,21 @@ from arena.observability.events import make_event, validate_event
 from arena.observability.scrubber import scrub_text
 
 
+def _scrub_value(value: Any) -> Any:
+    """Recursively scrub strings inside lists/dicts; pass through non-strings.
+
+    Used by TraceStore._scrub_payload to ensure no secret-bearing string
+    escapes into JSONL traces, regardless of nesting depth.
+    """
+    if isinstance(value, str):
+        return scrub_text(value)
+    if isinstance(value, list):
+        return [_scrub_value(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _scrub_value(v) for k, v in value.items()}
+    return value
+
+
 class TraceStore:
     """Append-only JSONL event log per run.
 
@@ -79,8 +94,15 @@ class TraceStore:
         return f"evt_{self._counter:04d}"
 
     def _scrub_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Apply scrub_text to every string-valued payload field."""
-        return {k: (scrub_text(v) if isinstance(v, str) else v) for k, v in payload.items()}
+        """Apply scrub_text to every string-valued payload field, recursively
+        through lists and nested dicts.
+
+        The event schema has `evidence: array of strings` (required by
+        breaker_triggered) — without recursive scrubbing, secrets inside
+        evidence arrays would land unscrubbed in the JSONL trace. Same
+        risk applies to any future nested-dict payload field.
+        """
+        return {k: _scrub_value(v) for k, v in payload.items()}
 
     def _log_path(self, task_id: str | None) -> Path:
         if task_id is None:

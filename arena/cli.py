@@ -234,31 +234,38 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     # manifest), so corrupting train.csv after init-fixture is detected.
     try:
         fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / slug)
-    except FileNotFoundError as exc:
-        # Manifest missing post-dequeue (fixtures dir deleted, slug typo,
-        # pipeline corruption). Without this guard the FileNotFoundError
-        # would propagate as an unhandled exception with a traceback,
-        # leaving the task permanently lost from the queue. Persist a
-        # blocked row and exit cleanly.
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        # Two failure modes converge here:
+        # 1. FileNotFoundError: fixture manifest missing post-dequeue
+        #    (fixtures dir deleted, slug typo, pipeline corruption).
+        # 2. JSONDecodeError: runs/.baselines/<slug>/fixture_hash.json is
+        #    corrupt (incomplete write, manual edit, disk corruption).
+        # Either way, the task is already dequeued — without this guard
+        # the exception would propagate as an unhandled traceback,
+        # leaving the task permanently lost. Persist a blocked row and
+        # exit cleanly. Corrupt baseline = reproducibility violation.
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {slug}: {exc}"
         _persist_blocked_experiment(
             store=store,
             packet=packet,
             run_id=run_id,
             adapter=adapter,
             breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
-            message=f"fixture manifest missing for {slug}: {exc}",
+            message=message,
             usage_proxy=None,
         )
         console.print(
             f"[red]task {packet['task_id']} blocked: "
-            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (fixture manifest missing for {slug})[/red]"
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
         )
         raise typer.Exit(code=2) from exc
-
-    _is_new_fixture, drifted_from_fixture = record_fixture_hash(
-        competition_slug=slug,
-        fixture_hash=fixture_hash,
-    )
     trace_store.emit(
         event_type="run_started",
         severity="info" if not drifted_from_fixture else "error",
@@ -292,11 +299,29 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         )
         raise typer.Exit(code=2)
 
-    _is_new, drifted_from = record_provider_version(
-        competition_slug=slug,
-        provider=adapter.name,
-        version=adapter.version,
-    )
+    try:
+        _is_new, drifted_from = record_provider_version(
+            competition_slug=slug,
+            provider=adapter.name,
+            version=adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        # runs/.baselines/<slug>/provider_versions.json is corrupt.
+        # Same task-loss risk as the fixture-hash block above; same fix.
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=f"provider version baseline corrupt for {slug}: {exc}",
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (provider version baseline corrupt for {slug})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
     trace_store.emit(
         event_type="provider_version_recorded",
         severity="warning" if drifted_from else "info",

@@ -110,3 +110,33 @@ def test_replay_run_started_carries_fixture_hash(tmp_path: Path) -> None:
 def test_replay_raises_on_missing_run(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         replay_run(run_id="nonexistent", root=tmp_path)
+
+
+def test_replay_orders_event_ids_numerically_not_lexicographically(tmp_path: Path) -> None:
+    """evt_10000 must come AFTER evt_9999. Lexicographic sort would put
+    evt_10000 first ("1" < "9"); numeric sort puts evt_9999 first.
+
+    Phase 0 doesn't reach 10k events, but the schema permits 4+ digits
+    and PR7's longer runs will cross the threshold. Lock the contract now."""
+    run_dir = tmp_path / "run_x"
+    run_dir.mkdir()
+    # Write two events directly with explicit event_ids spanning the
+    # 10000 boundary. We use validated event JSON (timestamp passes
+    # date-time format) so the events would round-trip through
+    # validate_event if we re-validated here.
+    e9999 = (
+        '{"schema_version":"event.v1","event_id":"evt_9999",'
+        '"event_type":"task_started","timestamp":"2026-05-02T12:00:00+00:00",'
+        '"run_id":"run_x","task_id":"task_old","severity":"info","payload":{}}'
+    )
+    e10000 = (
+        '{"schema_version":"event.v1","event_id":"evt_10000",'
+        '"event_type":"task_started","timestamp":"2026-05-02T12:00:01+00:00",'
+        '"run_id":"run_x","task_id":"task_new","severity":"info","payload":{}}'
+    )
+    (run_dir / "run.jsonl").write_text(e9999 + "\n" + e10000 + "\n", encoding="utf-8")
+
+    view = replay_run(run_id="run_x", root=tmp_path)
+    # Numeric ordering: task_old (evt_9999) appears FIRST,
+    # task_new (evt_10000) appears second.
+    assert [t.task_id for t in view.tasks] == ["task_old", "task_new"]
