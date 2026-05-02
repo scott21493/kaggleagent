@@ -1,11 +1,13 @@
+# arena/controller/watchdog.py
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
 
-from arena.budget.governor import BudgetGovernor
+from arena.budget.governor import BudgetExceeded, BudgetGovernor
 from arena.budget.kill_switch import KillSwitch
+from arena.observability.trace_store import TraceStore
 from arena.providers.base import ProviderAdapter, ProviderResult
-from arena.sandbox.runner import SandboxRunner
+from arena.sandbox.runner import SandboxRunner, SandboxViolation
 
 
 class KillSwitchActive(Exception):
@@ -18,31 +20,21 @@ class KillSwitchActive(Exception):
 
 
 class Watchdog:
-    """Wraps a provider invocation with kill-switch, budget, and sandbox checks.
+    """Wraps a provider invocation with kill-switch, budget, sandbox, and
+    event-emission concerns.
 
-    The API is split so callers can check before they dequeue (so a blocked
-    invoke leaves the queued task retryable):
+    Phases:
 
     - check_can_invoke(provider_name): kill switch + pre-invoke budget.
       Call BEFORE TaskQueue.dequeue.
-    - wrap_invoke(adapter, packet, *, sandbox=None): activate sandbox →
-      provider.invoke → post-invoke budget. Call AFTER dequeue.
+    - wrap_invoke(adapter, packet, *, sandbox=None, event_emitter=None):
+      activate sandbox → emit provider_invoked → adapter.invoke →
+      emit task_finished (or breaker_triggered) → post-invoke budget.
 
-    The sandbox is passed PER-CALL because its policy is packet-scoped (built
-    from the dequeued packet's allowed_paths). The watchdog itself stays
-    packet-agnostic. When `sandbox` is None, `wrap_invoke` runs without
-    sandbox enforcement (PR2 backward compat + tests that don't exercise the
-    sandbox path).
-
-    Providers register filesystem/network intent via assert_sandbox_allowed
-    inside their invoke; the active sandbox raises SandboxViolation on the
-    first policy violation, which propagates through wrap_invoke for the
-    CLI to handle.
-
-    The waste detector's repeated-same-failure tracking is event-level
-    (PR4); the watchdog does not call it in PR2/PR3. Per-task waste cap
-    enforcement happens inside governor.record_post_invoke from
-    usage_proxy['waste_events'] and usage_proxy['failed_commands'].
+    The sandbox and event_emitter are passed PER-CALL because both have
+    packet-scoped lifetime (sandbox policy, run-level trace store). The
+    watchdog itself stays packet-agnostic. When either is None, the
+    relevant behavior is a no-op (PR2/PR3 backward compat).
     """
 
     def __init__(
@@ -54,9 +46,6 @@ class Watchdog:
         self._kill_switch = kill_switch
 
     def check_can_invoke(self, provider_name: str) -> None:
-        """Pre-dequeue check. Raises KillSwitchActive if the kill switch is
-        active, or BudgetExceeded if the next provider call would exceed
-        run-level call counts. Does not touch the queue."""
         if self._kill_switch.is_active():
             raise KillSwitchActive(f"kill switch active; refusing to invoke {provider_name!r}")
         self._governor.check_pre_invoke(provider_name)
@@ -67,30 +56,50 @@ class Watchdog:
         packet: dict,
         *,
         sandbox: SandboxRunner | None = None,
+        event_emitter: TraceStore | None = None,
     ) -> ProviderResult:
-        """Invoke the provider with the (optional) sandbox active and
-        validate the returned UsageProxy against per-task and per-run
-        ceilings.
-
-        Caller should have already called check_can_invoke(adapter.name);
-        this method skips the kill-switch and pre-invoke checks.
-
-        `sandbox`, when provided, is activated via runner.context() for the
-        duration of adapter.invoke(packet) and deactivated on both success
-        and exception (the context manager guarantees this). SandboxViolation
-        propagates back to the caller, who translates it into a status=blocked
-        row.
-        """
         sandbox_ctx: AbstractContextManager[object] = (
             sandbox.context() if sandbox is not None else nullcontext()
         )
-        # No re-check of the kill switch here: see PR2 plan §8. PR7 will
-        # add per-event polling for long-running subprocess providers.
-        with sandbox_ctx:
-            result = adapter.invoke(packet)
-        self._governor.record_post_invoke(
-            adapter.name,
-            result.usage_proxy,
-            task_id=packet["task_id"],
-        )
+        if event_emitter is not None:
+            event_emitter.emit(
+                event_type="provider_invoked",
+                severity="info",
+                task_id=packet["task_id"],
+                payload={"provider": adapter.name, "provider_version": adapter.version},
+            )
+        try:
+            with sandbox_ctx:
+                result = adapter.invoke(packet)
+        except SandboxViolation as exc:
+            if event_emitter is not None:
+                event_emitter.emit(
+                    event_type="breaker_triggered",
+                    severity="error",
+                    task_id=packet["task_id"],
+                    payload={"breaker": exc.breaker.value, "evidence": [exc.attempt.target]},
+                )
+            raise
+        try:
+            self._governor.record_post_invoke(
+                adapter.name,
+                result.usage_proxy,
+                task_id=packet["task_id"],
+            )
+        except BudgetExceeded as exc:
+            if event_emitter is not None:
+                event_emitter.emit(
+                    event_type="breaker_triggered",
+                    severity="error",
+                    task_id=packet["task_id"],
+                    payload={"breaker": exc.breaker.value, "evidence": [str(exc)]},
+                )
+            raise
+        if event_emitter is not None:
+            event_emitter.emit(
+                event_type="task_finished",
+                severity="info",
+                task_id=packet["task_id"],
+                payload={"status": result.status, "provider": adapter.name},
+            )
         return result
