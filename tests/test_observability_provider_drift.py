@@ -29,10 +29,12 @@ def test_provider_version_drift_flags_experiment_row(
 
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
-    exp1 = store.get_latest_experiment("tabular_binary_v1")
-    assert exp1 is not None
-    assert "PROVIDER_VERSION_CHANGED" not in (exp1["artifact_paths"] or "")
-    store.close()
+    try:
+        exp1 = store.get_latest_experiment("tabular_binary_v1")
+        assert exp1 is not None
+        assert "PROVIDER_VERSION_CHANGED" not in (exp1["artifact_paths"] or "")
+    finally:
+        store.close()
 
     # Force a version change for the second invocation.
     monkeypatch.setattr(StubCodexProvider, "version", property(lambda self: "stub_codex.v999"))
@@ -44,8 +46,10 @@ def test_provider_version_drift_flags_experiment_row(
 
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
-    exp2 = store.get_latest_experiment("tabular_binary_v1")
-    assert exp2 is not None
-    assert "PROVIDER_VERSION_CHANGED" in (exp2["artifact_paths"] or "")
-    assert "from=stub_codex.v1" in (exp2["artifact_paths"] or "")
-    store.close()
+    try:
+        exp2 = store.get_latest_experiment("tabular_binary_v1")
+        assert exp2 is not None
+        assert "PROVIDER_VERSION_CHANGED" in (exp2["artifact_paths"] or "")
+        assert "from=stub_codex.v1" in (exp2["artifact_paths"] or "")
+    finally:
+        store.close()

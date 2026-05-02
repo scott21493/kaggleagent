@@ -32,6 +32,7 @@ DB_PATH = Path("scoreboard.sqlite")
 RUNS_ROOT = Path("runs")
 WORKTREE_ROOT = Path("worktrees")
 FIXTURES_ROOT = Path("fixtures")
+TRACES_ROOT = Path("traces")
 
 # Tag appended to artifact_paths when provider_version drift is detected.
 # NOT a Phase enum value — provider drift is informational, the run
@@ -213,7 +214,7 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     # the provider_version_recorded event. Drift produces a warning event
     # and a PROVIDER_VERSION_CHANGED tag in artifact_paths but does NOT
     # halt the run (informational, not a breaker).
-    trace_store = TraceStore(run_id=run_id, root="traces")
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
     _is_new, drifted_from = record_provider_version(
         competition_slug=slug,
         provider=adapter.name,
@@ -226,6 +227,9 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         payload={
             "provider": adapter.name,
             "provider_version": adapter.version,
+            # previous_hash field is reused from the fixture-drift use case
+            # (Task 7); here it carries the previous PROVIDER VERSION string,
+            # not a content hash. The field is generic in event.schema.json.
             "previous_hash": drifted_from or "",
         },
     )
