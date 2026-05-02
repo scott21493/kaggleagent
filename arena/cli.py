@@ -16,6 +16,8 @@ from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import validate_fixture_manifest
+from arena.observability.trace_store import TraceStore
+from arena.observability.version_baseline import record_provider_version
 from arena.providers.base import ProviderAdapter, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
@@ -30,6 +32,14 @@ DB_PATH = Path("scoreboard.sqlite")
 RUNS_ROOT = Path("runs")
 WORKTREE_ROOT = Path("worktrees")
 FIXTURES_ROOT = Path("fixtures")
+
+# Tag appended to artifact_paths when provider_version drift is detected.
+# NOT a Phase enum value — provider drift is informational, the run
+# completes. The Phase enum is mirrored exactly by
+# schemas/task_packet.schema.json's phase list (verified by
+# tests/test_controller_state.py); adding a value without updating the
+# schema would break the drift guard.
+PROVIDER_VERSION_CHANGED_TAG = "PROVIDER_VERSION_CHANGED"
 
 
 def _store() -> ScoreboardStore:
@@ -198,11 +208,36 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     sandbox_policy = SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
     sandbox = SandboxRunner(sandbox_policy)
 
+    # PR4 observability: build the trace store, record provider-version
+    # baseline (per-slug, persists across init-fixture cycles), and emit
+    # the provider_version_recorded event. Drift produces a warning event
+    # and a PROVIDER_VERSION_CHANGED tag in artifact_paths but does NOT
+    # halt the run (informational, not a breaker).
+    trace_store = TraceStore(run_id=run_id, root="traces")
+    _is_new, drifted_from = record_provider_version(
+        competition_slug=slug,
+        provider=adapter.name,
+        version=adapter.version,
+    )
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from else "info",
+        task_id=packet["task_id"],
+        payload={
+            "provider": adapter.name,
+            "provider_version": adapter.version,
+            "previous_hash": drifted_from or "",
+        },
+    )
+    version_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from}>" if drifted_from else ""
+    )
+
     # Post-dequeue: invoke + post-invoke per-task cap check. A breaker here
     # persists a status=blocked row because the task DID run and consume
     # budget — there is no clean way to unwind that.
     try:
-        result = watchdog.wrap_invoke(adapter, packet, sandbox=sandbox)
+        result = watchdog.wrap_invoke(adapter, packet, sandbox=sandbox, event_emitter=trace_store)
     except BudgetExceeded as exc:
         _persist_blocked_experiment(
             store=store,
@@ -247,7 +282,10 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         status="completed" if result.status == "success" else result.status,
         metric_name="roc_auc",
         valid_submission=None,
-        artifact_paths=result.artifacts,
+        artifact_paths=[
+            *result.artifacts,
+            *([version_drift_tag] if version_drift_tag else []),
+        ],
         trace_path=None,
         created_at=result.finished_at,
         input_chars=result.usage_proxy["input_chars"],
