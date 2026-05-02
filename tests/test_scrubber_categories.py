@@ -80,6 +80,7 @@ def test_scrubs_auth_json_with_id_token_and_auth_token_keys() -> None:
     out = scrub_text('{"id_token":"eyJ.foo","auth_token":"abc"}')
     assert "eyJ.foo" not in out
     assert '"abc"' not in out
+    assert "<REDACTED_AUTH_JSON>" in out
 
 
 def test_scrubs_password_assignment() -> None:
@@ -105,3 +106,42 @@ def test_case_insensitive_matching() -> None:
     out_upper = scrub_text("AUTHORIZATION: BEARER abc123")
     assert "abc123" not in out_lower
     assert "abc123" not in out_upper
+
+
+def test_does_not_scrub_pure_hex_digests() -> None:
+    """Hex digests (SHA-256, git commit SHAs, etc.) share the [A-Za-z0-9+/]
+    alphabet but are NOT base64 — they must survive scrubbing so the
+    fixture_manifest_hash and similar audit values stay readable in traces."""
+    sha256_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    out = scrub_text(f"fixture_manifest_hash: {sha256_hex}")
+    assert sha256_hex in out  # NOT redacted
+    assert "<REDACTED_BASE64>" not in out
+
+
+def test_scrubs_home_path_windows_forward_slash_form(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows, USERPROFILE is C:\\Users\\name but logs often render
+    paths as C:/Users/name (pathlib.Path str form). Both must scrub."""
+    monkeypatch.setenv("ARENA_SCRUB_HOME_PATHS", "1")
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("USERPROFILE", "C:\\Users\\scott")
+    out = scrub_text("loaded C:/Users/scott/.kaggle/kaggle.json")
+    assert "C:/Users/scott" not in out
+    assert "<HOME>" in out
+
+
+def test_quoted_api_key_preserves_closing_quote() -> None:
+    """Cosmetic but matters for log parsers: the closing quote on
+    `api_key="sk-..."` must survive scrubbing."""
+    out = scrub_text('api_key="sk-1234567890abcdefghij"')
+    assert out.startswith('api_key="')
+    assert out.endswith('"')
+    assert "<REDACTED_API_KEY>" in out
+    assert "sk-1234567890abcdefghij" not in out
+
+
+def test_scrubs_long_base64_blob_includes_padding() -> None:
+    """The {0,2} padding must be inside the match; previously the trailing
+    \\b dropped it."""
+    out = scrub_text("token=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXowMTIzNDU2Nzg5QUJDREVGRw==")
+    assert "==" not in out  # padding swallowed too
+    assert "<REDACTED_BASE64>" in out
