@@ -19,6 +19,8 @@ from arena.fixture.manifest import validate_fixture_manifest
 from arena.providers.base import ProviderAdapter, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
+from arena.sandbox.policy import SandboxPolicy
+from arena.sandbox.runner import SandboxRunner, SandboxViolation
 from arena.scoreboard.store import ScoreboardStore
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
@@ -185,11 +187,18 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
 
     create_workspace(WORKTREE_ROOT, packet["competition_slug"], packet["experiment_id"])
 
+    # Build the packet-scoped sandbox AFTER dequeue: allowed_writes is the
+    # active packet's allowed_paths (this experiment's worktree only).
+    # Writes to a sibling worktree, a different competition, or fixtures
+    # all trip ProtectedFileBreaker.
+    sandbox_policy = SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
+    sandbox = SandboxRunner(sandbox_policy)
+
     # Post-dequeue: invoke + post-invoke per-task cap check. A breaker here
     # persists a status=blocked row because the task DID run and consume
     # budget — there is no clean way to unwind that.
     try:
-        result = watchdog.wrap_invoke(adapter, packet)
+        result = watchdog.wrap_invoke(adapter, packet, sandbox=sandbox)
     except BudgetExceeded as exc:
         _persist_blocked_experiment(
             store=store,
@@ -199,6 +208,18 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
             breaker_or_reason=exc.breaker.value,
             message=str(exc),
             usage_proxy=exc.usage_proxy,
+        )
+        console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except SandboxViolation as exc:
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=exc.breaker.value,
+            message=f"{exc} (target={exc.attempt.target})",
+            usage_proxy=None,
         )
         console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
         raise typer.Exit(code=2) from exc
