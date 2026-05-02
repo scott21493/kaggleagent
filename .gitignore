@@ -23,11 +23,19 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# IDE
+# IDE / agent harness
 .idea/
 .vscode/
+.claude/
 *.swp
 *~
+
+# Dependency lockfile — uv generates this on `uv sync`. Phase 0 installs via
+# `pip install '.[dev]'` per .github/workflows/ci.yml; we have NOT yet decided
+# to adopt a committed uv.lock for reproducibility. Remove this entry only as
+# a deliberate dependency-management decision, not as a side effect of running
+# uv locally.
+uv.lock
 
 # OS
 .DS_Store
