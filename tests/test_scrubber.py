@@ -1,6 +1,7 @@
+# tests/test_scrubber.py
 from __future__ import annotations
 
-from arena.security.scrubber import scrub_text
+from arena.observability.scrubber import scrub_text
 
 
 def test_scrubs_bearer_and_password() -> None:
