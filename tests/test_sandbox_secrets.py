@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from arena.sandbox.policy import SandboxPolicy
@@ -49,9 +50,7 @@ def test_is_protected_write_allows_worktree_path(tmp_path: Path) -> None:
 def test_is_protected_write_rejects_outside_worktree(tmp_path: Path) -> None:
     p = _policy(tmp_path)
     target = (
-        Path("/etc/passwd")
-        if Path("/etc").exists()
-        else Path("C:/Windows/System32/drivers/etc/hosts")
+        Path("C:/Windows/System32/drivers/etc/hosts") if os.name == "nt" else Path("/etc/passwd")
     )
     assert is_protected_write(target, p) is True
 

@@ -9,6 +9,7 @@ run blocks with the right breaker tag in the experiment row.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -118,7 +119,7 @@ def test_run_next_protected_write_trips_protected_file_breaker(
     ProtectedFileBreaker."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
-    bad_target = "/etc/passwd" if Path("/etc").exists() else "C:/Windows/System32/drivers/etc/hosts"
+    bad_target = "C:/Windows/System32/drivers/etc/hosts" if os.name == "nt" else "/etc/passwd"
     monkeypatch.setattr(
         StubCodexProvider,
         "invoke",

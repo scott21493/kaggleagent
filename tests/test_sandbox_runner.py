@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,7 @@ def test_assert_allowed_raises_on_network_egress(tmp_path: Path) -> None:
 
 def test_assert_allowed_raises_on_protected_write(tmp_path: Path) -> None:
     runner = SandboxRunner(_policy(tmp_path))
-    bad = "/etc/passwd" if Path("/etc").exists() else "C:/Windows/System32/drivers/etc/hosts"
+    bad = "C:/Windows/System32/drivers/etc/hosts" if os.name == "nt" else "/etc/passwd"
     with pytest.raises(SandboxViolation) as exc:
         runner.assert_allowed(SandboxAttempt(kind=SandboxAttemptKind.PROTECTED_WRITE, target=bad))
     assert exc.value.breaker is Breaker.PROTECTED_FILE

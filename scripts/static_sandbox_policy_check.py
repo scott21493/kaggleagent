@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -80,9 +81,7 @@ def main() -> None:
         )
 
         # Forbidden: write to a system path far outside any worktree.
-        bad_target = (
-            "/etc/passwd" if Path("/etc").exists() else "C:/Windows/System32/drivers/etc/hosts"
-        )
+        bad_target = "C:/Windows/System32/drivers/etc/hosts" if os.name == "nt" else "/etc/passwd"
         _expect_violation(
             runner,
             SandboxAttempt(kind=SandboxAttemptKind.PROTECTED_WRITE, target=bad_target),
