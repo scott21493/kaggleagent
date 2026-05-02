@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any
 
 from arena.budget.governor import BudgetExceeded, BudgetGovernor
 from arena.budget.kill_switch import KillSwitch
@@ -28,13 +29,24 @@ class Watchdog:
     - check_can_invoke(provider_name): kill switch + pre-invoke budget.
       Call BEFORE TaskQueue.dequeue.
     - wrap_invoke(adapter, packet, *, sandbox=None, event_emitter=None):
-      activate sandbox → emit provider_invoked → adapter.invoke →
+      activate sandbox → emit provider_invoked → adapter.invoke (with
+      live waste observer driven from shell_command_observed events) →
       emit task_finished (or breaker_triggered) → post-invoke budget.
 
     The sandbox and event_emitter are passed PER-CALL because both have
     packet-scoped lifetime (sandbox policy, run-level trace store). The
     watchdog itself stays packet-agnostic. When either is None, the
     relevant behavior is a no-op (PR2/PR3 backward compat).
+
+    PR4 Task 6 adds the live waste observer: when event_emitter is set,
+    wrap_invoke binds a TaskWasteCounters for the task and registers an
+    on_event callback on the trace store. The callback filters for
+    shell_command_observed events with exit_code != 0 and calls
+    WasteDetector.observe_failed_command + check_task_caps. The latter
+    raises BudgetExceeded(REPEATED_FAILURE) if Phase0HardCeilings.repeated_same_failure_per_task
+    is exceeded — this propagates through the sandbox context manager,
+    out of adapter.invoke, and through wrap_invoke as a normal
+    BudgetExceeded.
     """
 
     def __init__(
@@ -72,13 +84,22 @@ class Watchdog:
         duration of adapter.invoke; SandboxViolation propagates and
         record_post_invoke is correctly skipped.
 
-        When `event_emitter` is set, emits provider_invoked before invoke
-        and task_finished after a successful record_post_invoke.
-        SandboxViolation and BudgetExceeded both emit breaker_triggered
-        events (with breaker + evidence) before re-raising. The trace
-        always shows a complete causal chain: provider_invoked -> either
-        task_finished OR breaker_triggered, never both.
+        When `event_emitter` is set:
+        - Emits provider_invoked before invoke
+        - Binds a TaskWasteCounters and registers an on_event callback that
+          drives WasteDetector from shell_command_observed events with
+          exit_code != 0. Repeated-same-failure over the cap raises
+          BudgetExceeded(REPEATED_FAILURE) BEFORE adapter.invoke returns.
+        - Emits task_finished after a successful record_post_invoke.
+        - SandboxViolation and BudgetExceeded both emit breaker_triggered
+          events (with breaker + evidence) before re-raising.
+
+        The trace always shows a complete causal chain: provider_invoked →
+        either task_finished OR breaker_triggered, never both.
         """
+        # Local imports to avoid circular dep (waste.py imports governor).
+        from arena.budget.waste import TaskWasteCounters, WasteDetector
+
         sandbox_ctx: AbstractContextManager[object] = (
             sandbox.context() if sandbox is not None else nullcontext()
         )
@@ -87,8 +108,34 @@ class Watchdog:
                 event_type="provider_invoked",
                 severity="info",
                 task_id=packet["task_id"],
-                payload={"provider": adapter.name, "provider_version": adapter.version},
+                payload={
+                    "provider": adapter.name,
+                    "provider_version": adapter.version,
+                },
             )
+
+        # Live waste observer: bind a counter for this task and drive
+        # WasteDetector.observe_failed_command from shell_command_observed
+        # events the provider emits during invoke. Repeated-same-failure
+        # over the cap raises BudgetExceeded(REPEATED_FAILURE) BEFORE
+        # adapter.invoke returns.
+        waste_state = TaskWasteCounters()
+        waste = WasteDetector(self._governor.ceilings)
+        task_id_for_waste = packet["task_id"]
+
+        def _on_event(evt: dict[str, Any]) -> None:
+            if evt.get("event_type") != "shell_command_observed":
+                return
+            payload = evt.get("payload", {})
+            if payload.get("exit_code", 0) == 0:
+                return
+            command = payload.get("command", "")
+            waste.observe_failed_command(waste_state, command)
+            waste.check_task_caps(waste_state, task_id=task_id_for_waste)
+
+        if event_emitter is not None:
+            event_emitter.set_on_event(_on_event)
+
         try:
             with sandbox_ctx:
                 result = adapter.invoke(packet)
@@ -98,9 +145,28 @@ class Watchdog:
                     event_type="breaker_triggered",
                     severity="error",
                     task_id=packet["task_id"],
-                    payload={"breaker": exc.breaker.value, "evidence": [exc.attempt.target]},
+                    payload={
+                        "breaker": exc.breaker.value,
+                        "evidence": [exc.attempt.target],
+                    },
                 )
             raise
+        except BudgetExceeded as exc:
+            # Live waste observer raised mid-invoke. Emit breaker_triggered
+            # and propagate so run_next persists a status=blocked row via
+            # the existing except BudgetExceeded arm.
+            if event_emitter is not None:
+                event_emitter.emit(
+                    event_type="breaker_triggered",
+                    severity="error",
+                    task_id=packet["task_id"],
+                    payload={"breaker": exc.breaker.value, "evidence": [str(exc)]},
+                )
+            raise
+        finally:
+            if event_emitter is not None:
+                event_emitter.set_on_event(None)
+
         try:
             self._governor.record_post_invoke(
                 adapter.name,
@@ -116,6 +182,7 @@ class Watchdog:
                     payload={"breaker": exc.breaker.value, "evidence": [str(exc)]},
                 )
             raise
+
         if event_emitter is not None:
             event_emitter.emit(
                 event_type="task_finished",

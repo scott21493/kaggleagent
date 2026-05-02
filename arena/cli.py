@@ -69,11 +69,15 @@ def _latest_run_id() -> str | None:
     return runs[-1].name if runs else None
 
 
-def _get_provider(name: str) -> ProviderAdapter:
+def _get_provider(
+    name: str,
+    *,
+    event_emitter: TraceStore | None = None,
+) -> ProviderAdapter:
     if name == "stub_codex":
-        return StubCodexProvider(workspace_root=WORKTREE_ROOT)
+        return StubCodexProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     if name == "stub_claude":
-        return StubClaudeProvider(workspace_root=WORKTREE_ROOT)
+        return StubClaudeProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     raise typer.BadParameter(f"unknown provider: {name}")
 
 
@@ -238,6 +242,11 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     version_drift_tag = (
         f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from}>" if drifted_from else ""
     )
+
+    # PR4 Task 6: rebuild the adapter with the trace store wired in so it
+    # can emit shell_command_observed events that the watchdog picks up
+    # via the live waste observer callback.
+    adapter = _get_provider(provider, event_emitter=trace_store)
 
     # Post-dequeue: invoke + post-invoke per-task cap check. A breaker here
     # persists a status=blocked row because the task DID run and consume

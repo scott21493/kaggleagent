@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,13 @@ class TraceStore:
     Scrubs payload string fields via `scrub_text` before writing —
     providers may emit stdout that contains accidentally-captured tokens,
     and the trace is the durable record.
+
+    Optional `set_on_event(callback)` registers a synchronous fan-out
+    invoked after each successful emit. The callback receives the
+    validated, scrubbed event dict. Used by Watchdog to drive WasteDetector
+    from shell_command_observed events without coupling the trace store
+    to budget logic. The callback is cleared after each invocation by
+    convention — wrap_invoke does this in `finally`.
     """
 
     def __init__(self, run_id: str, root: str | Path = "traces") -> None:
@@ -35,6 +43,7 @@ class TraceStore:
         # 0 and collides with the previous instance's evt_NNNN values
         # within the same run.
         self._counter = self._load_max_event_id()
+        self._on_event: Callable[[dict[str, Any]], None] | None = None
 
     def _load_max_event_id(self) -> int:
         """Scan <root>/<run_id>/**/*.jsonl for the highest evt_NNNN id and
@@ -78,6 +87,16 @@ class TraceStore:
             return self._root / "run.jsonl"
         return self._root / task_id / "events.jsonl"
 
+    def set_on_event(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        """Register a synchronous callback invoked after each successful emit.
+
+        The callback receives the validated, scrubbed event dict. Used by
+        Watchdog to drive WasteDetector from shell_command_observed events
+        without coupling the trace store to budget logic. Pass None to
+        clear (wrap_invoke does this in finally).
+        """
+        self._on_event = callback
+
     def emit(
         self,
         *,
@@ -91,6 +110,10 @@ class TraceStore:
 
         On ValidationError the counter rolls back so subsequent emits
         produce contiguous evt_NNNN ids — no gaps in the trace.
+
+        After a successful append, fans out to the optional on_event
+        callback (registered via set_on_event). The callback is invoked
+        synchronously and must not mutate the event dict.
         """
         from jsonschema import ValidationError
 
@@ -114,4 +137,8 @@ class TraceStore:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+        # Fan out AFTER the JSONL line is appended — the event is
+        # durable when the callback runs.
+        if self._on_event is not None:
+            self._on_event(event)
         return event
