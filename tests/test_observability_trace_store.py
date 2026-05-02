@@ -175,3 +175,69 @@ def test_emit_rollback_counter_on_validation_error(tmp_path: Path) -> None:
     log = (tmp_path / "run_x" / "task_0001" / "events.jsonl").read_text(encoding="utf-8")
     new_event = json.loads(log.strip())
     assert new_event["event_id"] == "evt_0002"
+
+
+def test_set_on_event_callback_fires_after_jsonl_append(tmp_path: Path) -> None:
+    """The callback must run AFTER the line is durable on disk so a
+    callback that raises (e.g., BudgetExceeded from WasteDetector) does
+    NOT roll back the durable trace."""
+    store = TraceStore(run_id="run_x", root=tmp_path)
+    captured: list[dict] = []
+
+    def _callback(evt: dict) -> None:
+        # Verify the file is already written when we get here.
+        log = tmp_path / "run_x" / "task_0001" / "events.jsonl"
+        assert log.exists()
+        captured.append(evt)
+
+    store.set_on_event(_callback)
+    store.emit(event_type="task_started", severity="info", task_id="task_0001", payload={})
+    assert len(captured) == 1
+    assert captured[0]["event_type"] == "task_started"
+
+
+def test_set_on_event_none_clears_callback(tmp_path: Path) -> None:
+    """Passing None to set_on_event removes the callback so subsequent
+    emits don't fan out. Watchdog uses this in `finally` to prevent
+    leaked callbacks across invocations."""
+    store = TraceStore(run_id="run_x", root=tmp_path)
+    fired: list[dict] = []
+    store.set_on_event(lambda evt: fired.append(evt))
+    store.emit(event_type="task_started", severity="info", task_id="task_0001", payload={})
+    assert len(fired) == 1
+
+    store.set_on_event(None)
+    store.emit(
+        event_type="task_finished",
+        severity="info",
+        task_id="task_0001",
+        payload={"status": "success"},
+    )
+    # Second emit did NOT fire the callback.
+    assert len(fired) == 1
+
+
+def test_set_on_event_callback_exception_propagates(tmp_path: Path) -> None:
+    """A callback that raises (e.g., BudgetExceeded from WasteDetector)
+    propagates out of emit. The JSONL line is already durable at this
+    point — the trace records the event even when the callback fails.
+    This is the behavior the live waste observer in Watchdog.wrap_invoke
+    relies on: the BudgetExceeded raised by the callback unwinds through
+    adapter.invoke and the surrounding try/except."""
+    store = TraceStore(run_id="run_x", root=tmp_path)
+
+    class CallbackError(RuntimeError):
+        pass
+
+    def _raising(evt: dict) -> None:
+        raise CallbackError("simulating WasteDetector cap")
+
+    store.set_on_event(_raising)
+    with pytest.raises(CallbackError):
+        store.emit(event_type="task_started", severity="info", task_id="task_0001", payload={})
+    # The trace line WAS written before the callback ran.
+    log = tmp_path / "run_x" / "task_0001" / "events.jsonl"
+    assert log.exists()
+    line = log.read_text(encoding="utf-8").strip()
+    parsed = json.loads(line)
+    assert parsed["event_type"] == "task_started"

@@ -114,6 +114,13 @@ class TraceStore:
         After a successful append, fans out to the optional on_event
         callback (registered via set_on_event). The callback is invoked
         synchronously and must not mutate the event dict.
+
+        If the callback raises, the exception PROPAGATES out of emit().
+        The JSONL line is already durable at this point — the trace
+        records the event even when the callback fails. The Watchdog's
+        live-waste-detector uses this contract: the BudgetExceeded
+        raised by the WasteDetector callback unwinds through
+        adapter.invoke and the surrounding try/except.
         """
         from jsonschema import ValidationError
 

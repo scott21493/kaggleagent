@@ -155,7 +155,12 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     if run_id is None:
         raise typer.BadParameter(f"no run for {slug}")
 
-    # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the queue.
+    # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the
+    # queue. NOTE: this adapter is for name validation only — it is rebuilt
+    # AFTER the trace store is constructed (see below) so it can wire in
+    # event_emitter for shell_command_observed emission. If the rebuild
+    # below ever returns a different name, the packet provider check at
+    # `peeked["provider"] != adapter.name` would catch the divergence.
     adapter = _get_provider(provider)
 
     # Build the governor seeded with this run's accumulated usage.
