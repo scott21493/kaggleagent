@@ -74,3 +74,46 @@ def test_frozen_dataclass(tmp_path: Path) -> None:
     p = SandboxPolicy.for_writes(frozenset({tmp_path}))
     with pytest.raises(dataclasses.FrozenInstanceError):
         p.allowed_writes = frozenset()  # type: ignore[misc]
+
+
+def test_from_packet_rejects_traversal_in_allowed_paths(tmp_path: Path) -> None:
+    """Adversarial packet with `..` traversal in allowed_paths must raise
+    rather than silently grant write access outside workspace_root."""
+    with pytest.raises(ValueError, match=r"possible `\.\.`-traversal"):
+        SandboxPolicy.from_packet(
+            {"allowed_paths": ["worktrees/../../../etc/"], "blocked_paths": []},
+            workspace_root=tmp_path,
+        )
+
+
+def test_from_packet_rejects_traversal_in_blocked_paths(tmp_path: Path) -> None:
+    """Workspace-relative blocked_paths entries are also subject to the
+    traversal guard. Tilde-prefixed entries are exempt (covered separately)."""
+    with pytest.raises(ValueError, match=r"possible `\.\.`-traversal"):
+        SandboxPolicy.from_packet(
+            {
+                "allowed_paths": ["worktrees/a/exp_0001/"],
+                "blocked_paths": ["fixtures/../../../bad.txt"],
+            },
+            workspace_root=tmp_path,
+        )
+
+
+def test_from_packet_admits_tilde_blocked_paths_outside_workspace(
+    tmp_path: Path,
+) -> None:
+    """`~`-prefixed blocked entries are intentionally outside workspace_root
+    (they target user-home secret stores). The traversal guard must not
+    reject them."""
+    p = SandboxPolicy.from_packet(
+        {
+            "allowed_paths": ["worktrees/a/exp_0001/"],
+            "blocked_paths": ["~/.kaggle/", "~/.codex/"],
+        },
+        workspace_root=tmp_path,
+    )
+    # Should construct without raising; the tilde entries land in blocked_paths.
+    target = Path("~/.kaggle/kaggle.json").expanduser()
+    from arena.sandbox.secrets import is_secret_read
+
+    assert is_secret_read(target, p) is True

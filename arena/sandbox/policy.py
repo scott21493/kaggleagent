@@ -98,14 +98,45 @@ class SandboxPolicy:
         `fixtures/<slug>/hidden_labels.csv`). They are merged with the
         canonical four-secret-store defaults.
 
+        Path-traversal guard: workspace-relative entries (in either
+        allowed_paths or blocked_paths) MUST resolve to a location under
+        workspace_root after normalization. A packet that tries to escape
+        via `..`-traversal raises ValueError immediately. ~-prefixed
+        blocked_paths entries are exempt — they are deliberately outside
+        the workspace and must remain so to block actual secret stores.
+
         The network allowlist comes from `ARENA_NETWORK_DOMAINS_ALLOWED`.
         """
-        allowed = frozenset(_resolve(workspace_root / p) for p in packet["allowed_paths"])
-        packet_blocked = frozenset(
-            _resolve(p) if str(p).startswith("~") else _resolve(workspace_root / p)
-            for p in packet.get("blocked_paths", [])
+        resolved_root = _resolve(workspace_root)
+
+        def _resolve_workspace_relative(p: str, *, field: str) -> Path:
+            """Resolve a workspace-relative entry and reject `..`-traversal."""
+            resolved = _resolve(workspace_root / p)
+            try:
+                resolved.relative_to(resolved_root)
+            except ValueError:
+                raise ValueError(
+                    f"packet {field} entry {p!r} resolves to {resolved} "
+                    f"which is outside workspace_root {resolved_root}; "
+                    "possible `..`-traversal attempt"
+                ) from None
+            return resolved
+
+        allowed = frozenset(
+            _resolve_workspace_relative(p, field="allowed_paths") for p in packet["allowed_paths"]
         )
-        blocked = _default_blocked_paths(workspace_root=workspace_root) | packet_blocked
+
+        # blocked_paths splits into two camps: ~-prefixed (user-home,
+        # exempt from the workspace check) and workspace-relative (subject
+        # to the same traversal guard as allowed_paths).
+        packet_blocked: set[Path] = set()
+        for p in packet.get("blocked_paths", []):
+            if str(p).startswith("~"):
+                packet_blocked.add(_resolve(p))
+            else:
+                packet_blocked.add(_resolve_workspace_relative(p, field="blocked_paths"))
+
+        blocked = _default_blocked_paths(workspace_root=workspace_root) | frozenset(packet_blocked)
         domains = _split_csv(os.environ.get("ARENA_NETWORK_DOMAINS_ALLOWED"))
         return cls(
             allowed_writes=allowed,
