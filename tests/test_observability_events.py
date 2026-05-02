@@ -122,8 +122,53 @@ def test_harness_event_dataclass_to_dict_roundtrip() -> None:
         severity="info",
         payload={"status": "completed"},
         task_id="task_0001",
+        timestamp="2026-05-02T12:00:00+00:00",
     )
     as_dict = h.to_dict()
     validate_event(as_dict)
     assert as_dict["event_id"] == "evt_0042"
     assert as_dict["task_id"] == "task_0001"
+
+
+def test_validate_event_rejects_empty_timestamp() -> None:
+    """Empty timestamp must fail format: date-time validation. Direct
+    HarnessEvent construction without setting timestamp produces an empty
+    string default; without format checking, the schema would silently
+    accept it and a malformed event would land in the trace JSONL."""
+    bogus = HarnessEvent(
+        event_type="run_started",
+        run_id="run_x",
+        event_id="evt_0001",
+        severity="info",
+        payload={},
+    ).to_dict()
+    assert bogus["timestamp"] == ""
+    with pytest.raises(ValidationError):
+        validate_event(bogus)
+
+
+def test_validate_event_rejects_malformed_timestamp() -> None:
+    """A non-ISO-8601 string (e.g., 'not a date') must fail format: date-time."""
+    bogus = make_event(
+        event_type="run_started",
+        run_id="run_x",
+        event_id="evt_0001",
+        severity="info",
+        payload={},
+    )
+    bogus["timestamp"] = "not a date"
+    with pytest.raises(ValidationError):
+        validate_event(bogus)
+
+
+def test_validate_event_accepts_iso8601_with_seconds_precision() -> None:
+    """The make_event default (datetime.now(UTC).isoformat(timespec='seconds'))
+    produces a string the schema accepts."""
+    evt = make_event(
+        event_type="run_started",
+        run_id="run_x",
+        event_id="evt_0001",
+        severity="info",
+        payload={},
+    )
+    validate_event(evt)  # no raise

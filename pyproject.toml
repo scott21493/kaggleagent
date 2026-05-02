@@ -41,6 +41,7 @@ dependencies = [
   "pydantic-settings>=2.2,<3.0",
   "pyyaml>=6.0,<7.0",
   "jsonschema>=4.22,<5.0",
+  "rfc3339-validator>=0.1.4",
   "pandas>=2.0,<3.0",
   "numpy>=1.26,<3.0",
   "scikit-learn>=1.4,<2.0",
