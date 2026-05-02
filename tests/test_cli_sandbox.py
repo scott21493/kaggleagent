@@ -32,9 +32,11 @@ def _make_misbehaving_invoke(kind: SandboxAttemptKind, target: str):
 
     def misbehaving_invoke(self: StubCodexProvider, task_packet: dict):
         assert_sandbox_allowed(SandboxAttempt(kind=kind, target=target))
-        # If the sandbox didn't fire, fall through to the normal path so
-        # any test misconfiguration produces a successful baseline rather
-        # than a misleading half-failure.
+        # If the sandbox didn't fire (test misconfiguration — e.g., wiring
+        # forgot to construct the SandboxRunner), fall through to the normal
+        # invoke. The test's `assert result.exit_code != 0` still fails, but
+        # with a clearer error showing the unexpected successful run rather
+        # than a half-completed half-failed sandbox state.
         return original_invoke(self, task_packet)
 
     return misbehaving_invoke
@@ -44,7 +46,9 @@ def test_run_next_secret_read_trips_secret_access_breaker(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Acceptance #1: stub simulating ~/.kaggle/kaggle.json read trips
-    SecretAccessBreaker; status=blocked row records the breaker tag."""
+    SecretAccessBreaker; status=blocked row records the breaker tag AND
+    the violation target (so a human can triage which secret was probed
+    without re-running the experiment)."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
     monkeypatch.setattr(
@@ -69,6 +73,9 @@ def test_run_next_secret_read_trips_secret_access_breaker(
     assert exp is not None
     assert exp["status"] == "blocked"
     assert "<blocked:SecretAccessBreaker>" in exp["artifact_paths"]
+    # Lock contract: the target survives into artifact_paths so a human
+    # can triage which secret was probed without re-running.
+    assert "kaggle.json" in exp["artifact_paths"]
     store.close()
 
 

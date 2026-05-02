@@ -191,6 +191,10 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     # active packet's allowed_paths (this experiment's worktree only).
     # Writes to a sibling worktree, a different competition, or fixtures
     # all trip ProtectedFileBreaker.
+    #
+    # Path.cwd() resolves the packet's relative paths: in production the CLI
+    # runs from the workspace root; in tests, fixture_workspace's
+    # monkeypatch.chdir(tmp_path) makes Path.cwd() the per-test tmp dir.
     sandbox_policy = SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
     sandbox = SandboxRunner(sandbox_policy)
 
@@ -212,13 +216,15 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
         raise typer.Exit(code=2) from exc
     except SandboxViolation as exc:
+        # exc message already includes the target ("sandbox <kind> denied: <target>"),
+        # so str(exc) is the right human-triage payload — no need to append target again.
         _persist_blocked_experiment(
             store=store,
             packet=packet,
             run_id=run_id,
             adapter=adapter,
             breaker_or_reason=exc.breaker.value,
-            message=f"{exc} (target={exc.attempt.target})",
+            message=str(exc),
             usage_proxy=None,
         )
         console.print(f"[red]task {packet['task_id']} blocked by {exc.breaker.value}: {exc}[/red]")
