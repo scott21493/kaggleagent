@@ -464,7 +464,7 @@ def budget_status(
 @app.command()
 def replay(run_id: str) -> None:
     """Reconstruct a run's view from its event traces."""
-    view = replay_run(run_id=run_id)
+    view = replay_run(run_id=run_id, root=TRACES_ROOT)
     console.print(f"[green]Run {view.run_id}: {len(view.tasks)} task(s)[/green]")
     if view.fixture_manifest_hash:
         console.print(f"fixture_manifest_hash: {view.fixture_manifest_hash}")
@@ -485,5 +485,8 @@ def report(competition_slug: str) -> None:
     run_id = _latest_run_id()
     if run_id is None:
         raise typer.BadParameter(f"no run for {competition_slug}")
-    view = replay_run(run_id=run_id)
+    view = replay_run(run_id=run_id, root=TRACES_ROOT)
+    # Bare print, NOT console.print: Rich would reformat markdown markers
+    # (#, |, etc.) as Rich markup and break the output for downstream
+    # tools that expect plain markdown.
     print(render_run_report(view))

@@ -25,6 +25,9 @@ def render_run_report(view: RunReplayView) -> str:
     lines.append("| task_id | status | score | metric | provider | version | breakers |")
     lines.append("|---|---|---|---|---|---|---|")
     for t in view.tasks:
+        # score=0.0 is a VALID score value (perfect-fail or trivial baseline),
+        # so use explicit None check rather than truthy fallback. Other string
+        # fields use `or ""` since empty string and None render identically.
         lines.append(
             f"| {t.task_id} | {t.status or ''} | {t.score if t.score is not None else ''} "
             f"| {t.metric_name or ''} | {t.provider or ''} | {t.provider_version or ''} "

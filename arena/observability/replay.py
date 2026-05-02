@@ -44,6 +44,16 @@ def replay_run(*, run_id: str, root: str | Path = "traces") -> RunReplayView:
 
     Tasks appear in order of their first event_id (so a task that started
     first is listed first).
+
+    Phase 0 assumptions (relax in PR7+ if either becomes a real constraint):
+    - In-memory accumulation: all events are loaded into a single list
+      before replay. Fine for fixture runs (~10s of events); may need
+      streaming for long real-provider runs.
+    - Single-writer: this function assumes one TraceStore lineage wrote
+      the events. Concurrent TraceStore(run_id=same_id) instances would
+      produce overlapping evt_NNNN values that this replay would silently
+      reorder by id (correct deterministically, but not what the writers
+      intended).
     """
     run_root = Path(root) / run_id
     if not run_root.exists():
@@ -66,6 +76,9 @@ def replay_run(*, run_id: str, root: str | Path = "traces") -> RunReplayView:
         task_id = evt.get("task_id")
 
         if et == "run_started":
+            # Last-non-empty-wins semantics: if multiple run_started events
+            # appear (unlikely in Phase 0; one per run), the later non-empty
+            # sha256 takes precedence. Empty payloads don't overwrite.
             fixture_hash = payload.get("sha256") or fixture_hash
             continue
 
