@@ -232,7 +232,29 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     # to per-slug baseline, halt on drift. The digest covers actual file
     # contents (sorted (rel_path, sha256(file_contents)) pairs from the
     # manifest), so corrupting train.csv after init-fixture is detected.
-    fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / slug)
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / slug)
+    except FileNotFoundError as exc:
+        # Manifest missing post-dequeue (fixtures dir deleted, slug typo,
+        # pipeline corruption). Without this guard the FileNotFoundError
+        # would propagate as an unhandled exception with a traceback,
+        # leaving the task permanently lost from the queue. Persist a
+        # blocked row and exit cleanly.
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=f"fixture manifest missing for {slug}: {exc}",
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (fixture manifest missing for {slug})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
     _is_new_fixture, drifted_from_fixture = record_fixture_hash(
         competition_slug=slug,
         fixture_hash=fixture_hash,
