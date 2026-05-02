@@ -16,6 +16,13 @@ class HarnessEvent:
     keyed by optional fields (provider, breaker, evidence, score, etc.).
     Per-event-type required fields are enforced via the schema's allOf
     conditional (e.g., breaker_triggered MUST have breaker + evidence).
+
+    The dataclass is frozen at the field level, but `payload` is a plain
+    dict — its CONTENTS can still be mutated through the reference. The
+    `to_dict()` method shallow-copies payload to isolate the returned dict
+    from later mutations, but callers should treat the HarnessEvent as
+    immutable in spirit. validate_event() runs against the to_dict() output,
+    so post-validation mutation cannot corrupt an emitted event.
     """
 
     event_type: str
@@ -24,15 +31,14 @@ class HarnessEvent:
     severity: str  # debug/info/warning/error/critical
     payload: dict[str, Any] = field(default_factory=dict)
     task_id: str | None = None
-    timestamp: str = ""  # ISO 8601 UTC, set on construction or to_dict
+    timestamp: str = ""  # ISO 8601 UTC; set by make_event — direct construction must set explicitly
 
     def to_dict(self) -> dict[str, Any]:
-        ts = self.timestamp or datetime.now(UTC).isoformat(timespec="seconds")
         return {
             "schema_version": "event.v1",
             "event_id": self.event_id,
             "event_type": self.event_type,
-            "timestamp": ts,
+            "timestamp": self.timestamp,
             "run_id": self.run_id,
             "task_id": self.task_id,
             "severity": self.severity,

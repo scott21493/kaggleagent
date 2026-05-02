@@ -1,6 +1,7 @@
 # tests/test_observability_events.py
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import pytest
@@ -25,6 +26,10 @@ def test_make_event_returns_valid_dict_for_run_started() -> None:
 
 
 def test_make_event_iso_timestamp_in_utc() -> None:
+    """Verify the timestamp is ISO-8601 UTC at seconds precision and that
+    the schema validates it. The bare tzinfo-aware check would pass for
+    `str(datetime.now(UTC))` (space separator, microseconds), which is
+    NOT ISO-8601 — schema format validation catches that."""
     evt = make_event(
         event_type="task_started",
         run_id="run_x",
@@ -33,9 +38,16 @@ def test_make_event_iso_timestamp_in_utc() -> None:
         payload={},
         task_id="task_0001",
     )
-    # parses cleanly as ISO 8601 UTC
+    # Format check: YYYY-MM-DDTHH:MM:SS+00:00 (seconds precision, T separator,
+    # explicit UTC offset).
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", evt["timestamp"]), (
+        f"unexpected timestamp format: {evt['timestamp']!r}"
+    )
+    # tzinfo is set
     parsed = datetime.fromisoformat(evt["timestamp"])
     assert parsed.tzinfo is not None
+    # Schema also accepts (the format: date-time constraint passes).
+    validate_event(evt)
 
 
 def test_validate_event_rejects_unknown_event_type() -> None:
