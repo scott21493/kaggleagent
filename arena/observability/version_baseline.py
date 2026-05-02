@@ -46,3 +46,37 @@ def record_provider_version(
         return False, None
     # Drift: keep the original baseline so later runs continue to see drift.
     return False, existing
+
+
+def record_fixture_hash(
+    *,
+    competition_slug: str,
+    fixture_hash: str,
+    root: str | Path = "runs/.baselines",
+) -> tuple[bool, str | None]:
+    """Record a fixture-set digest baseline for `competition_slug`.
+
+    Layout: <root>/<competition_slug>/fixture_hash.json mapping
+    `{"sha256": "<digest>"}`. SCOPED PER SLUG (not per run_id) so drift
+    is detected across `arena init-fixture` cycles.
+
+    First call returns (True, None). Same-digest call returns (False, None).
+    Different-digest call returns (False, "<old_digest>") and DOES NOT
+    overwrite — the baseline is sticky so every subsequent run-next call
+    sees the same drift signal until a human deliberately resets it.
+    """
+    baseline_path = Path(root) / competition_slug / "fixture_hash.json"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    if baseline_path.exists():
+        baseline: dict[str, str] = json.loads(baseline_path.read_text(encoding="utf-8"))
+    else:
+        baseline = {}
+
+    existing = baseline.get("sha256")
+    if existing is None:
+        baseline["sha256"] = fixture_hash
+        baseline_path.write_text(json.dumps(baseline, indent=2), encoding="utf-8")
+        return True, None
+    if existing == fixture_hash:
+        return False, None
+    return False, existing

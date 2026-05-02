@@ -11,15 +11,16 @@ from arena.budget.governor import BudgetExceeded, BudgetGovernor, RunAccumulator
 from arena.budget.kill_switch import KillSwitch
 from arena.budget.policy import Phase0HardCeilings
 from arena.controller.planner import create_calibration_task_packet
+from arena.controller.state import Phase
 from arena.controller.task_queue import TaskQueue
 from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
-from arena.fixture.manifest import validate_fixture_manifest
+from arena.fixture.manifest import compute_fixture_set_digest, validate_fixture_manifest
 from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
-from arena.observability.version_baseline import record_provider_version
+from arena.observability.version_baseline import record_fixture_hash, record_provider_version
 from arena.providers.base import ProviderAdapter, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
@@ -226,6 +227,49 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     # and a PROVIDER_VERSION_CHANGED tag in artifact_paths but does NOT
     # halt the run (informational, not a breaker).
     trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+
+    # PR4 Task 7 (security spec §9 #9): compute fixture-set digest, compare
+    # to per-slug baseline, halt on drift. The digest covers actual file
+    # contents (sorted (rel_path, sha256(file_contents)) pairs from the
+    # manifest), so corrupting train.csv after init-fixture is detected.
+    fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / slug)
+    _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+        competition_slug=slug,
+        fixture_hash=fixture_hash,
+    )
+    trace_store.emit(
+        event_type="run_started",
+        severity="info" if not drifted_from_fixture else "error",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value
+            if not drifted_from_fixture
+            else Phase.BLOCKED_REPRODUCIBILITY.value,
+        },
+    )
+    if drifted_from_fixture:
+        # Fixture drift = halt the run. The blocked row tells operators
+        # which slug + which previous digest diverged. The baseline is
+        # sticky (per-slug, not per-run), so this fires consistently
+        # until a human deliberately resets the baseline.
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=(
+                f"fixture digest drift for {slug}: was {drifted_from_fixture}, now {fixture_hash}"
+            ),
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (fixture drift on {slug})[/red]"
+        )
+        raise typer.Exit(code=2)
+
     _is_new, drifted_from = record_provider_version(
         competition_slug=slug,
         provider=adapter.name,
