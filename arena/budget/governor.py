@@ -78,6 +78,16 @@ class BudgetGovernor:
         self._accum = accumulators if accumulators is not None else RunAccumulators()
 
     @property
+    def ceilings(self) -> Phase0HardCeilings:
+        """Read-only access to the configured hard ceilings.
+
+        Added in PR4 so the Watchdog can construct a WasteDetector with the
+        same ceilings without reaching into private state. Treat as
+        read-only; cap mutation requires re-instantiating the governor.
+        """
+        return self._ceilings
+
+    @property
     def accumulators(self) -> RunAccumulators:
         """Return the live RunAccumulators instance (not a copy).
 

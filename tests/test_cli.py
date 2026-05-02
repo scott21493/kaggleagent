@@ -32,7 +32,7 @@ def test_init_fixture_creates_run_record(fixture_workspace):
     result = CliRunner().invoke(app, ["init-fixture", "tabular_binary_v1"])
     assert result.exit_code == 0, result.output
 
-    runs = list((fixture_workspace / "runs").iterdir())
+    runs = [p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_")]
     assert len(runs) == 1
     run_id = runs[0].name
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
@@ -52,7 +52,7 @@ def test_plan_writes_calibration_task_packet(fixture_workspace):
     result = runner.invoke(app, ["plan", "tabular_binary_v1"])
     assert result.exit_code == 0, result.output
 
-    runs = sorted((fixture_workspace / "runs").iterdir())
+    runs = sorted(p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_"))
     assert len(runs) == 1
     queue_files = list((runs[0] / "queue").glob("*.json"))
     assert len(queue_files) == 1
@@ -123,7 +123,7 @@ def test_run_next_with_unknown_provider_does_not_dequeue(fixture_workspace):
     runner.invoke(app, ["plan", "tabular_binary_v1"])
 
     # Confirm queue has the single task before run-next is attempted.
-    runs = sorted((fixture_workspace / "runs").iterdir())
+    runs = sorted(p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_"))
     queue_dir = runs[0] / "queue"
     assert len(list(queue_dir.glob("*.json"))) == 1
 
@@ -214,7 +214,7 @@ def test_run_next_halted_by_kill_switch_leaves_task_retryable(
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
     runner.invoke(app, ["plan", "tabular_binary_v1"])
 
-    runs = sorted((fixture_workspace / "runs").iterdir())
+    runs = sorted(p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_"))
     queue_dir = runs[0] / "queue"
     assert len(list(queue_dir.glob("*.json"))) == 1, "task not enqueued by plan"
 
@@ -256,7 +256,7 @@ def test_run_next_with_valid_but_wrong_provider_leaves_task_in_queue(
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
     runner.invoke(app, ["plan", "tabular_binary_v1"])  # plans for stub_codex
 
-    runs = sorted((fixture_workspace / "runs").iterdir())
+    runs = sorted(p for p in (fixture_workspace / "runs").iterdir() if p.name.startswith("run_"))
     queue_dir = runs[0] / "queue"
     assert len(list(queue_dir.glob("*.json"))) == 1, "task not enqueued by plan"
 

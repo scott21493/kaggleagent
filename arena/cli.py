@@ -11,11 +11,16 @@ from arena.budget.governor import BudgetExceeded, BudgetGovernor, RunAccumulator
 from arena.budget.kill_switch import KillSwitch
 from arena.budget.policy import Phase0HardCeilings
 from arena.controller.planner import create_calibration_task_packet
+from arena.controller.state import Phase
 from arena.controller.task_queue import TaskQueue
 from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
-from arena.fixture.manifest import validate_fixture_manifest
+from arena.fixture.manifest import compute_fixture_set_digest, validate_fixture_manifest
+from arena.observability.replay import replay_run
+from arena.observability.report import render_run_report
+from arena.observability.trace_store import TraceStore
+from arena.observability.version_baseline import record_fixture_hash, record_provider_version
 from arena.providers.base import ProviderAdapter, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
@@ -30,6 +35,15 @@ DB_PATH = Path("scoreboard.sqlite")
 RUNS_ROOT = Path("runs")
 WORKTREE_ROOT = Path("worktrees")
 FIXTURES_ROOT = Path("fixtures")
+TRACES_ROOT = Path("traces")
+
+# Tag appended to artifact_paths when provider_version drift is detected.
+# NOT a Phase enum value — provider drift is informational, the run
+# completes. The Phase enum is mirrored exactly by
+# schemas/task_packet.schema.json's phase list (verified by
+# tests/test_controller_state.py); adding a value without updating the
+# schema would break the drift guard.
+PROVIDER_VERSION_CHANGED_TAG = "PROVIDER_VERSION_CHANGED"
 
 
 def _store() -> ScoreboardStore:
@@ -56,11 +70,15 @@ def _latest_run_id() -> str | None:
     return runs[-1].name if runs else None
 
 
-def _get_provider(name: str) -> ProviderAdapter:
+def _get_provider(
+    name: str,
+    *,
+    event_emitter: TraceStore | None = None,
+) -> ProviderAdapter:
     if name == "stub_codex":
-        return StubCodexProvider(workspace_root=WORKTREE_ROOT)
+        return StubCodexProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     if name == "stub_claude":
-        return StubClaudeProvider(workspace_root=WORKTREE_ROOT)
+        return StubClaudeProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     raise typer.BadParameter(f"unknown provider: {name}")
 
 
@@ -138,7 +156,12 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     if run_id is None:
         raise typer.BadParameter(f"no run for {slug}")
 
-    # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the queue.
+    # Resolve the provider BEFORE dequeue so a CLI typo doesn't corrupt the
+    # queue. NOTE: this adapter is for name validation only — it is rebuilt
+    # AFTER the trace store is constructed (see below) so it can wire in
+    # event_emitter for shell_command_observed emission. If the rebuild
+    # below ever returns a different name, the packet provider check at
+    # `peeked["provider"] != adapter.name` would catch the divergence.
     adapter = _get_provider(provider)
 
     # Build the governor seeded with this run's accumulated usage.
@@ -198,11 +221,134 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
     sandbox_policy = SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
     sandbox = SandboxRunner(sandbox_policy)
 
+    # PR4 observability: build the trace store, record provider-version
+    # baseline (per-slug, persists across init-fixture cycles), and emit
+    # the provider_version_recorded event. Drift produces a warning event
+    # and a PROVIDER_VERSION_CHANGED tag in artifact_paths but does NOT
+    # halt the run (informational, not a breaker).
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+
+    # PR4 Task 7 (security spec §9 #9): compute fixture-set digest, compare
+    # to per-slug baseline, halt on drift. The digest covers actual file
+    # contents (sorted (rel_path, sha256(file_contents)) pairs from the
+    # manifest), so corrupting train.csv after init-fixture is detected.
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / slug)
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        # Two failure modes converge here:
+        # 1. FileNotFoundError: fixture manifest missing post-dequeue
+        #    (fixtures dir deleted, slug typo, pipeline corruption).
+        # 2. JSONDecodeError: runs/.baselines/<slug>/fixture_hash.json is
+        #    corrupt (incomplete write, manual edit, disk corruption).
+        # Either way, the task is already dequeued — without this guard
+        # the exception would propagate as an unhandled traceback,
+        # leaving the task permanently lost. Persist a blocked row and
+        # exit cleanly. Corrupt baseline = reproducibility violation.
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {slug}: {exc}"
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=message,
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+    trace_store.emit(
+        event_type="run_started",
+        severity="info" if not drifted_from_fixture else "error",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value
+            if not drifted_from_fixture
+            else Phase.BLOCKED_REPRODUCIBILITY.value,
+        },
+    )
+    if drifted_from_fixture:
+        # Fixture drift = halt the run. The blocked row tells operators
+        # which slug + which previous digest diverged. The baseline is
+        # sticky (per-slug, not per-run), so this fires consistently
+        # until a human deliberately resets the baseline.
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=(
+                f"fixture digest drift for {slug}: was {drifted_from_fixture}, now {fixture_hash}"
+            ),
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (fixture drift on {slug})[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        _is_new, drifted_from = record_provider_version(
+            competition_slug=slug,
+            provider=adapter.name,
+            version=adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        # runs/.baselines/<slug>/provider_versions.json is corrupt.
+        # Same task-loss risk as the fixture-hash block above; same fix.
+        _persist_blocked_experiment(
+            store=store,
+            packet=packet,
+            run_id=run_id,
+            adapter=adapter,
+            breaker_or_reason=Phase.BLOCKED_REPRODUCIBILITY.value,
+            message=f"provider version baseline corrupt for {slug}: {exc}",
+            usage_proxy=None,
+        )
+        console.print(
+            f"[red]task {packet['task_id']} blocked: "
+            f"{Phase.BLOCKED_REPRODUCIBILITY.value} (provider version baseline corrupt for {slug})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from else "info",
+        task_id=packet["task_id"],
+        payload={
+            "provider": adapter.name,
+            "provider_version": adapter.version,
+            # previous_hash field is reused from the fixture-drift use case
+            # (Task 7); here it carries the previous PROVIDER VERSION string,
+            # not a content hash. The field is generic in event.schema.json.
+            "previous_hash": drifted_from or "",
+        },
+    )
+    version_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from}>" if drifted_from else ""
+    )
+
+    # PR4 Task 6: rebuild the adapter with the trace store wired in so it
+    # can emit shell_command_observed events that the watchdog picks up
+    # via the live waste observer callback.
+    adapter = _get_provider(provider, event_emitter=trace_store)
+
     # Post-dequeue: invoke + post-invoke per-task cap check. A breaker here
     # persists a status=blocked row because the task DID run and consume
     # budget — there is no clean way to unwind that.
     try:
-        result = watchdog.wrap_invoke(adapter, packet, sandbox=sandbox)
+        result = watchdog.wrap_invoke(adapter, packet, sandbox=sandbox, event_emitter=trace_store)
     except BudgetExceeded as exc:
         _persist_blocked_experiment(
             store=store,
@@ -247,7 +393,10 @@ def run_next(slug: str, provider: str = typer.Option(..., "--provider")) -> None
         status="completed" if result.status == "success" else result.status,
         metric_name="roc_auc",
         valid_submission=None,
-        artifact_paths=result.artifacts,
+        artifact_paths=[
+            *result.artifacts,
+            *([version_drift_tag] if version_drift_tag else []),
+        ],
         trace_path=None,
         created_at=result.finished_at,
         input_chars=result.usage_proxy["input_chars"],
@@ -335,6 +484,27 @@ def evaluate(
     experiment_id: str = exp["experiment_id"]
     store.update_experiment_score(experiment_id, score=eval_result.score)
     store.update_experiment_validation(experiment_id, valid_submission=True)
+
+    # PR4: emit score_recorded into the run's trace store so `arena replay`
+    # can reconstruct the actual evaluated score. Pull the run_id off the
+    # experiment row (run_next persisted it). When run_id is missing
+    # (e.g., a manually-seeded experiment from a fixture-smoke test) the
+    # emit is skipped — no run, no trace dir.
+    run_id_for_event = exp["run_id"]
+    if run_id_for_event:
+        evaluate_trace_store = TraceStore(run_id=run_id_for_event, root=TRACES_ROOT)
+        evaluate_trace_store.emit(
+            event_type="score_recorded",
+            severity="info",
+            task_id=exp["task_id"],
+            payload={
+                "score": eval_result.score,
+                "metric_name": exp["metric_name"] or "",
+                "experiment_id": experiment_id,
+                "status": "valid" if eval_result.valid_submission else "invalid",
+            },
+        )
+
     console.print(f"score={eval_result.score:.6f}")
 
 
@@ -394,3 +564,34 @@ def budget_status(
     color = "red" if kill_active else "green"
     state = "ACTIVE" if kill_active else "inactive"
     console.print(f"  kill_switch: [{color}]{state}[/{color}]")
+
+
+@app.command()
+def replay(run_id: str) -> None:
+    """Reconstruct a run's view from its event traces."""
+    view = replay_run(run_id=run_id, root=TRACES_ROOT)
+    console.print(f"[green]Run {view.run_id}: {len(view.tasks)} task(s)[/green]")
+    if view.fixture_manifest_hash:
+        console.print(f"fixture_manifest_hash: {view.fixture_manifest_hash}")
+    for task in view.tasks:
+        breakers = ", ".join(task.breakers) or "none"
+        console.print(
+            f"  {task.task_id}: status={task.status} score={task.score} "
+            f"provider={task.provider}@{task.provider_version} breakers={breakers}"
+        )
+    if view.breaker_counts:
+        for breaker, count in sorted(view.breaker_counts.items()):
+            console.print(f"[red]{breaker}: {count}[/red]")
+
+
+@app.command()
+def report(competition_slug: str) -> None:
+    """Render a markdown run report for the latest run of `competition_slug`."""
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(f"no run for {competition_slug}")
+    view = replay_run(run_id=run_id, root=TRACES_ROOT)
+    # Bare print, NOT console.print: Rich would reformat markdown markers
+    # (#, |, etc.) as Rich markup and break the output for downstream
+    # tools that expect plain markdown.
+    print(render_run_report(view))

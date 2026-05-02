@@ -48,6 +48,7 @@ Thumbs.db
 worktrees/
 artifacts/
 traces/
+runs/
 competitions/*/data/
 competitions/*/predictions/
 competitions/*/models/

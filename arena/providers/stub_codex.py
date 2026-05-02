@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from arena.observability.trace_store import TraceStore
 from arena.providers.base import ProviderAdapter, ProviderResult
 from arena.providers.parser import build_result
 from arena.schemas.validate import validate
@@ -26,10 +27,26 @@ class StubCodexProvider(ProviderAdapter):
     rest of the harness. If a future caller needs to invoke from elsewhere,
     add a `fixture_root` constructor argument and thread it through the
     `inputs` resolution.
+
+    Optional fields exercise observability: failed_commands is a list of
+    (command_str, exit_code) pairs that the stub emits as
+    shell_command_observed events through `event_emitter` before producing
+    its normal result. Enables PR4's live waste-detector path tests
+    (security acceptance test 5: 4 identical failed commands → REPEATED_FAILURE
+    because Phase0HardCeilings.repeated_same_failure_per_task = 2 with
+    strict `>` check).
     """
 
-    def __init__(self, workspace_root: str | Path) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path = "worktrees",
+        *,
+        event_emitter: TraceStore | None = None,
+        failed_commands: list[tuple[str, int]] | None = None,
+    ) -> None:
         self._workspace_root = Path(workspace_root)
+        self._event_emitter = event_emitter
+        self._failed_commands = failed_commands or []
 
     @property
     def name(self) -> str:
@@ -41,6 +58,17 @@ class StubCodexProvider(ProviderAdapter):
 
     def invoke(self, task_packet: dict) -> ProviderResult:
         validate("task_packet", task_packet)
+        # PR4 live waste path: emit shell_command_observed events for any
+        # injected failed_commands. These are picked up by the watchdog's
+        # WasteDetector observer (PR4 Task 6).
+        if self._event_emitter is not None:
+            for command, exit_code in self._failed_commands:
+                self._event_emitter.emit(
+                    event_type="shell_command_observed",
+                    severity="info" if exit_code == 0 else "warning",
+                    task_id=task_packet["task_id"],
+                    payload={"command": command, "exit_code": exit_code},
+                )
         task_id = task_packet["task_id"]
         slug = task_packet["competition_slug"]
         exp_id = task_packet["experiment_id"]
