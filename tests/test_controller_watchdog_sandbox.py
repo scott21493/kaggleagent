@@ -85,6 +85,11 @@ class _ObservingProvider(ProviderAdapter):
 
 
 class _MisbehavingSecretReadProvider(_ObservingProvider):
+    """Provider that calls assert_sandbox_allowed with a forbidden secret path
+    inside its invoke. Used to verify that SandboxViolation propagates through
+    Watchdog.wrap_invoke and that the active sandbox is deactivated even when
+    invoke raises."""
+
     def invoke(self, task_packet: dict) -> ProviderResult:
         # Provider attempts a secret read.
         assert_sandbox_allowed(
@@ -93,6 +98,8 @@ class _MisbehavingSecretReadProvider(_ObservingProvider):
                 target=str(Path("~/.kaggle/kaggle.json").expanduser()),
             )
         )
+        # assert_sandbox_allowed raises SandboxViolation when a sandbox is
+        # active — intentionally unreachable in tests that activate one.
         return super().invoke(task_packet)
 
 

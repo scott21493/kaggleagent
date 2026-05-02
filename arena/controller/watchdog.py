@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 
 from arena.budget.governor import BudgetGovernor
 from arena.budget.kill_switch import KillSwitch
@@ -81,7 +81,9 @@ class Watchdog:
         propagates back to the caller, who translates it into a status=blocked
         row.
         """
-        sandbox_ctx = sandbox.context() if sandbox is not None else nullcontext()
+        sandbox_ctx: AbstractContextManager[object] = (
+            sandbox.context() if sandbox is not None else nullcontext()
+        )
         # No re-check of the kill switch here: see PR2 plan §8. PR7 will
         # add per-event polling for long-running subprocess providers.
         with sandbox_ctx:
