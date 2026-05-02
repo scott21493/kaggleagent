@@ -24,7 +24,7 @@ This document is the authoritative DAG. Each PR will get its own implementation 
 
 These were resolved during brainstorming and are not revisited here:
 
-1. **Workforce:** Claude Code performs all implementation. Sequential by default. Subagent-driven parallel runs are reserved for the two designated fan-out layers (PR3+PR4, PR5+PR6).
+1. **Workforce:** Claude Code performs all implementation. Sequential by default. Subagent-driven parallel runs are reserved for the one designated fan-out layer (PR5+PR6). PR3 and PR4 are now sequential (PR4 depends on PR3).
 2. **Strategy:** Vertical slices, not horizontal layers. Every PR ends with a demonstrably better end-to-end harness.
 3. **Phase 0 close scope:** Stub-only is what CI gates. Real Codex/Claude adapters are skeletal — enough to attempt the happy path locally — but full auth/health/runbook polish defers to Phase 1.
 4. **Granularity:** ~7 functional vertical slices (Approach B). ~1–3 hour Claude Code session per slice. PR0 preflight is separate.
@@ -43,12 +43,13 @@ PR1 (the spine)               ← stub end-to-end loop runs here
   ▼
 PR2 (the cap)                 ← budget + kill switch + waste
   │
-  ├──────────┐
-  ▼          ▼
-PR3 (moat)   PR4 (eyes)       ← parallel-safe (disjoint module trees)
-  │          │
-  └─────┬────┘
-        ▼
+  ▼
+PR3 (moat)                    ← PR4 depends on PR3 (both touch arena/cli.py and arena/controller/watchdog.py)
+  │
+  ▼
+PR4 (eyes)
+  │
+  ▼
         ├──────────┐
         ▼          ▼
        PR5         PR6        ← parallel-safe (disjoint module trees)
@@ -58,7 +59,7 @@ PR3 (moat)   PR4 (eyes)       ← parallel-safe (disjoint module trees)
             PR7                ← real adapters + Phase 0 close
 ```
 
-Sequential: 8 PRs (including PR0). Wall-clock with subagent fan-out at the two parallel layers: ~5 sequential session-equivalents.
+Sequential: 8 PRs (including PR0). Wall-clock with subagent fan-out at the one remaining parallel layer (PR5+PR6): ~6 sequential session-equivalents.
 
 ---
 
@@ -145,7 +146,7 @@ Adds hard ceilings and the kill switch to PR1's loop. Same end-to-end run, now b
 
 ---
 
-## 7. PR3 — The Moat (~2–3 hours, parallel-safe with PR4)
+## 7. PR3 — The Moat (~2–3 hours, sequenced before PR4)
 
 Sandbox + secrets + network deny. Defends the loop from PR2.
 
@@ -165,11 +166,11 @@ Sandbox + secrets + network deny. Defends the loop from PR2.
 - Stub provider attempting to write outside its worktree triggers `ProtectedFileBreaker`.
 - `static_sandbox_policy_check.py` SCAFFOLDING comment is removed; the script is now a real driver.
 
-**Disjoint from PR4:** PR3 touches only `arena/sandbox/` plus `scripts/static_sandbox_policy_check.py` and tests under `tests/sandbox/`. No overlap with PR4.
+**Sequenced before PR4 — PR4 must rebase onto post-PR3 main because both modify `arena/cli.py` and `arena/controller/watchdog.py`.**
 
 ---
 
-## 8. PR4 — The Eyes (~2–3 hours, parallel-safe with PR3)
+## 8. PR4 — The Eyes (~2–3 hours, depends on PR3)
 
 Observability + replay + scrubber expansion + provider-version baselining.
 
@@ -192,7 +193,7 @@ Observability + replay + scrubber expansion + provider-version baselining.
 - Stub provider version baseline is captured on first run; subsequent run with a different version flags `PROVIDER_VERSION_CHANGED`.
 - `check_migrations.py` SCAFFOLDING comment is removed.
 
-**Disjoint from PR3:** PR4 touches only `arena/observability/` plus `scripts/check_migrations.py` and tests under `tests/observability/`. No overlap with PR3.
+**Depends on PR3 — both touch `arena/cli.py` (run-next exception arms) and `arena/controller/watchdog.py` (wrap_invoke wiring); PR4 must rebase onto post-PR3 main.**
 
 ---
 
@@ -286,7 +287,7 @@ Skeletal real Codex/Claude adapters + the complete 10-step research-proxy loop +
 - [scripts/validate_memory_examples.py](../../../scripts/validate_memory_examples.py) → proper test suite in PR6.
 - The SCAFFOLDING headers come off in those PRs.
 
-**Subagent fan-out:** PR3 and PR4 are designed to be safe to run as parallel subagents after PR2 lands. PR5 and PR6 are designed to be safe to run as parallel subagents after PR4 lands. The boundaries are file-tree disjoint and the schemas they touch are also disjoint. The spine PRs (PR0, PR1, PR2, PR7) must run sequentially.
+**Subagent fan-out:** PR3 must land before PR4 (both modify `arena/cli.py` and `arena/controller/watchdog.py`; PR4 must rebase onto post-PR3 main). PR5 and PR6 are designed to be safe to run as parallel subagents after PR4 lands. The spine PRs (PR0, PR1, PR2, PR3, PR4, PR7) must run sequentially.
 
 **Module ownership table:**
 
@@ -315,8 +316,8 @@ Skeletal real Codex/Claude adapters + the complete 10-step research-proxy loop +
 | PR0 | Preflight                             | ~30 min           | no                |
 | PR1 | The spine                             | 3–4 hours         | no                |
 | PR2 | Budget + kill switch                  | 1.5–2 hours       | no                |
-| PR3 | Sandbox + secrets + network           | 2–3 hours         | yes (with PR4)    |
-| PR4 | Observability + replay + scrubber     | 2–3 hours         | yes (with PR3)    |
+| PR3 | Sandbox + secrets + network           | 2–3 hours         | no (PR4 depends on PR3) |
+| PR4 | Observability + replay + scrubber     | 2–3 hours         | no (depends on PR3)     |
 | PR5 | Research proxy steps 1–8              | 2 hours           | yes (with PR6)    |
 | PR6 | Review + memory + SI freeze           | 2–3 hours         | yes (with PR5)    |
 | PR7 | Real adapters + Phase 0 close         | 2–3 hours         | no                |
