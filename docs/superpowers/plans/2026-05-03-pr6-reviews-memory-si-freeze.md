@@ -851,6 +851,62 @@ def test_arena_review_blocks_on_kill_switch(
         store.close()
 
 
+def test_arena_review_attaches_to_impl_rows_run_not_latest(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for cross-run linkage: stub fusion_id is deterministic
+    (fusion_0001), so a second `arena init-fixture` + new research-proxy
+    creates a new run with the SAME fusion_id. `arena review --experiment
+    <impl from first run>` must attach to the FIRST run, not the latest,
+    AND must locate the fusion row from the FIRST run."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _run_research_proxy_first(runner)
+    # Capture the first run's id from exp_0004.
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        first_run = store._require_conn().execute(
+            "SELECT run_id FROM experiments WHERE experiment_id = ?",
+            ("exp_0004",),
+        ).fetchone()["run_id"]
+    finally:
+        store.close()
+
+    # Start a second run; produces exp_0005..exp_0008 with a different run_id.
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+
+    # Review the FIRST run's impl row. The new review row should be
+    # attached to first_run, not the latest run.
+    result = runner.invoke(
+        app,
+        [
+            "review",
+            "tabular_binary_v1",
+            "--provider",
+            "stub_claude",
+            "--experiment",
+            "exp_0004",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        rev_row = store._require_conn().execute(
+            "SELECT run_id FROM experiments WHERE experiment_id = ?",
+            ("exp_0009",),
+        ).fetchone()
+        assert rev_row is not None
+        assert rev_row["run_id"] == first_run
+    finally:
+        store.close()
+
+
 def test_arena_review_persists_post_invoke_budget_blocked_row_with_usage(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -947,23 +1003,28 @@ def review(
             f"unknown review provider {provider!r}; PR6 supports only stub_claude"
         )
 
-    run_id = _latest_run_id()
-    if run_id is None:
-        raise typer.BadParameter(
-            f"no run for {competition_slug}; "
-            f"run `arena init-fixture {competition_slug}` first"
-        )
     store = _store()
 
-    # Resolve the impl row + fusion_proposal.json path from the scoreboard.
+    # Resolve the impl row + its run_id FIRST. The review row must be
+    # attached to the SAME run as the impl row (not _latest_run_id()),
+    # otherwise a second `arena init-fixture` followed by `arena review
+    # --experiment exp_0004` would attach the review to the new run
+    # while reading impl artifacts from the old one. The fusion_token
+    # is also deterministic (fusion_0001) across runs, so the fusion
+    # lookup MUST also filter by run_id to avoid cross-run linkage.
     impl_row = store._require_conn().execute(
-        "SELECT experiment_id, artifact_paths FROM experiments "
+        "SELECT experiment_id, run_id, artifact_paths FROM experiments "
         "WHERE competition_slug = ? AND experiment_id = ?",
         (competition_slug, experiment),
     ).fetchone()
     if impl_row is None:
         raise typer.BadParameter(
             f"experiment {experiment} not found for {competition_slug}"
+        )
+    run_id = impl_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(
+            f"experiment {experiment} has no run_id (corrupt scoreboard?)"
         )
     impl_paths: list[str] = json.loads(impl_row["artifact_paths"])
 
@@ -988,12 +1049,14 @@ def review(
         )
 
     # Find the fusion row whose artifact_paths contains the same fusion_token
-    # AND has the <step:fusion> marker. That row's artifact_paths includes
-    # the fusion_proposal.json path.
+    # AND has the <step:fusion> marker AND lives in the SAME run as the
+    # impl row. fusion_token is deterministic across runs (fusion_0001),
+    # so without the run_id filter we could match a different run's row.
     fusion_row = store._require_conn().execute(
         "SELECT experiment_id, artifact_paths FROM experiments "
-        "WHERE competition_slug = ? AND artifact_paths LIKE ? AND artifact_paths LIKE ?",
-        (competition_slug, f"%{fusion_token}%", "%<step:fusion>%"),
+        "WHERE competition_slug = ? AND run_id = ? "
+        "AND artifact_paths LIKE ? AND artifact_paths LIKE ?",
+        (competition_slug, run_id, f"%{fusion_token}%", "%<step:fusion>%"),
     ).fetchone()
     if fusion_row is None:
         raise typer.BadParameter(
@@ -1246,7 +1309,7 @@ Expected: 7 passed.
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 309 passed (was 299, +10 = 3 packet builder + 7 CLI). All checks clean.
+Expected: 310 passed (was 299, +11 = 3 packet builder + 8 CLI tests including the cross-run-linkage regression). All checks clean.
 
 - [ ] **Step 10: Commit**
 
@@ -1801,7 +1864,7 @@ Expected: 13 passed (6 proposal + 4 validator + 3 diff).
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 322 passed (was 309, +13). All checks clean.
+Expected: 323 passed (was 310, +13). All checks clean.
 
 - [ ] **Step 10: Commit**
 
@@ -1986,6 +2049,49 @@ def test_memory_propose_missing_review_experiment(
     assert "exp_9999" in result.output or "not found" in result.output.lower()
 
 
+def test_memory_propose_rejects_schema_invalid_review(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A research_review.json that is syntactically valid JSON but
+    fails schema validation (missing a required field) must surface as
+    a clean typer.BadParameter, not an unhandled ValidationError.
+    """
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _bootstrap_review(runner)
+
+    # Locate the review row's research_review.json and overwrite it
+    # with a payload missing the required `decision` field.
+    rev_workspace = fixture_workspace / "worktrees" / "tabular_binary_v1" / "exp_0005"
+    rr_path = rev_workspace / "research_review.json"
+    assert rr_path.exists()
+    rr_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "research_review.v1",
+                "review_id": "rr_0001",
+                "competition_slug": "tabular_binary_v1",
+                "subject_id": "exp_0004",
+                # decision intentionally missing
+                "summary": "10+ char summary",
+                "strengths": [],
+                "weaknesses": [],
+                "required_fixes": [],
+                "follow_up_recommendations": [],
+                "risk_level": "low",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["memory", "propose", "tabular_binary_v1", "--review", "exp_0005"]
+    )
+    assert result.exit_code != 0
+    assert "schema-invalid" in result.output.lower() or "decision" in result.output
+
+
 def test_memory_propose_id_is_monotonic(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2020,12 +2126,16 @@ Expected: 5 failures — `arena memory propose` doesn't exist yet.
 In `arena/cli.py`, add at the top of the file (after the existing `arena/research_proxy/*` imports):
 
 ```python
+from jsonschema import ValidationError
+
 from arena.memory.proposal import (
     get_next_proposal_id,
     synthesize_memory_proposal,
     validate_memory_update,
 )
 ```
+
+(If `from jsonschema import ValidationError` is already imported elsewhere in `arena/cli.py`, do NOT add it again — keep imports unique.)
 
 Then add a Typer subapp BEFORE the existing subcommands (after `app = typer.Typer(...)` at line ~46):
 
@@ -2098,6 +2208,14 @@ def memory_propose(
             f"failed to read research_review.json at "
             f"{research_review_path}: {exc}"
         ) from exc
+    except ValidationError as exc:
+        # Schema-invalid research_review.json: surface as a clean
+        # BadParameter rather than letting the ValidationError escape
+        # as an unhandled exception.
+        raise typer.BadParameter(
+            f"research_review.json at {research_review_path} is "
+            f"schema-invalid: {exc.message}"
+        ) from exc
 
     proposals_dir = Path("memory/proposals")
     proposals_dir.mkdir(parents=True, exist_ok=True)
@@ -2149,7 +2267,7 @@ Expected: 5 passed.
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 327 passed (was 322, +5). All checks clean.
+Expected: 329 passed (was 323, +6 = 5 happy-path/no-row/etc. + 1 schema-invalid review regression). All checks clean.
 
 - [ ] **Step 6: Commit**
 
@@ -2305,6 +2423,183 @@ def test_scan_detects_score_regression(
     finally:
         store.close()
     assert any(f.kind == "score_regression" for f in findings)
+
+
+def test_scan_detects_invalid_submission(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row with valid_submission=False (fixture-success-rate
+    regression) surfaces as an invalid_submission finding (§7.3 'lower
+    fixture success rate than champion')."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _bootstrap_clean_run(runner)
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        store._require_conn().execute(
+            "UPDATE experiments SET valid_submission = 0 "
+            "WHERE experiment_id = ?",
+            ("exp_0004",),
+        )
+        store._require_conn().commit()
+        findings = scan_runs(
+            "tabular_binary_v1",
+            store=store,
+            runs_root=fixture_workspace / "runs",
+            baselines_root=fixture_workspace / "runs" / ".baselines",
+        )
+    finally:
+        store.close()
+    assert any(f.kind == "invalid_submission" for f in findings)
+
+
+def test_scan_detects_wall_clock_regression(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When non-calibration rows' aggregated wall_seconds exceeds the
+    calibration champion's by >20% AND there's no score improvement,
+    scan_runs surfaces a wall_clock_regression finding (§7.3
+    'wall-clock increase over 20% without score/safety improvement').
+
+    The PR1 calibration row exists at exp_0001; we plant a non-zero
+    wall_seconds on it as the champion baseline, then inflate one
+    research-proxy row's wall_seconds to trip the threshold."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    runner.invoke(
+        app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"]
+    )
+    runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        # Champion (calibration): 1 row, wall_seconds=1.0, score=0.5.
+        store._require_conn().execute(
+            "UPDATE experiments SET wall_seconds = 1.0 "
+            "WHERE experiment_id = 'exp_0001'"
+        )
+        # Challenger: 4 rows, summed wall_seconds=2.0 (>1.20 * 1.0 and
+        # score not improved over champion's 0.5 — research-proxy impl
+        # row's score is also 0.5).
+        store._require_conn().execute(
+            "UPDATE experiments SET wall_seconds = 0.5 "
+            "WHERE experiment_id IN ('exp_0002','exp_0003','exp_0004','exp_0005')"
+        )
+        store._require_conn().commit()
+        findings = scan_runs(
+            "tabular_binary_v1",
+            store=store,
+            runs_root=fixture_workspace / "runs",
+            baselines_root=fixture_workspace / "runs" / ".baselines",
+        )
+    finally:
+        store.close()
+    assert any(f.kind == "wall_clock_regression" for f in findings), [
+        f.kind for f in findings
+    ]
+
+
+def test_scan_detects_provider_calls_regression(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When non-calibration row count exceeds the calibration row count
+    by >20% AND there's no score improvement, scan_runs surfaces a
+    provider_calls_regression finding."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    runner.invoke(
+        app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"]
+    )
+    runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    # Champion: 1 calibration row. Challenger: 4 research-proxy rows
+    # = 4× the champion = >20% increase. Score at exp_0004 is the
+    # calibration baseline 0.5, so no improvement.
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        findings = scan_runs(
+            "tabular_binary_v1",
+            store=store,
+            runs_root=fixture_workspace / "runs",
+            baselines_root=fixture_workspace / "runs" / ".baselines",
+        )
+    finally:
+        store.close()
+    assert any(f.kind == "provider_calls_regression" for f in findings), [
+        f.kind for f in findings
+    ]
+
+
+def test_scan_treats_missing_trace_as_failed_replay(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row whose task_id has no events.jsonl on disk MUST surface a
+    failed_replay finding. The chain cannot be replayed, so per §7.3
+    this is a freeze trigger. Regression for the original 'no trace =
+    OK to skip' bug.
+    """
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _bootstrap_clean_run(runner)
+
+    # Locate exp_0004's trace file and delete it.
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        impl = store._require_conn().execute(
+            "SELECT run_id, task_id FROM experiments WHERE experiment_id = ?",
+            ("exp_0004",),
+        ).fetchone()
+    finally:
+        store.close()
+
+    canonical = (
+        fixture_workspace
+        / "traces"
+        / impl["run_id"]
+        / impl["task_id"]
+        / "events.jsonl"
+    )
+    if canonical.exists():
+        canonical.unlink()
+    nested = (
+        fixture_workspace
+        / "runs"
+        / impl["run_id"]
+        / "traces"
+        / impl["task_id"]
+        / "events.jsonl"
+    )
+    if nested.exists():
+        nested.unlink()
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        findings = scan_runs(
+            "tabular_binary_v1",
+            store=store,
+            runs_root=fixture_workspace / "runs",
+            baselines_root=fixture_workspace / "runs" / ".baselines",
+        )
+    finally:
+        store.close()
+    assert any(f.kind == "failed_replay" for f in findings), [
+        f.kind for f in findings
+    ]
 ```
 
 - [ ] **Step 2: Write failing proposal tests**
@@ -2426,11 +2721,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from arena.scoreboard.store import ScoreboardStore
+from arena.self_improvement.champion_challenger import (
+    Metrics,
+    compare_metrics,
+)
 
 # Phase-0 thresholds. These are deliberate Phase-0-stub defaults; PR7
 # may make them configurable.
 _CALIBRATION_BASELINE_SCORE = 0.5
 _WASTE_EVENTS_THRESHOLD = 5
+# Fixture success rate threshold: any single row with valid_submission
+# explicitly False is a finding (Phase 0 has at most a handful of rows
+# per slug, so a per-row check is appropriate).
+_INVALID_SUBMISSION_FIRES_FINDING = True
 
 
 @dataclass(frozen=True)
@@ -2454,17 +2757,44 @@ def scan_runs(
     """Scan all scoreboard rows + traces + baselines for `slug` and
     return findings.
 
-    Phase 0 checks (subset of §7.3 — protected-file mutation and
-    schema drift are out of scope until PR7's auto-apply flow exists):
-    - blocked_row: any status="blocked" row
-    - score_regression: max(score) < _CALIBRATION_BASELINE_SCORE
-    - waste_events_threshold: SUM(waste_events) > _WASTE_EVENTS_THRESHOLD
-    - failed_replay: any task_id has missing/corrupt events.jsonl
+    Phase 0 checks cover the §7.3 triggers that can be derived from
+    durable state. Protected-file mutation and schema drift are out of
+    scope until PR7's auto-apply flow exists.
+
+    Triggers:
+    - blocked_row: any status="blocked" row.
+    - invalid_submission: any row with valid_submission explicitly False.
+      (§7.3 "lower fixture success rate than champion".)
+    - score_regression: max(score) < _CALIBRATION_BASELINE_SCORE.
+    - waste_events_threshold: SUM(waste_events) > _WASTE_EVENTS_THRESHOLD.
+      (§7.3 "more waste events".)
+    - wall_clock_regression: aggregated wall_seconds across non-calibration
+      rows exceeds the calibration champion's wall_seconds by >20% AND
+      max(score) <= calibration's score (no improvement to justify the
+      cost). (§7.3 "wall-clock increase over 20% without score/safety
+      improvement".)
+    - provider_calls_regression: aggregated provider_calls across
+      non-calibration rows > 1.20 * calibration's provider_calls AND no
+      score improvement. (§7.3 "provider call count increase over 20%
+      without score/safety improvement".)
+    - failed_replay: any row with a task_id whose
+      traces/<run_id>/<task_id>/events.jsonl is MISSING or corrupt. A
+      missing trace is treated as failed replay (the trace event chain
+      cannot be reconstructed), not as replay-success.
+
+    The +20% triggers use champion_challenger.compare_metrics so the
+    comparison logic is a single library helper. In Phase-0 stub mode
+    most stubs report zero wall_seconds, so these triggers fire only on
+    test fixtures that synthesize non-zero values (or PR7's real
+    adapters). Tests in tests/test_self_improvement_scan.py exercise
+    the triggers via direct row inserts.
     """
     findings: list[Finding] = []
 
     rows = store._require_conn().execute(
-        "SELECT experiment_id, task_id, run_id, status, score, waste_events "
+        "SELECT experiment_id, task_id, run_id, status, score, "
+        "valid_submission, waste_events, wall_seconds, "
+        "experiment_type, provider "
         "FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
         (slug,),
     ).fetchall()
@@ -2487,7 +2817,28 @@ def scan_runs(
                 )
             )
 
-    # 2. score regression (only against rows that produced a score)
+    # 2. invalid submissions (fixture success rate below champion).
+    if _INVALID_SUBMISSION_FIRES_FINDING:
+        for row in rows:
+            # valid_submission is stored as 0/1/None; only fire on
+            # explicit False (0). None means "not applicable to this
+            # row" (e.g. blocked-row branches that never produced a
+            # submission).
+            if row["valid_submission"] == 0:
+                findings.append(
+                    Finding(
+                        kind="invalid_submission",
+                        severity="high",
+                        problem=(
+                            f"experiment {row['experiment_id']} produced "
+                            "valid_submission=False (fixture success rate "
+                            "regression vs champion)"
+                        ),
+                        evidence_refs=[f"scoreboard:{row['experiment_id']}"],
+                    )
+                )
+
+    # 3. score regression (only against rows that produced a score)
     scores = [row["score"] for row in rows if row["score"] is not None]
     if scores and max(scores) < _CALIBRATION_BASELINE_SCORE:
         worst = next(
@@ -2506,7 +2857,7 @@ def scan_runs(
             )
         )
 
-    # 3. waste events threshold
+    # 4. waste events threshold
     total_waste = sum((row["waste_events"] or 0) for row in rows)
     if total_waste > _WASTE_EVENTS_THRESHOLD:
         findings.append(
@@ -2521,21 +2872,101 @@ def scan_runs(
             )
         )
 
-    # 4. failed replay (missing or corrupt events.jsonl per task)
+    # 5+6. wall-clock and provider-call +20% regressions vs the
+    # calibration champion. Champion = the calibration row(s) (PR1's
+    # `arena run-next` writes experiment_type="calibration"); challenger
+    # = aggregated non-calibration rows for this slug. Rely on
+    # compare_metrics so the threshold logic is a single helper.
+    cal_rows = [row for row in rows if row["experiment_type"] == "calibration"]
+    challenger_rows = [
+        row for row in rows if row["experiment_type"] != "calibration"
+    ]
+    if cal_rows and challenger_rows:
+        champion = Metrics(
+            score=max(
+                (row["score"] for row in cal_rows if row["score"] is not None),
+                default=_CALIBRATION_BASELINE_SCORE,
+            ),
+            wall_seconds=sum((row["wall_seconds"] or 0.0) for row in cal_rows),
+            provider_calls=len(cal_rows),
+            waste_events=sum((row["waste_events"] or 0) for row in cal_rows),
+        )
+        challenger = Metrics(
+            score=max(
+                (row["score"] for row in challenger_rows if row["score"] is not None),
+                default=champion.score,
+            ),
+            wall_seconds=sum(
+                (row["wall_seconds"] or 0.0) for row in challenger_rows
+            ),
+            provider_calls=len(challenger_rows),
+            waste_events=sum(
+                (row["waste_events"] or 0) for row in challenger_rows
+            ),
+        )
+        comparison = compare_metrics(champion, challenger)
+        # Map the comparison's regression reason into the corresponding
+        # Finding.kind. compare_metrics returns "; "-joined reason
+        # strings; we surface each as its own finding so freeze
+        # evidence enumerates them clearly.
+        if "wall_seconds" in comparison.reason:
+            findings.append(
+                Finding(
+                    kind="wall_clock_regression",
+                    severity="medium",
+                    problem=(
+                        f"wall-clock +{comparison.wall_seconds_delta:.1f}s "
+                        ">20% over champion without score/safety improvement"
+                    ),
+                    evidence_refs=[f"scoreboard:slug={slug}"],
+                )
+            )
+        if "provider_calls" in comparison.reason:
+            findings.append(
+                Finding(
+                    kind="provider_calls_regression",
+                    severity="medium",
+                    problem=(
+                        f"provider_calls +{comparison.provider_calls_delta} "
+                        ">20% over champion without score/safety improvement"
+                    ),
+                    evidence_refs=[f"scoreboard:slug={slug}"],
+                )
+            )
+
+    # 7. failed replay: a row with a task_id and NO trace, or a corrupt
+    # trace. Missing means the chain cannot be replayed; per §7.3 this
+    # is a freeze trigger. We try the canonical traces/<run_id>/<task_id>
+    # path first, then runs/<run_id>/traces/<run_id>/<task_id> for
+    # workspaces that wrote traces under the run dir.
     for row in rows:
-        if not row["task_id"]:
+        if not row["task_id"] or not row["run_id"]:
             continue
-        events_path = (
+        canonical = Path("traces") / row["run_id"] / row["task_id"] / "events.jsonl"
+        nested = (
             runs_root / row["run_id"] / "traces" / row["task_id"] / "events.jsonl"
         )
-        # Try the canonical traces/<run_id>/<task_id>/events.jsonl too.
-        alt_events_path = Path("traces") / row["run_id"] / row["task_id"] / "events.jsonl"
-        if events_path.exists():
-            target = events_path
-        elif alt_events_path.exists():
-            target = alt_events_path
+        target: Path | None
+        if canonical.exists():
+            target = canonical
+        elif nested.exists():
+            target = nested
         else:
-            continue  # no trace at all is OK for Phase 0; skip
+            target = None
+        if target is None:
+            findings.append(
+                Finding(
+                    kind="failed_replay",
+                    severity="high",
+                    problem=(
+                        f"missing trace for {row['experiment_id']} (task "
+                        f"{row['task_id']}, run {row['run_id']}); replay cannot "
+                        "be reconstructed"
+                    ),
+                    evidence_refs=[f"trace:{row['run_id']}/{row['task_id']}"],
+                )
+            )
+            continue
         try:
             target.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -2732,7 +3163,7 @@ Expected: 9 passed (3 scan + 3 proposal + 3 champion_challenger).
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 336 passed (was 327, +9). All checks clean.
+Expected: 342 passed (was 329, +13 = 7 scan + 3 proposal + 3 champion_challenger). All checks clean.
 
 - [ ] **Step 10: Commit**
 
@@ -3310,7 +3741,7 @@ Expected: 10 passed (5 freeze + 5 CLI).
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 346 passed (was 336, +10). All checks clean. All 6 acceptance scripts green (still 6 in this commit; Task 7 removes one).
+Expected: 352 passed (was 342, +10). All checks clean. All 6 acceptance scripts green (still 6 in this commit; Task 7 removes one).
 
 - [ ] **Step 8: Commit**
 
@@ -3482,23 +3913,26 @@ Expected: 7 passed (covers all 4 operations + 2 conditional paths + contradictio
 git rm scripts/validate_memory_examples.py
 ```
 
-- [ ] **Step 4: Update CLAUDE.md (and any other docs) to remove "6 CI scripts" phrasing**
+- [ ] **Step 4: Update root-level docs to remove "6 CI scripts" phrasing**
 
-Search for references:
+This repo has `README.md` at the root (NOT `CLAUDE.md`). The "6 CI scripts" phrase appears in historical plan documents under `docs/superpowers/plans/` (PR3, PR4, PR5) — those are write-once historical records and MUST NOT be edited. Only edit live, root-level documentation.
+
+Search for live references:
 
 ```bash
-grep -rn "6 CI scripts\|all 6 CI scripts\|6 acceptance scripts" CLAUDE.md README.md 2>/dev/null
+.venv/Scripts/python.exe -c "import subprocess, pathlib; [print(p) for p in pathlib.Path('.').glob('*.md')]"
+grep -n "6 CI scripts\|all 6 CI scripts\|6 acceptance scripts" README.md 2>/dev/null
 ```
 
-For each match, update the wording. Use this replacement template:
+If `README.md` (or any other `*.md` file at the repo root) contains the phrase, replace it inline. Use this template for the wording:
 
-> Old: "all 6 CI scripts green: ruff, ruff format, mypy, pytest, validate_schemas, validate_prompt_delimiters, fixture_smoke, static_sandbox_policy_check, validate_memory_examples, check_migrations"
+> Old: "all 6 CI scripts green: ... validate_memory_examples ..."
 >
 > New: "all external acceptance scripts green: validate_schemas.py, validate_prompt_delimiters.py, fixture_smoke.py, static_sandbox_policy_check.py, check_migrations.py — plus pytest (which now covers the memory_update examples that scripts/validate_memory_examples.py used to inline)"
 
-If `CLAUDE.md` has an enumerated list of acceptance scripts, edit it to drop `validate_memory_examples.py` and add a one-liner: "Memory proposal example coverage moved to `tests/test_memory_proposal_examples.py` (PR6)."
+If `README.md` has no such reference (the grep returns no output), no doc edit is needed; proceed directly to Step 5. Do NOT create a new `CLAUDE.md` just to write the phrasing into; do NOT modify the historical plan files under `docs/superpowers/plans/` even though they contain the old phrase.
 
-If no such reference exists in `CLAUDE.md` (the grep returns nothing), proceed to Step 5.
+Track which root-level docs you actually changed; the Step 6 commit should `git add` only those, plus `tests/test_memory_proposal_examples.py`. The deletion of `scripts/validate_memory_examples.py` was already staged by `git rm` in Step 3.
 
 - [ ] **Step 5: Run full suite + lint + mypy + the (now 5) acceptance scripts**
 
@@ -3514,15 +3948,21 @@ If no such reference exists in `CLAUDE.md` (the grep returns nothing), proceed t
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 353 passed (was 346, +7). All 5 remaining acceptance scripts green. ruff/format/mypy clean.
+Expected: 359 passed (was 352, +7). All 5 remaining acceptance scripts green. ruff/format/mypy clean.
 
 (Note: `scripts/validate_memory_examples.py` no longer exists.)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/test_memory_proposal_examples.py CLAUDE.md
-# (and any other modified docs from Step 4)
+# Stage the new test file. Stage any root-level *.md files you actually
+# edited in Step 4 (e.g., `git add README.md`). The deletion of
+# scripts/validate_memory_examples.py is already staged from `git rm`
+# in Step 3. Do NOT `git add CLAUDE.md` — that file does not exist in
+# this repo.
+git add tests/test_memory_proposal_examples.py
+# Optionally:
+#   git add README.md           # only if Step 4 modified it
 git commit -m "$(cat <<'EOF'
 test(memory): replace validate_memory_examples.py with proper test suite
 
@@ -3542,10 +3982,12 @@ The new test suite covers:
 exercised against every operation path, with both schema- and
 semantic-validation coverage.
 
-Updated CLAUDE.md (and any other docs) to drop "6 CI scripts"
-phrasing in favor of explicit listing — avoids count-drift on every
-script add/remove. Memory example coverage is now under pytest, so
-the external acceptance-scripts list shrinks to 5.
+If README.md (or any other root-level *.md) referenced "6 CI scripts",
+it was updated in Step 4 to list the acceptance scripts explicitly so
+the count doesn't drift on every script add/remove. Historical PR plans
+under docs/superpowers/plans/ were intentionally left as-is. Memory
+example coverage is now under pytest, so the external acceptance-scripts
+list shrinks to 5.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -3591,7 +4033,7 @@ PR6 acceptance is met when:
 2. `arena memory propose tabular_binary_v1 --review exp_0005` succeeds; writes `memory/proposals/mem_0001.json` (schema-valid); emits `memory_proposal_created` trace event with payload using only `event.schema.json`-permitted keys; creates NO scoreboard row.
 3. `arena self-improve scan tabular_binary_v1` against a clean scoreboard exits 0 with zero proposals + no sentinel. Same command against a scoreboard with a blocked row produces ≥1 `self_improvement/proposals/sip_NNNN.json` + writes `SELF_IMPROVEMENT_FROZEN.md`. NO scoreboard row.
 4. `tests/test_memory_proposal_examples.py` covers all 4 `operation` paths + contradiction detection. `scripts/validate_memory_examples.py` is gone; CLAUDE.md (and any other docs) no longer say "6 CI scripts".
-5. Full suite green (353+ tests); ruff/format/mypy clean; 5 external acceptance scripts green.
+5. Full suite green (359+ tests); ruff/format/mypy clean; 5 external acceptance scripts green.
 6. PR5 invariants still hold: re-running `arena research-proxy` against a clean fixture still produces 4 rows; `provider_calls == COUNT(*)`; PR4 reproducibility checks fire.
 
 This unblocks PR7 (Real Codex/Claude + close-the-loop), which composes the three PR6 commands into the full 10-step §6.2 acceptance test.
