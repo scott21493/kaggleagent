@@ -29,15 +29,21 @@ arena memory propose <competition_slug> --review <review_exp_id>
    → reads the review row's research_review.json from its artifact_paths
    → synthesizes memory_update.json (no-op observation if review has no actionable findings)
    → writes memory/proposals/mem_NNNN.json (repo-root, monotonic ID across all slugs)
-   → emits trace event memory_proposal_created with proposal_id, proposal_path,
-     review_experiment_id, competition_slug, source_review_artifact
+   → emits trace event memory_proposal_created (payload: message, phase=
+     MEMORY_PROPOSAL_CREATED, proposal_id, memory_update_id, experiment_id=
+     <review_exp_id>, review_id=<rr_NNNN>, path=memory/proposals/mem_NNNN.json,
+     paths=[<source_review_artifact>])
    → NO scoreboard row, NO provider invocation, provider_calls unchanged
 
 arena self-improve scan <competition_slug>
    → reads scoreboard rows + traces + baselines for <slug>; scans ALL rows (Phase 0)
    → checks §7.3 freeze triggers against thresholds
    → emits 0..N self_improvement/proposals/sip_NNNN.json (repo-root)
-   → emits trace event self_improvement_scan_completed with finding count
+   → emits trace event self_improvement_scan_completed (payload: message,
+     phase=SELF_IMPROVEMENT_SCAN_COMPLETED, status=clean|findings|frozen,
+     reason="findings_count=N; freeze_triggered=true|false",
+     paths=[self_improvement/proposals/sip_NNNN.json, ...], evidence=[...],
+     and path=SELF_IMPROVEMENT_FROZEN.md when frozen)
    → if any §7.3 trigger fires, writes SELF_IMPROVEMENT_FROZEN.md (Markdown
      body + fenced JSON metadata block)
    → NO scoreboard row, NO provider invocation, provider_calls unchanged
@@ -96,7 +102,7 @@ This pattern matches `arena report` — a control-plane command that reads score
 | Scoreboard row | NO |
 | `provider_calls` | unchanged |
 | Output artifact | `memory/proposals/mem_NNNN.json` (repo-root, monotonic ID across all slugs via filesystem scan) |
-| Trace event | `memory_proposal_created` (payload: `proposal_id`, `proposal_path`, `review_experiment_id`, `competition_slug`, `source_review_artifact`) |
+| Trace event | `memory_proposal_created`. Payload uses ONLY `event.schema.json`-permitted keys (the schema sets `additionalProperties: false`): `message`, `phase=MEMORY_PROPOSAL_CREATED`, `proposal_id=mem_NNNN`, `memory_update_id=mem_NNNN` (same value; both keys are exposed for replay tooling), `experiment_id=<review_exp_id>`, `review_id=<rr_NNNN>`, `path=memory/proposals/mem_NNNN.json`, `paths=[<source_review_artifact>]`. |
 
 **Resolution path:**
 1. Verify the review row exists in the scoreboard for `<slug>` and is a research-proxy row with `<step:review>` token.
@@ -124,7 +130,7 @@ This pattern matches `arena report` — a control-plane command that reads score
 | `provider_calls` | unchanged |
 | Scan window | ALL rows for `<slug>` (Phase 0 — small scoreboard); `--since` / `--limit` flags deferred to PR7+ |
 | Output artifacts | 0..N `self_improvement/proposals/sip_NNNN.json` (repo-root, monotonic across all slugs) |
-| Trace event | `self_improvement_scan_completed` (payload: `slug`, `findings_count`, `freeze_triggered`, `proposal_ids`) |
+| Trace event | `self_improvement_scan_completed`. Payload uses ONLY `event.schema.json`-permitted keys (the schema sets `additionalProperties: false`): `message`, `phase=SELF_IMPROVEMENT_SCAN_COMPLETED`, `status` ∈ {`clean`, `findings`, `frozen`}, `reason="findings_count=N; freeze_triggered=true\|false"`, `paths=[self_improvement/proposals/sip_NNNN.json, ...]`, `evidence=[...]` (string array of human-readable evidence refs), and `path=SELF_IMPROVEMENT_FROZEN.md` ONLY when `status=frozen`. |
 | Freeze sentinel | `SELF_IMPROVEMENT_FROZEN.md` at repo root if any §7.3 trigger fires |
 
 **Scan procedure:**
@@ -327,6 +333,7 @@ PR6 lands when:
 | Champion baseline = PR1's calibration (0.5 stub) | Phase 0 stub-only behavior; PR7's real Codex changes the comparison; documented in champion_challenger.py docstring |
 | `arena review`'s subject_id resolution — assumes path format `worktrees/<slug>/<exp>/submission.csv` | Stub extracts subject_id from inputs[0] same way stub_codex extracts fusion_id; failure mode is `typer.BadParameter` |
 | Replace `scripts/validate_memory_examples.py` — CI references the script | Acceptance gate #4 explicitly checks docs are updated; reviewer verifies CLAUDE.md + README |
+| Trace event payload drift — `event.schema.json` sets `additionalProperties: false`, so any payload key not in the allowed set rejects at `TraceStore.emit()` validation | §3.2 and §3.3 specify the EXACT key set per event; spec brainstorming round caught this before code was written; plan reviewer must check that no PR6 code uses keys outside `{message, phase, proposal_id, memory_update_id, experiment_id, review_id, path, paths, status, reason, evidence}` |
 
 ## 11. Plan-review preempts (carry from PR1+PR2+PR3+PR4+PR5)
 
