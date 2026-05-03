@@ -360,6 +360,15 @@ class StubClaudeProvider(ProviderAdapter):
         `worktrees/<slug>/<exp_id>/submission.csv` and return <exp_id>.
         Returns None if no matching input exists or the path shape is
         unexpected.
+
+        Assumes the Phase-0 CLI contract: input is a RELATIVE path of
+        the form `worktrees/<slug>/<exp>/submission.csv` (Path.parts
+        normalizes both forward- and back-slashes, so this works on
+        Windows). Absolute paths and paths with `..` traversal segments
+        produce parts whose [-4] element is not literally `"worktrees"`,
+        and silently yield None. The CLI in PR6 Task 2 always passes
+        relative paths from the scoreboard's artifact_paths column, so
+        the silent-None branch is unreachable in practice.
         """
         for input_path in inputs:
             if not input_path.endswith("submission.csv"):
