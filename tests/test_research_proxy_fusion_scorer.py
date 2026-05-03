@@ -108,5 +108,34 @@ def test_is_eligible_rejects_proposal_referencing_forbidden_network() -> None:
     assert any("network" in r.lower() or "requests" in r.lower() for r in reasons)
 
 
+def test_is_eligible_distinguishes_dep_from_algorithm_step_prose() -> None:
+    """Forbidden-network scanning must NOT trip on natural-language prose
+    in algorithm_steps. Only package-name dependencies (exact match,
+    after normalization) and explicit live-network patterns
+    (http://, https://, import requests, …) count. Otherwise everyday
+    phrasing like 'requests careful calibration' or 'open the socket
+    of options' would falsely block proposals.
+
+    First half: prose with the words 'requests' and 'socket' in
+    algorithm_steps but no network-package dep → eligible.
+    Second half: same proposal plus 'requests' as a real dependency →
+    not eligible. Pinning this distinction guards against accidental
+    re-tightening that brings back the false positive.
+    """
+    proposal = _valid_proposal()
+    proposal["implementation_plan"]["algorithm_steps"] = [
+        "Stack OOF predictions; the meta-learner requests careful calibration.",
+        "Open the socket of available cost-vs-fit options and pick one.",
+        "Write submission.csv with id, target.",
+    ]
+    passes, reasons = is_eligible(proposal)
+    assert passes is True, f"prose false-positive: {reasons}"
+
+    proposal["implementation_plan"]["dependencies"] = ["pandas", "requests"]
+    passes, reasons = is_eligible(proposal)
+    assert passes is False
+    assert any("network" in r.lower() and "requests" in r.lower() for r in reasons)
+
+
 def test_min_fusion_score_constant_is_in_range() -> None:
     assert 0.0 < MIN_FUSION_SCORE < 1.0

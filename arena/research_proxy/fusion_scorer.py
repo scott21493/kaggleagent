@@ -23,23 +23,56 @@ class FusionScore:
 
 
 _COST_RANK = {"tiny": 1.0, "small": 0.8, "medium": 0.5, "large": 0.2}
+# Forward-compat: PR7 will switch the fit component from mechanism-count
+# (the current Phase-0 proxy) to a lookup against the digest's
+# applicability.fit value via this table. Kept here so PR7 doesn't need
+# to reintroduce the constant; safe to leave unused in Phase 0.
 _FIT_RANK = {"high": 1.0, "medium": 0.6, "low": 0.2}
 
-_FORBIDDEN_NETWORK_TOKENS = (
-    "requests",
-    "urllib",
-    "httpx",
-    "aiohttp",
+# Forbidden tokens are scoped: package-style names match exactly against
+# normalized dependency names; live-network patterns and explicit-import
+# patterns match as substrings only against algorithm_steps prose. This
+# split prevents English words like "requests" or "socket" appearing in
+# step descriptions ("the meta-learner requests careful calibration")
+# from falsely tripping the eligibility gate. Real package usage still
+# trips it via the dependency check.
+_FORBIDDEN_NETWORK_DEPS = frozenset({"requests", "urllib", "httpx", "aiohttp", "socket"})
+_FORBIDDEN_NETWORK_STEP_PATTERNS = (
     "http://",
     "https://",
-    "socket",
+    "import requests",
+    "import urllib",
+    "import httpx",
+    "import aiohttp",
+    "import socket",
 )
-_FORBIDDEN_UNTRUSTED_IMPORTS = (
-    "subprocess",  # Phase 0: no shelling out from research-proxy code
+_FORBIDDEN_UNTRUSTED_DEPS = frozenset(
+    {"subprocess"}  # Phase 0: no shelling out from research-proxy code
+)
+_FORBIDDEN_UNTRUSTED_STEP_PATTERNS = (
+    "import subprocess",
     "os.system",
     "eval(",
     "exec(",
 )
+
+
+def _normalize_dep(dep: str) -> str:
+    """Strip version specifiers, extras, and surrounding whitespace from
+    a pip-style dependency string and lowercase the result. Returns the
+    base package name so `_FORBIDDEN_NETWORK_DEPS` membership is a clean
+    exact match.
+
+    Examples: 'requests' → 'requests'; 'requests>=2.0' → 'requests';
+    'Requests[security]==2.31.0' → 'requests'.
+    """
+    name = dep.strip().lower()
+    for sep in ("==", ">=", "<=", "~=", "!=", ">", "<"):
+        if sep in name:
+            name = name.split(sep, 1)[0]
+    if "[" in name:
+        name = name.split("[", 1)[0]
+    return name.strip()
 
 
 def score_fusion_proposal(proposal: dict[str, Any]) -> FusionScore:
@@ -79,9 +112,15 @@ def is_eligible(proposal: dict[str, Any]) -> tuple[bool, list[str]]:
     - risks is a list (may be empty; spec only says "risk list")
     - stop_condition non-empty
     - source_refs non-empty
-    - No forbidden network token in implementation_plan.dependencies or
-      .algorithm_steps
-    - No forbidden untrusted-code-import token in algorithm_steps
+    - No forbidden network use: dependency names match exactly against
+      _FORBIDDEN_NETWORK_DEPS (after normalization); algorithm_steps are
+      scanned only for explicit live-network patterns (http://, https://,
+      import requests, etc.) so plain English words don't false-trigger.
+    - No forbidden untrusted-code use: same dep-vs-step split with
+      _FORBIDDEN_UNTRUSTED_{DEPS,STEP_PATTERNS}.
+
+    First match per category wins (one reason per failure axis to keep
+    the breaker UX short; broader negative coverage lives in Task 6).
     """
     reasons: list[str] = []
 
@@ -110,17 +149,35 @@ def is_eligible(proposal: dict[str, Any]) -> tuple[bool, list[str]]:
         reasons.append("source_refs empty")
 
     impl = proposal.get("implementation_plan", {})
-    haystack_parts: list[str] = []
-    haystack_parts.extend(impl.get("dependencies", []))
-    haystack_parts.extend(impl.get("algorithm_steps", []))
-    haystack = " ".join(haystack_parts).lower()
-    for token in _FORBIDDEN_NETWORK_TOKENS:
-        if token in haystack:
-            reasons.append(f"forbidden network dependency token: {token}")
+    deps = [_normalize_dep(d) for d in impl.get("dependencies", [])]
+    steps_haystack = " ".join(impl.get("algorithm_steps", [])).lower()
+
+    # Network category: deps exact-match, then steps substring-match.
+    network_hit: str | None = None
+    for dep in deps:
+        if dep in _FORBIDDEN_NETWORK_DEPS:
+            network_hit = f"dependency {dep!r}"
             break
-    for token in _FORBIDDEN_UNTRUSTED_IMPORTS:
-        if token in haystack:
-            reasons.append(f"forbidden untrusted-code import: {token}")
+    if network_hit is None:
+        for pattern in _FORBIDDEN_NETWORK_STEP_PATTERNS:
+            if pattern in steps_haystack:
+                network_hit = f"algorithm step contains {pattern!r}"
+                break
+    if network_hit is not None:
+        reasons.append(f"forbidden network use: {network_hit}")
+
+    # Untrusted-code category: same dep-vs-step split.
+    untrusted_hit: str | None = None
+    for dep in deps:
+        if dep in _FORBIDDEN_UNTRUSTED_DEPS:
+            untrusted_hit = f"dependency {dep!r}"
             break
+    if untrusted_hit is None:
+        for pattern in _FORBIDDEN_UNTRUSTED_STEP_PATTERNS:
+            if pattern in steps_haystack:
+                untrusted_hit = f"algorithm step contains {pattern!r}"
+                break
+    if untrusted_hit is not None:
+        reasons.append(f"forbidden untrusted-code use: {untrusted_hit}")
 
     return (len(reasons) == 0, reasons)
