@@ -78,3 +78,32 @@ class ProviderAdapter(ABC):
         - write any required outputs into the workspace
         - return a ProviderResult whose to_dict() satisfies provider_result.schema.json
         """
+
+
+class ProviderUnavailable(RuntimeError):
+    """Raised when a real provider cannot be invoked before subprocess
+    task start: missing binary, expired auth, or missing required CLI
+    capability. Per ADR-0004 §"Process not started" — the controller
+    treats this as a hard failure that produces NO scoreboard row and
+    NO trace event.
+
+    `code` is a runtime str (not HealthCode) to keep base.py
+    dependency-free; health.py imports base.py, so typing code as
+    HealthCode would create a cycle. Callers pass health.code.value.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        code: str,
+        detail: str,
+        runbook: str | None = None,
+    ) -> None:
+        self.provider = provider
+        self.code = code
+        self.detail = detail
+        self.runbook = runbook
+        msg = f"{provider} CLI: {code} ({detail})"
+        if runbook:
+            msg += f"; see {runbook}"
+        super().__init__(msg)
