@@ -26,7 +26,11 @@ class StubClaudeProvider(ProviderAdapter):
     to dispatch on (role, phase): research_proxy + (RESEARCH_QUESTION_CREATED,
     METHOD_DIGEST_CREATED, FUSION_PROPOSAL_CREATED) phases write a
     schema-valid JSON artifact. PR6 extends with role=review +
-    MEMORY_PROPOSAL_CREATED.
+    FUSION_PROXY_REVIEWED, which emits research_review.json. (The
+    MEMORY_PROPOSAL_CREATED phase exists in the Phase enum, but PR6's
+    arena memory propose is a controller-only action — no provider
+    invocation, no stub_claude dispatch — so this provider does NOT
+    handle that phase.)
 
     Optional fields exercise observability: failed_commands is a list of
     (command_str, exit_code) pairs that the stub emits as
