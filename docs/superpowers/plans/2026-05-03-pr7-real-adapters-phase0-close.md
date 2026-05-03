@@ -28,7 +28,7 @@ Apply to every task in this plan:
 - `ProviderResult.status` enum is `success | failure | blocked | killed | interrupted` — schema is closed; sub-status detail goes through artifact tokens like `<killed:wall_clock_timeout>`.
 - `SandboxPolicy._default_blocked_paths` extension test (Task 4) must cover BOTH read denial AND write denial precedence over packet `allowed_paths`.
 - All artifact-token substring checks in tests must `paths = json.loads(row["artifact_paths"])` first; never substring-match raw JSON.
-- Branch is `pr7-real-adapters-phase0-close` (already created from main; current HEAD is the spec commit `b8216ff`).
+- Branch is `pr7-real-adapters-phase0-close` (already created from main; current HEAD is the plan commit `f5069d3`, parent is the spec-fix commit `b8216ff`).
 - Test count baseline: 369 passing on main pre-PR7. After PR7 expect ~395-410 (+26-41 tests across 13 tasks).
 - Coverage baseline: 91.63% on main; PR7's gate restoration to 70 has 21+ percentage-point margin.
 
@@ -64,7 +64,7 @@ from arena.providers.auth import matches_auth_expiry
         "authentication failed",
         "Credential expired, please re-authenticate.",
         "session expired",
-        "Login required to continue.",
+        "Please log in to continue.",
         "token invalid",
         "Auth denied (401)",
         "401 Unauthorized",
@@ -781,7 +781,10 @@ Add the new method to the `TraceStore` class:
         paths. The scrubbed paths are appropriate for
         ProviderResult.stdout_path / stderr_path; the raw paths must
         never cross any artifact / event / report boundary."""
-        base = Path(self._root) / self._run_id / task_id
+        # self._root is already <root>/<run_id> per TraceStore.__init__,
+        # so DO NOT prepend self._run_id again — that would yield
+        # traces/<run_id>/<run_id>/<task_id>/.
+        base = self._root / task_id
         base.mkdir(parents=True, exist_ok=True)
         stdout_raw = base / "stdout.raw"
         stderr_raw = base / "stderr.raw"
@@ -848,8 +851,12 @@ def test_default_blocked_paths_includes_traces(tmp_path):
 
 
 def test_provider_packet_cannot_read_traces_even_if_in_allowed_paths(tmp_path):
-    """blocked_paths wins over allowed_paths for SECRET_READ (raw stream protection)."""
+    """blocked_paths wins over allowed_paths for SECRET_READ (raw stream protection).
+
+    Note: is_secret_read / is_protected_write are MODULE FUNCTIONS in
+    arena.sandbox.secrets, not methods on SandboxPolicy."""
     from arena.sandbox.policy import SandboxPolicy
+    from arena.sandbox.secrets import is_secret_read
     packet = {
         "task_id": "task_0001",
         "allowed_paths": ["traces/"],  # try to allow traces — must still be denied
@@ -857,7 +864,7 @@ def test_provider_packet_cannot_read_traces_even_if_in_allowed_paths(tmp_path):
     }
     policy = SandboxPolicy.from_packet(packet, workspace_root=tmp_path)
     target = (tmp_path / "traces" / "run_x" / "task_y" / "stdout.raw").resolve()
-    assert policy.is_secret_read(target) is True, (
+    assert is_secret_read(target, policy) is True, (
         "blocked_paths must win over allowed_paths for raw-trace reads"
     )
 
@@ -865,6 +872,7 @@ def test_provider_packet_cannot_read_traces_even_if_in_allowed_paths(tmp_path):
 def test_provider_packet_cannot_write_to_traces_even_if_in_allowed_paths(tmp_path):
     """blocked_paths wins over allowed_paths for PROTECTED_WRITE."""
     from arena.sandbox.policy import SandboxPolicy
+    from arena.sandbox.secrets import is_protected_write
     packet = {
         "task_id": "task_0001",
         "allowed_paths": ["traces/"],
@@ -872,7 +880,7 @@ def test_provider_packet_cannot_write_to_traces_even_if_in_allowed_paths(tmp_pat
     }
     policy = SandboxPolicy.from_packet(packet, workspace_root=tmp_path)
     target = (tmp_path / "traces" / "fake_write.txt").resolve()
-    assert policy.is_protected_write(target) is True
+    assert is_protected_write(target, policy) is True
 ```
 
 - [ ] **Step 2: Run tests; confirm failure**
@@ -1066,18 +1074,35 @@ from arena.providers.base import ProviderUnavailable
 from arena.providers.codex import RealCodexProvider
 
 
-def _packet(task_id: str = "task_0001") -> dict:
+def _packet(task_id: str = "task_0001", *, role: str = "implementation",
+            phase: str = "CALIBRATION_TASK_CREATED",
+            provider: str = "codex") -> dict:
+    """task_packet.schema.json-valid packet helper.
+
+    Required fields per schema (additionalProperties: false):
+      schema_version, task_id, competition_slug, provider, role, phase,
+      objective, inputs, allowed_paths, blocked_paths, budgets,
+      required_outputs, success_criteria.
+    Note: it's `required_outputs` (NOT `expected_outputs`) and
+    `budgets.max_shell_commands` is in the budgets `required` set.
+    """
     return {
         "schema_version": "task_packet.v1",
         "task_id": task_id,
         "competition_slug": "tabular_binary_v1",
-        "role": "implementation",
-        "phase": "CALIBRATION_TASK_CREATED",
+        "provider": provider,
+        "role": role,
+        "phase": phase,
+        "objective": "test",
         "inputs": [],
-        "expected_outputs": ["submission.csv"],
         "allowed_paths": [],
         "blocked_paths": [],
-        "budgets": {"max_wall_minutes": 5, "max_provider_calls": 1},
+        "budgets": {
+            "max_wall_minutes": 5,
+            "max_shell_commands": 100,
+        },
+        "required_outputs": ["submission.csv"],
+        "success_criteria": [],
     }
 
 
@@ -1204,7 +1229,8 @@ def test_invoke_exit_0_with_terminal_event_returns_success(
     result = p.invoke(_packet())
     assert result.status == "success"
     assert "submission.csv" in result.artifacts
-    assert result.usage_proxy.shell_commands == 3
+    # UsageProxy is a TypedDict (not a dataclass) — use ["key"] access.
+    assert result.usage_proxy["shell_commands"] == 3
 
 
 def test_invoke_writes_provider_streams_via_tracestore(
@@ -1241,9 +1267,10 @@ def test_invoke_records_deterministic_usage_on_failure(
     )
     result = p.invoke(_packet())
     assert result.status == "failure"
-    assert result.usage_proxy.wall_seconds >= 0.0
-    assert result.usage_proxy.input_chars > 0
-    assert result.usage_proxy.output_chars == len("malformed{") + len("err")
+    # UsageProxy is a TypedDict — use ["key"] access.
+    assert result.usage_proxy["wall_seconds"] >= 0.0
+    assert result.usage_proxy["input_chars"] > 0
+    assert result.usage_proxy["output_chars"] == len("malformed{") + len("err")
 
 
 # Shim integration tests — exercise the real subprocess boundary
@@ -1335,7 +1362,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from arena.observability.scrubber import scrub
+from arena.observability.scrubber import scrub_text
 from arena.observability.trace_store import TraceStore
 from arena.providers.auth import matches_auth_expiry
 from arena.providers.base import (
@@ -1383,6 +1410,11 @@ class RealCodexProvider(ProviderAdapter):
                 "route stdout/stderr persistence without a TraceStore. "
                 "Pass event_emitter= at construction time."
             )
+        # Per ProviderAdapter.invoke contract: validate the incoming
+        # packet. Mirrors stub_codex/stub_claude (double-validation is
+        # cheap; CLI also pre-validates).
+        from arena.schemas.validate import validate as _validate_schema
+        _validate_schema("task_packet", task_packet)
         task_id = task_packet["task_id"]
         prompt_dir = self._cwd / ".arena_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -1434,8 +1466,8 @@ class RealCodexProvider(ProviderAdapter):
         wall_seconds = time.monotonic() - start
         finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
-        scrubbed_stdout = scrub(stdout)
-        scrubbed_stderr = scrub(stderr)
+        scrubbed_stdout = scrub_text(stdout)
+        scrubbed_stderr = scrub_text(stderr)
 
         paths = self._event_emitter.write_provider_streams(
             task_id=task_id,
@@ -1476,14 +1508,17 @@ class RealCodexProvider(ProviderAdapter):
         else:
             status = "failure"
 
-        usage = UsageProxy(
-            input_chars=len(prompt_json),
-            output_chars=len(scrubbed_stdout) + len(scrubbed_stderr),
-            wall_seconds=wall_seconds,
-            shell_commands=int(parsed.get("usage", {}).get("shell_commands", 0)),
-            failed_commands=int(parsed.get("usage", {}).get("failed_commands", 0)),
-            waste_events=int(parsed.get("usage", {}).get("waste_events", 0)),
-        )
+        # UsageProxy is a TypedDict — kwarg construction is permitted by
+        # PEP 589 but tests must read fields via ["key"] access. The 6
+        # fields here are EXACTLY the schema's required set.
+        usage: UsageProxy = {
+            "input_chars": len(prompt_json),
+            "output_chars": len(scrubbed_stdout) + len(scrubbed_stderr),
+            "wall_seconds": wall_seconds,
+            "shell_commands": int(parsed.get("usage", {}).get("shell_commands", 0)),
+            "failed_commands": int(parsed.get("usage", {}).get("failed_commands", 0)),
+            "waste_events": int(parsed.get("usage", {}).get("waste_events", 0)),
+        }
 
         return ProviderResult(
             task_id=task_id,
@@ -1571,15 +1606,25 @@ def test_invoke_review_role_validates_against_research_review_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """role='review' + phase='FUSION_PROXY_REVIEWED' → research_review schema."""
+    # research_review.schema.json (additionalProperties: false) requires:
+    #   schema_version, review_id (rr_NNNN), competition_slug,
+    #   subject_id, decision (accept|reject|revise|run_proxy|stop),
+    #   summary (≥10 chars), strengths, weaknesses, required_fixes,
+    #   follow_up_recommendations, risk_level.
+    # No `recommendations` or `reviewed_at` fields — they would fail
+    # additionalProperties: false.
     valid_review = json.dumps({
         "schema_version": "research_review.v1",
         "review_id": "rr_0001",
+        "competition_slug": "tabular_binary_v1",
         "subject_id": "fusion_0001",
-        "decision": "approve",
-        "risk_level": "low",
+        "decision": "accept",
+        "summary": "Proposal looks reasonable for the proxy slice.",
+        "strengths": ["clear mechanism", "smallest test defined"],
+        "weaknesses": [],
         "required_fixes": [],
-        "recommendations": [],
-        "reviewed_at": "2026-05-03T12:00:00+00:00",
+        "follow_up_recommendations": [],
+        "risk_level": "low",
     })
     def fake_run(*a, **kw):
         return MagicMock(returncode=0, stdout=valid_review, stderr="")
@@ -1674,7 +1719,7 @@ from typing import Any
 
 from jsonschema import ValidationError
 
-from arena.observability.scrubber import scrub
+from arena.observability.scrubber import scrub_text
 from arena.observability.trace_store import TraceStore
 from arena.providers.auth import matches_auth_expiry
 from arena.providers.base import (
@@ -1729,6 +1774,8 @@ class RealClaudeProvider(ProviderAdapter):
                 f"{type(self).__name__}.invoke requires event_emitter; "
                 "task packets do not carry run_id."
             )
+        # Adapter-level packet validation per ProviderAdapter contract.
+        validate_schema("task_packet", task_packet)
         task_id = task_packet["task_id"]
         role = task_packet.get("role", "")
         phase = task_packet.get("phase", "")
@@ -1775,8 +1822,8 @@ class RealClaudeProvider(ProviderAdapter):
         wall_seconds = time.monotonic() - start
         finished_at = datetime.now(UTC).isoformat(timespec="seconds")
 
-        scrubbed_stdout = scrub(stdout)
-        scrubbed_stderr = scrub(stderr)
+        scrubbed_stdout = scrub_text(stdout)
+        scrubbed_stderr = scrub_text(stderr)
 
         paths = self._event_emitter.write_provider_streams(
             task_id=task_id,
@@ -1812,14 +1859,15 @@ class RealClaudeProvider(ProviderAdapter):
         else:
             status = "failure"
 
-        usage = UsageProxy(
-            input_chars=len(prompt_json),
-            output_chars=len(scrubbed_stdout) + len(scrubbed_stderr),
-            wall_seconds=wall_seconds,
-            shell_commands=0,
-            failed_commands=0,
-            waste_events=0,
-        )
+        # UsageProxy TypedDict — see codex.py for the convention note.
+        usage: UsageProxy = {
+            "input_chars": len(prompt_json),
+            "output_chars": len(scrubbed_stdout) + len(scrubbed_stderr),
+            "wall_seconds": wall_seconds,
+            "shell_commands": 0,
+            "failed_commands": 0,
+            "waste_events": 0,
+        }
 
         return ProviderResult(
             task_id=task_id,
@@ -2537,7 +2585,7 @@ def eval_harness(
         skip("memory propose", "review prerequisite missing in this run")
 
     run("self-improve scan", self_improve_scan, competition_slug)
-    run("report", report_command, competition_slug)
+    run("report", report, competition_slug)
 
     _render_step_table(steps)
 
@@ -2545,7 +2593,7 @@ def eval_harness(
     raise typer.Exit(1 if failed_count > 0 else 0)
 ```
 
-(Note: `report_command` may be the actual function name for the report Typer command; verify and adjust import. `init_fixture`, `plan`, `run_next`, `research_proxy`, `evaluate`, `review`, `memory_propose`, `self_improve_scan` are all already defined in cli.py.)
+(Note: `init_fixture`, `plan`, `run_next`, `research_proxy`, `evaluate`, `review`, `memory_propose`, `self_improve_scan`, `report` are all already defined in cli.py — call them directly.)
 
 Add to imports near the top of cli.py if not already present:
 
@@ -2597,7 +2645,7 @@ For each condition, the test invokes the relevant CLI command(s) via `runner.inv
 - 08 review at least one: `review --experiment <impl>` → assert review row with `<step:review>` token.
 - 09 scoreboard records: after run-next, assert experiment row has non-null `wall_seconds`, `provider_version`, `artifact_paths`, `valid_submission`.
 - 10 governor enforces: set `ARENA_PHASE0_PROVIDER_CALL_CAP=0` and run-next → assert exit blocks.
-- 12 sandbox denies secrets: assert `SandboxPolicy.from_packet({}).is_secret_read(home / ".kaggle" / "key")` is True.
+- 12 sandbox denies secrets: `from arena.sandbox.secrets import is_secret_read; from arena.sandbox.policy import SandboxPolicy`; assert `is_secret_read(home / ".kaggle" / "key", SandboxPolicy.from_packet({}, workspace_root=tmp_path))` is True. (Module functions, not methods.)
 - 13 memory updates as deltas: `memory propose --review <id>` → assert `mem_*.json` exists; assert `memory/research.md` is NOT mutated by the propose command (only diff rendered).
 
 - [ ] **Step 2: Run the tests; confirm pass**
