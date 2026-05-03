@@ -1,0 +1,332 @@
+# tests/test_provider_codex.py
+"""RealCodexProvider: monkeypatch unit tests + shim integration tests.
+
+Unit tests cover edge cases (timeouts, FileNotFoundError, exit-code
+mapping). Shim tests exercise the real subprocess boundary including
+argv construction, prompt-file routing, scrubber attachment, and
+TraceStore.write_provider_streams.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from arena.observability.trace_store import TraceStore
+from arena.providers.base import ProviderUnavailable
+from arena.providers.codex import RealCodexProvider
+
+
+def _packet(
+    task_id: str = "task_0001",
+    *,
+    role: str = "implementation",
+    phase: str = "CALIBRATION_TASK_CREATED",
+    provider: str = "codex",
+) -> dict:
+    """task_packet.schema.json-valid packet helper.
+
+    Required fields per schema (additionalProperties: false):
+      schema_version, task_id, competition_slug, provider, role, phase,
+      objective, inputs, allowed_paths, blocked_paths, budgets,
+      required_outputs, success_criteria.
+    `objective` has minLength=10. Budgets `required` is exactly 5
+    fields: max_wall_minutes, max_shell_commands, max_failed_commands,
+    max_input_chars, max_output_chars (additionalProperties: false on
+    budgets too, so don't add extras).
+    """
+    return {
+        "schema_version": "task_packet.v1",
+        "task_id": task_id,
+        "competition_slug": "tabular_binary_v1",
+        "provider": provider,
+        "role": role,
+        "phase": phase,
+        "objective": "real-adapter test packet",  # minLength=10
+        "inputs": [],
+        "allowed_paths": [],
+        "blocked_paths": [],
+        "budgets": {
+            "max_wall_minutes": 5,
+            "max_shell_commands": 100,
+            "max_failed_commands": 10,
+            "max_input_chars": 100_000,
+            "max_output_chars": 100_000,
+        },
+        "required_outputs": ["submission.csv"],
+        "success_criteria": [],
+    }
+
+
+def test_invoke_requires_event_emitter(tmp_path: Path) -> None:
+    """Real adapters MUST have a non-None TraceStore at invoke() time —
+    task packets do not carry run_id."""
+    p = RealCodexProvider(executable="codex", version="0.4.2", cwd=tmp_path)
+    with pytest.raises(RuntimeError, match=r"event_emitter"):
+        p.invoke(_packet())
+
+
+def test_invoke_file_not_found_raises_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        raise FileNotFoundError("codex")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    with pytest.raises(ProviderUnavailable) as exc:
+        p.invoke(_packet())
+    assert exc.value.code == "not_found"
+
+
+def test_invoke_timeout_returns_killed_with_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        raise subprocess.TimeoutExpired(cmd="codex", timeout=600)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "killed"
+    assert "<killed:wall_clock_timeout>" in result.artifacts
+
+
+def test_invoke_exit_64_returns_blocked_with_auth_tokens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=64, stdout="", stderr="auth")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "blocked"
+    assert "<blocked:AuthFailureBreaker>" in result.artifacts
+    assert "<runbook:docs/phase0/runbooks/auth_expiry.md>" in result.artifacts
+
+
+def test_invoke_exit_1_with_auth_stderr_upgrades_to_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=1, stdout="", stderr="session expired, please log in")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "blocked"
+    assert "<blocked:AuthFailureBreaker>" in result.artifacts
+
+
+def test_invoke_exit_1_neutral_stays_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=1, stdout="", stderr="connection refused")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "failure"
+    assert not any(t.startswith("<blocked:") for t in result.artifacts)
+
+
+def test_invoke_exit_0_missing_terminal_event_returns_failure_with_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NDJSON without a terminal usage/artifacts event."""
+
+    def fake_run(*a, **kw):
+        return MagicMock(
+            returncode=0,
+            stdout='{"event": "thinking"}\n{"event": "thinking"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "failure"
+    assert "<failure:missing_terminal_event>" in result.artifacts
+
+
+def test_invoke_exit_0_with_terminal_event_returns_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Final NDJSON event has artifacts + usage."""
+    terminal = json.dumps(
+        {
+            "event": "done",
+            "artifacts": ["submission.csv"],
+            "usage": {"shell_commands": 3, "failed_commands": 0, "waste_events": 0},
+        }
+    )
+
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=0, stdout=terminal + "\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "success"
+    assert "submission.csv" in result.artifacts
+    # UsageProxy is a TypedDict (not a dataclass) — use ["key"] access.
+    assert result.usage_proxy["shell_commands"] == 3
+
+
+def test_invoke_writes_provider_streams_via_tracestore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(*a, **kw):
+        return MagicMock(
+            returncode=0, stdout='{"event":"done","artifacts":[],"usage":{}}\n', stderr="some err"
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    base = tmp_path / "run_test" / "task_0001"
+    assert (base / "stdout.raw").exists()
+    assert (base / "stderr.raw").exists()
+    assert (base / "stdout.scrubbed").exists()
+    assert (base / "stderr.scrubbed").exists()
+    # ProviderResult paths reference SCRUBBED only:
+    assert result.stdout_path.endswith("stdout.scrubbed")
+    assert result.stderr_path.endswith("stderr.scrubbed")
+
+
+def test_invoke_records_deterministic_usage_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure paths still record wall_seconds, input_chars, output_chars."""
+
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=1, stdout="malformed{", stderr="err")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "failure"
+    # UsageProxy is a TypedDict — use ["key"] access.
+    assert result.usage_proxy["wall_seconds"] >= 0.0
+    assert result.usage_proxy["input_chars"] > 0
+    assert result.usage_proxy["output_chars"] == len("malformed{") + len("err")
+
+
+# Shim integration tests — exercise the real subprocess boundary
+
+
+def test_shim_invoke_argv_is_correct(
+    tmp_path: Path,
+    shim_codex_executable: Path,
+) -> None:
+    """Real subprocess: codex shim sees the right argv structure."""
+    record_path = tmp_path / "argv_record.txt"
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable=str(shim_codex_executable),
+        version="0.4.2",
+        cwd=tmp_path,
+        env={
+            "ARENA_SHIM_STDOUT": '{"event":"done","artifacts":[],"usage":{}}\n',
+            "ARENA_SHIM_PROMPT_FILE_VAR": "1",
+            "ARENA_SHIM_RECORD_PATH": str(record_path),
+        },
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "success"
+    # Shim recorded the prompt-file path; should point inside .arena_prompts/
+    recorded = record_path.read_text(encoding="utf-8")
+    assert ".arena_prompts" in recorded
+    assert recorded.endswith("prompt_task_0001.json")
+
+
+def test_shim_invoke_full_pipeline_writes_traces(
+    tmp_path: Path,
+    shim_codex_executable: Path,
+) -> None:
+    """Stdout + stderr from real subprocess flow through scrubber + TraceStore."""
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable=str(shim_codex_executable),
+        version="0.4.2",
+        cwd=tmp_path,
+        env={
+            "ARENA_SHIM_STDOUT": '{"event":"done","artifacts":["x.csv"],"usage":{}}\n',
+            "ARENA_SHIM_STDERR": "ignore me",
+        },
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "success"
+    assert "x.csv" in result.artifacts
+    assert (tmp_path / "run_test" / "task_0001" / "stdout.raw").read_text(encoding="utf-8").strip()
