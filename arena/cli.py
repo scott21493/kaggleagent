@@ -1297,7 +1297,18 @@ def review(
             "SELECT experiment_id, artifact_paths FROM experiments "
             "WHERE competition_slug = ? AND run_id = ? "
             "AND artifact_paths LIKE ? AND artifact_paths LIKE ?",
-            (competition_slug, run_id, f"%{fusion_token}%", "%<step:fusion>%"),
+            # Anchor LIKE to the JSON-list quoting (`"<token>"`) so a
+            # future debug/blocked artifact_paths value that happens to
+            # embed `<step:fusion>` as a substring (e.g., inside a
+            # message token) cannot false-positive. artifact_paths is
+            # JSON-encoded by ScoreboardStore.insert_experiment, so the
+            # token always appears with surrounding double-quotes.
+            (
+                competition_slug,
+                run_id,
+                f'%"{fusion_token}"%',
+                '%"<step:fusion>"%',
+            ),
         )
         .fetchone()
     )
@@ -1500,7 +1511,13 @@ def review(
             payload={
                 "review_id": rev_payload["review_id"],
                 "experiment_id": rev_exp,
-                "status": rev_payload["decision"],
+                # status is the row state ("completed"), consistent with
+                # how score_recorded uses status for valid/invalid. The
+                # review's decision (accept/revise/...) goes in `reason`
+                # so a single observability consumer reading payload.status
+                # sees one vocabulary across event types.
+                "status": "completed",
+                "reason": f"decision={rev_payload['decision']}",
                 "path": rev_artifact,
             },
         )
