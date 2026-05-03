@@ -674,6 +674,99 @@ def research_proxy(
     research_adapter = _get_provider(provider, event_emitter=trace_store)
     impl_adapter = _get_provider("stub_codex", event_emitter=trace_store)
 
+    # PR4 reproducibility precheck — mirrors arena run-next at
+    # arena/cli.py:235-340. Fixture-digest drift OR corrupt baseline halts
+    # the chain before any provider invocation. Provider-version drift
+    # (per adapter) tags the rows that adapter actually drove. Pre-invoke
+    # failures here do NOT persist scoreboard rows — same discipline as
+    # KillSwitchActive: no provider call happened.
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / competition_slug)
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=competition_slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {competition_slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {competition_slug}: {exc}"
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    if drifted_from_fixture:
+        message = (
+            f"fixture digest drift for {competition_slug}: "
+            f"was {drifted_from_fixture}, now {fixture_hash}"
+        )
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    trace_store.emit(
+        event_type="run_started",
+        severity="info",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value,
+        },
+    )
+
+    # Provider-version baselines: research_adapter (steps 2/4/5) +
+    # impl_adapter (step 7). Drift tags propagate into artifact_paths on
+    # the rows that adapter drove.
+    try:
+        _is_new_research, drifted_from_research = record_provider_version(
+            competition_slug=competition_slug,
+            provider=research_adapter.name,
+            version=research_adapter.version,
+        )
+        _is_new_impl, drifted_from_impl = record_provider_version(
+            competition_slug=competition_slug,
+            provider=impl_adapter.name,
+            version=impl_adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        message = f"provider version baseline corrupt for {competition_slug}: {exc}"
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_research else "info",
+        payload={
+            "provider": research_adapter.name,
+            "provider_version": research_adapter.version,
+            "previous_hash": drifted_from_research or "",
+        },
+    )
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_impl else "info",
+        payload={
+            "provider": impl_adapter.name,
+            "provider_version": impl_adapter.version,
+            "previous_hash": drifted_from_impl or "",
+        },
+    )
+
+    research_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_research}>"
+        if drifted_from_research
+        else None
+    )
+    impl_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_impl}>" if drifted_from_impl else None
+    )
+    research_drift_extras = [research_drift_tag] if research_drift_tag else []
+    impl_drift_extras = [impl_drift_tag] if impl_drift_tag else []
+
     # Seed governor accumulators from prior usage on this run so PR5
     # respects run-level provider-call caps already consumed by
     # calibration or earlier research-proxy invocations.
@@ -809,14 +902,6 @@ def research_proxy(
             invocation_started=False,
         )
         create_workspace(WORKTREE_ROOT, competition_slug, rq_exp)
-        trace_store.emit(
-            event_type="run_started",
-            severity="info",
-            payload={
-                "phase": Phase.NEW.value,
-                "message": "research-proxy run started",
-            },
-        )
         rq_packet = make_research_question_packet(
             competition_slug=competition_slug,
             run_id=run_id,
@@ -841,7 +926,7 @@ def research_proxy(
             adapter_name=research_adapter.name,
             adapter_version=research_adapter.version,
             status="completed",
-            artifact_paths=["<step:question>", rq_artifact],
+            artifact_paths=["<step:question>", rq_artifact, *research_drift_extras],
             usage_proxy=rq_result.usage_proxy,
         )
         console.print(f"[green]step 1-3 ok[/green]: research_question {rq_payload['question_id']}")
@@ -879,7 +964,7 @@ def research_proxy(
             adapter_name=research_adapter.name,
             adapter_version=research_adapter.version,
             status="completed",
-            artifact_paths=["<step:digest>", digest_artifact],
+            artifact_paths=["<step:digest>", digest_artifact, *research_drift_extras],
             usage_proxy=digest_result.usage_proxy,
         )
         console.print(f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}")
@@ -919,7 +1004,7 @@ def research_proxy(
             adapter_name=research_adapter.name,
             adapter_version=research_adapter.version,
             status="completed",
-            artifact_paths=["<step:fusion>", fp_artifact, fusion_token],
+            artifact_paths=["<step:fusion>", fp_artifact, fusion_token, *research_drift_extras],
             usage_proxy=fp_result.usage_proxy,
         )
         console.print(f"[green]step 5 ok[/green]: fusion_proposal {fusion_id_known}")
@@ -1027,6 +1112,7 @@ def research_proxy(
                     fusion_id_token,
                     "<blocked:InvalidSubmission>",
                     f"<message:{(eval_result.error or 'invalid')[:200]}>",
+                    *impl_drift_extras,
                 ],
                 usage_proxy=proxy_result.usage_proxy,
             )
@@ -1042,7 +1128,12 @@ def research_proxy(
             adapter_name=impl_adapter.name,
             adapter_version=impl_adapter.version,
             status="completed",
-            artifact_paths=["<step:implementation>", submission_path, fusion_id_token],
+            artifact_paths=[
+                "<step:implementation>",
+                submission_path,
+                fusion_id_token,
+                *impl_drift_extras,
+            ],
             usage_proxy=proxy_result.usage_proxy,
             score=eval_result.score,
             valid_submission=True,

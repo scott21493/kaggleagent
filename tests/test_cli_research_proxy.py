@@ -550,3 +550,160 @@ def test_research_proxy_persists_post_invoke_budget_blocked_row_with_usage(
         assert rows[0]["output_chars"] > 0
     finally:
         store.close()
+
+
+def test_research_proxy_blocks_on_fixture_digest_drift(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutating a fixture file after the baseline is recorded must halt
+    research-proxy with BLOCKED_REPRODUCIBILITY before any provider
+    invocation. Mirrors run-next's PR4 fixture-drift behavior."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    # First run establishes the baseline.
+    first = runner.invoke(app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"])
+    assert first.exit_code == 0, first.output
+
+    # Mutate train.csv. With the baseline already recorded, the second
+    # research-proxy must detect the drift and block.
+    train = fixture_workspace / "fixtures" / "tabular_binary_v1" / "train.csv"
+    train.write_text("id,x1,x2,target\n0,0,0,0\n", encoding="utf-8")
+
+    second = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert second.exit_code == 2
+    normalized = " ".join(second.output.lower().split())
+    assert "fixture digest drift" in normalized
+
+    # No new research-proxy rows from the second run. Count rows from the
+    # first run (4) and verify the second run added zero.
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        rows = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id FROM experiments WHERE competition_slug = ?",
+                ("tabular_binary_v1",),
+            )
+            .fetchall()
+        )
+        # First run produced 4 rows; second run produced 0 (blocked precheck).
+        assert len(rows) == 4
+    finally:
+        store.close()
+
+
+def test_research_proxy_blocks_on_corrupt_fixture_baseline(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt runs/.baselines/<slug>/fixture_hash.json must block
+    research-proxy with a clean BLOCKED_REPRODUCIBILITY message rather
+    than an unhandled JSONDecodeError traceback."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    # Bootstrap the baseline so the file exists, then corrupt it.
+    runner.invoke(app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"])
+    baseline = fixture_workspace / "runs" / ".baselines" / "tabular_binary_v1" / "fixture_hash.json"
+    baseline.write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code == 2
+    normalized = " ".join(result.output.lower().split())
+    assert "fixture state read failed" in normalized
+
+
+def test_research_proxy_blocks_on_corrupt_provider_baseline(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same shape as the fixture-baseline test, but for the provider
+    version baseline."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"])
+    baseline = (
+        fixture_workspace / "runs" / ".baselines" / "tabular_binary_v1" / "provider_versions.json"
+    )
+    baseline.write_text("{also not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code == 2
+    # Rich console may wrap the message across lines; collapse whitespace
+    # before matching so wrapping doesn't break the assertion.
+    normalized = " ".join(result.output.lower().split())
+    assert "provider version baseline corrupt" in normalized
+
+
+def test_research_proxy_tags_provider_version_drift(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When stub_claude's version changes after the baseline is
+    recorded, the next research-proxy run must succeed but tag the
+    research_adapter rows (question/digest/fusion) with
+    <PROVIDER_VERSION_CHANGED:from=...>. The implementation row, driven
+    by stub_codex (whose version did NOT change), must NOT carry the
+    tag. Mirrors run-next's PR4 provider-version-drift tagging
+    (arena/cli.py:339)."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+
+    first = runner.invoke(app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"])
+    assert first.exit_code == 0, first.output
+
+    # Patch StubClaudeProvider's version to simulate a provider upgrade.
+    # The baseline still has "stub_claude.v1" from the first run; the
+    # second run records "stub_claude.v2" -> drift -> tag on rows 1/2/3.
+    monkeypatch.setattr("arena.providers.stub_claude._VERSION", "stub_claude.v2")
+
+    second = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert second.exit_code == 0, second.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        rows = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id, artifact_paths FROM experiments "
+                "WHERE competition_slug = ? ORDER BY experiment_id",
+                ("tabular_binary_v1",),
+            )
+            .fetchall()
+        )
+        # First run: exp_0001-0004. Second run: exp_0005-0008.
+        second_run_rows = [r for r in rows if r["experiment_id"] >= "exp_0005"]
+        assert len(second_run_rows) == 4
+
+        # Steps question/digest/fusion (stub_claude) carry the tag.
+        for row in second_run_rows[:3]:
+            paths = json.loads(row["artifact_paths"])
+            assert any(
+                p.startswith("<PROVIDER_VERSION_CHANGED:from=stub_claude.v1>") for p in paths
+            ), f"missing drift tag in {paths}"
+
+        # Step implementation (stub_codex, version unchanged) does NOT.
+        impl_paths = json.loads(second_run_rows[3]["artifact_paths"])
+        assert not any(p.startswith("<PROVIDER_VERSION_CHANGED:") for p in impl_paths), (
+            f"unexpected drift tag in impl row: {impl_paths}"
+        )
+    finally:
+        store.close()
