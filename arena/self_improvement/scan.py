@@ -1,6 +1,7 @@
 # arena/self_improvement/scan.py
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -124,19 +125,37 @@ def scan_runs(
                     )
                 )
 
-    # 3. score regression (only against rows that produced a score)
-    scores = [row["score"] for row in rows if row["score"] is not None]
-    if scores and max(scores) < _CALIBRATION_BASELINE_SCORE:
+    # Split rows by experiment_type ONCE so the score-regression check
+    # below and the +20% comparisons further down both use the same
+    # champion/challenger partition. Champion = calibration row(s); any
+    # other row is a challenger.
+    cal_rows = [row for row in rows if row["experiment_type"] == "calibration"]
+    challenger_rows = [row for row in rows if row["experiment_type"] != "calibration"]
+
+    # 3. score regression: the challenger's BEST score must NOT be
+    # below the champion. The previous max-across-all-rows check
+    # masked regressions whenever a calibration row was present —
+    # cal=0.5 + challenger=0.42 → max(all)=0.5 → no finding fired
+    # (P1 from PR6 Task 5 review). Champion baseline is the calibration
+    # row's max score if present, else _CALIBRATION_BASELINE_SCORE.
+    champion_score = max(
+        (row["score"] for row in cal_rows if row["score"] is not None),
+        default=_CALIBRATION_BASELINE_SCORE,
+    )
+    challenger_scores = [row["score"] for row in challenger_rows if row["score"] is not None]
+    if challenger_scores and max(challenger_scores) < champion_score:
         worst = next(
-            row for row in rows if row["score"] is not None and row["score"] == min(scores)
+            row
+            for row in challenger_rows
+            if row["score"] is not None and row["score"] == min(challenger_scores)
         )
         findings.append(
             Finding(
                 kind="score_regression",
                 severity="high",
                 problem=(
-                    f"max score {max(scores):.4f} below calibration baseline "
-                    f"{_CALIBRATION_BASELINE_SCORE}"
+                    f"max challenger score {max(challenger_scores):.4f} below "
+                    f"champion {champion_score:.4f}"
                 ),
                 evidence_refs=[f"scoreboard:{worst['experiment_id']}"],
             )
@@ -155,12 +174,9 @@ def scan_runs(
         )
 
     # 5+6. wall-clock and provider-call +20% regressions vs the
-    # calibration champion. Champion = the calibration row(s) (PR1's
-    # `arena run-next` writes experiment_type="calibration"); challenger
-    # = aggregated non-calibration rows for this slug. Rely on
+    # calibration champion. Reuse the cal_rows / challenger_rows
+    # partition computed above for the score-regression check. Rely on
     # compare_metrics so the threshold logic is a single helper.
-    cal_rows = [row for row in rows if row["experiment_type"] == "calibration"]
-    challenger_rows = [row for row in rows if row["experiment_type"] != "calibration"]
     if cal_rows and challenger_rows:
         champion = Metrics(
             score=max(
@@ -242,15 +258,35 @@ def scan_runs(
             )
             continue
         try:
-            target.read_text(encoding="utf-8")
+            content = target.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             findings.append(
                 Finding(
                     kind="failed_replay",
                     severity="high",
-                    problem=f"corrupt trace at {target}",
+                    problem=f"unreadable trace at {target}",
                     evidence_refs=[f"trace:{row['run_id']}/{row['task_id']}"],
                 )
             )
+            continue
+        # A trace file that is UTF-8-decodable but contains
+        # syntactically invalid JSONL is also a failed_replay: the
+        # event chain cannot be reconstructed by replay tooling. Parse
+        # each non-empty line and fire on the first decode error.
+        for line in content.splitlines():
+            if not line.strip():
+                continue
+            try:
+                json.loads(line)
+            except json.JSONDecodeError:
+                findings.append(
+                    Finding(
+                        kind="failed_replay",
+                        severity="high",
+                        problem=f"corrupt JSONL at {target}",
+                        evidence_refs=[f"trace:{row['run_id']}/{row['task_id']}"],
+                    )
+                )
+                break
 
     return findings
