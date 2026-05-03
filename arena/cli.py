@@ -74,7 +74,21 @@ def _store() -> ScoreboardStore:
 
 
 def _new_run_id() -> str:
-    return "run_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    """Mint a fresh run_id with microsecond precision.
+
+    Two consecutive `arena init-fixture` calls in the same wall-second
+    used to produce identical run_ids, causing the second `insert_run`
+    to fail on the runs.run_id PRIMARY KEY constraint. Tests that
+    exercise multi-run scenarios (e.g., the cross-run linkage regression
+    in tests/test_cli_review.py) had to sleep ≥1s between init-fixtures
+    to dodge the collision.
+
+    Microsecond precision (%f → 6-digit microseconds) makes the run_id
+    monotonically unique under any reasonable invocation rate. Lex sort
+    over `runs/run_*` directories still works because microseconds
+    preserve ordering within the same second.
+    """
+    return "run_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
 
 
 def _latest_run_id() -> str | None:

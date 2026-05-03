@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import pytest
@@ -262,10 +261,9 @@ def test_arena_review_attaches_to_impl_rows_run_not_latest(
     finally:
         store.close()
 
-    # Start a second run; produces exp_0005..exp_0008 with a different run_id.
-    # _new_run_id uses second-precision timestamps; sleep so the second
-    # init-fixture lands on a fresh second and gets a distinct run_id.
-    time.sleep(1.1)
+    # Start a second run; produces exp_0005..exp_0008 with a different
+    # run_id. _new_run_id uses microsecond precision so consecutive
+    # init-fixture calls always yield distinct run_ids without sleeping.
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
     runner.invoke(app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"])
 
