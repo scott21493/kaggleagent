@@ -4,7 +4,7 @@
 
 **Goal:** Implement steps 1-8 of `docs/phase0/PHASE_0_SINGLE_SCOPE_PLAN.md` §6.2 — the bounded research-fusion proxy loop that proposes a research question, digests a local method note, proposes a method fusion, scores it deterministically, implements the smallest proxy test, and evaluates the proxy. Steps 9-10 (review + memory proposal) are PR6's territory.
 
-**Architecture:** Five new modules under `arena/research_proxy/` (question_generator, method_digest, fusion_proposal, fusion_scorer, package marker) plus extensions to both stub providers (stub_claude dispatches on `(role, phase)` to emit research_question.json / paper_digest.json / fusion_proposal.json; stub_codex dispatches on phase=FUSION_PROXY_IMPLEMENTED to emit a proxy submission.csv tagged with the fusion_id). One new CLI subcommand `arena research-proxy <slug> --provider stub_claude` orchestrates steps 1-8 in sequence within a single experiment_id, queuing each task through the existing watchdog/wrap_invoke path so observability + sandbox + waste detection apply to every step. The fusion_scorer is a pure deterministic gate between step 5 (proposal received) and step 7 (proxy implementation invoked) — a low score halts the chain before any code is written. The scoreboard records the proxy result with a `<fusion_id:fusion_NNNN>` token in `artifact_paths` (mirrors PR4's `<PROVIDER_VERSION_CHANGED:from=...>` pattern; no schema change).
+**Architecture:** Five new modules under `arena/research_proxy/` (question_generator, method_digest, fusion_proposal, fusion_scorer, package marker) plus extensions to both stub providers (stub_claude dispatches on `(role, phase)` to emit research_question.json / paper_digest.json / fusion_proposal.json; stub_codex dispatches on phase=FUSION_PROXY_IMPLEMENTED to emit a proxy submission.csv tagged with the fusion_id). One new CLI subcommand `arena research-proxy <slug> --provider stub_claude` orchestrates steps 1-8 in sequence, persisting FOUR experiment rows — one per provider invocation (research_proxy_question, research_proxy_digest, research_proxy_fusion, research_proxy_implementation). Each row carries its own experiment_id (via `store.get_next_experiment_id`) and task_id (matching numeric suffix), and its own usage_proxy from the corresponding ProviderResult. Each provider invocation goes through the existing watchdog/wrap_invoke path so observability + sandbox + waste detection apply to every step. The fusion_scorer is a pure deterministic gate between step 5 (proposal received) and step 7 (proxy implementation invoked) — a low score halts the chain before any code is written. The scoreboard records the `<fusion_id:fusion_NNNN>` token in `artifact_paths` starting at row 3 (fusion proposal) and row 4 (implementation), since fusion_id is not known until step 5 (mirrors PR4's `<PROVIDER_VERSION_CHANGED:from=...>` pattern; no schema change).
 
 **Tech Stack:** Python 3.12 stdlib only (json, hashlib, pathlib, dataclasses); `jsonschema>=4.22` for schema validation (already a dep); `pandas` for the proxy submission.csv (already a dep via PR1's stub_codex). No new third-party libraries.
 
@@ -28,9 +28,9 @@
 - Method notes exist at `fixtures/tabular_binary_v1/paper_bundle/method_note_001.md` and `method_note_002.md` (trusted fixture, listed in fixture_manifest.yaml so `compute_fixture_set_digest` covers them).
 - `StubClaudeProvider` and `StubCodexProvider` accept `event_emitter` + `failed_commands` kwargs (PR4); they currently dispatch only on the calibration role. PR5 extends `invoke()` with role/phase dispatch.
 - `Watchdog.wrap_invoke(adapter, packet, *, sandbox=None, event_emitter=None)` — PR3+PR4 plumbing. PR5's research-proxy CLI uses the same path so each step gets sandbox + observability for free.
-- `_persist_blocked_experiment(store, packet, run_id, adapter, breaker_or_reason, message, usage_proxy)` — PR2 helper; PR5 reuses it for unscored / ineligible fusion proposals.
+- `_persist_blocked_experiment(store, packet, run_id, adapter, breaker_or_reason, message, usage_proxy)` — PR2 helper; PR5 does NOT reuse it. Instead, PR5 uses a local `_persist_row` helper (calls `store.insert_experiment` + `store.update_experiment_score`) so each of the four rows can carry its own per-invocation usage_proxy.
 - `arena/cli.py` constants: `RUNS_ROOT`, `WORKTREE_ROOT`, `FIXTURES_ROOT`, `TRACES_ROOT`, `PROVIDER_VERSION_CHANGED_TAG`. PR5 adds a sibling `FUSION_ID_TAG_PREFIX = "fusion_id"` constant.
-- `arena/cli.py` helpers: `_store()`, `_new_run_id()`, `_latest_run_id()`, `_get_provider()`. PR5 reuses all four.
+- `arena/cli.py` helpers: `_store()`, `_latest_run_id()`, `_get_provider()`. PR5 reuses all three. (`_new_run_id()` is NOT used — PR5 attaches to the active run created by `arena init-fixture` via `_latest_run_id()`.)
 
 ---
 
@@ -56,7 +56,7 @@
 | `tests/test_research_proxy_method_digest.py` | `read_method_note` returns file contents; raises FileNotFoundError on missing path. `make_method_digest_packet` builds a valid task_packet with phase=METHOD_DIGEST_CREATED and the method note in inputs. `validate_paper_digest` accepts schema-valid input and rejects invalid. |
 | `tests/test_research_proxy_fusion_proposal.py` | `make_fusion_proposal_packet` builds a valid task_packet with phase=FUSION_PROPOSAL_CREATED. `validate_fusion_proposal` accepts schema-valid input and rejects invalid. |
 | `tests/test_research_proxy_fusion_scorer.py` | `score_fusion_proposal` returns a deterministic FusionScore; high-cost / high-risk proposals score lower; `is_eligible` flags proposals missing 2+ mechanisms, lacking ablation plan, or referencing forbidden network calls; `MIN_FUSION_SCORE` boundary. |
-| `tests/test_cli_research_proxy.py` | End-to-end `arena research-proxy tabular_binary_v1 --provider stub_claude` runs steps 1-8, exits 0, persists an experiment row tagged with `<fusion_id:fusion_NNNN>`, writes 4 artifact JSONs (research_question, paper_digest, fusion_proposal, submission.csv) under the experiment worktree. Plus a low-score-halt test that monkey-patches MIN_FUSION_SCORE upward and asserts the chain stops at step 6 with status=blocked. |
+| `tests/test_cli_research_proxy.py` | End-to-end `arena research-proxy tabular_binary_v1 --provider stub_claude` runs steps 1-8, exits 0, persists FOUR experiment rows (research_proxy_question / research_proxy_digest / research_proxy_fusion / research_proxy_implementation), writes 4 artifacts in separate per-step worktrees. Low-score-halt: rows 1-3 completed + row 4 blocked as FusionGateBlocked. Kill-switch / pre-invoke cap halts / mid-chain cap halts with blocked row for in-flight step. Collision-free IDs after calibration (exp_0001 + exp_0002…exp_0005). Run-level cap regression after calibration (governor seeded from get_run_usage_totals). 10 tests total. |
 | `tests/test_research_proxy_eligibility.py` | Every fusion proposal generated by stub_claude (against both method_note_001.md and method_note_002.md) satisfies the §6.3 eligibility checklist: 2+ mechanisms, task-fit explanation, smallest proxy test, ablation plan, resource estimate, risk list, stop condition, schema-valid, no forbidden tokens (no `import requests`, no `urllib`, no live URLs). |
 
 **Modify:**
@@ -65,15 +65,15 @@
 |---|---|
 | `arena/providers/stub_claude.py` | `invoke` dispatches on `(task_packet["role"], task_packet["phase"])`. For `("research_proxy", "RESEARCH_QUESTION_CREATED")` → write `research_question.json` artifact + return ProviderResult with that path in artifacts. Same for METHOD_DIGEST_CREATED → `paper_digest.json`; FUSION_PROPOSAL_CREATED → `fusion_proposal.json`. All other (role, phase) combinations fall through to the existing empty-payload path (backward compat). |
 | `arena/providers/stub_codex.py` | `invoke` dispatches on `(role, phase)`. For `("implementation", "FUSION_PROXY_IMPLEMENTED")` → write `submission.csv` (same shape as calibration: 0.5 constant) AND include `<fusion_id:{fusion_id}>` in the artifact path list, where fusion_id is read from `task_packet["inputs"]` (passed in as a path-style token like `worktrees/<slug>/<exp>/fusion_proposal.json`). For all other (role, phase) combinations, fall through to the existing calibration path. |
-| `arena/cli.py` | Add `from arena.research_proxy.* import ...` imports. Add `FUSION_ID_TAG_PREFIX = "fusion_id"` constant. Add new Typer subcommand `research_proxy(competition_slug, provider="stub_claude")` that orchestrates steps 1-8 in a single `experiment_id`. Each sub-step constructs a task packet, builds a TraceStore + sandbox, calls `watchdog.wrap_invoke(adapter, packet, sandbox=sandbox, event_emitter=trace_store)`, then validates the artifact's schema. Step 6 (fusion_scorer) is a pure function call on the proposal payload — it does NOT invoke a provider. Step 7 invokes stub_codex with the fusion_id reference. Step 8 evaluates the proxy submission.csv via `evaluate_fixture_submission`. |
+| `arena/cli.py` | Add `from arena.research_proxy.* import ...` imports. Add `FUSION_ID_TAG_PREFIX = "fusion_id"` constant. Add new Typer subcommand `research_proxy(competition_slug, provider="stub_claude")` that orchestrates steps 1-8 and persists FOUR experiment rows — one per provider invocation — via a local `_persist_row` helper that calls `store.insert_experiment` + `store.update_experiment_score`. Each invocation gets its own experiment_id from `store.get_next_experiment_id` and its own task_id (matching suffix). Each sub-step calls `_guarded_invoke` (check_can_invoke + wrap_invoke). Step 6 (fusion_scorer) is a pure function call — no provider invocation. Step 7 invokes stub_codex with the fusion_id reference. Step 8 evaluates the proxy submission.csv via `evaluate_fixture_submission`. A `_persist_inflight_blocked` helper records a status=blocked row for the in-flight step on mid-chain exception (KillSwitchActive / BudgetExceeded / SandboxViolation). |
 
 ---
 
 ## Workflow note
 
-PR5's research-proxy CLI is a SINGLE command that runs four provider invocations in sequence (steps 2, 4, 5, 7) plus three deterministic controller actions (steps 1, 3, 6, 8). Each provider invocation goes through the existing PR3+PR4 watchdog path so sandbox enforcement, trace events, and waste detection apply uniformly. The four artifacts (`research_question.json`, `paper_digest.json`, `fusion_proposal.json`, `submission.csv`) all land under one `worktrees/<slug>/<exp_id>/` directory keyed by a single `experiment_id`. The scoreboard gets ONE row per research-proxy invocation (experiment_type="research_proxy") with `<fusion_id:fusion_NNNN>` in artifact_paths.
+PR5's research-proxy CLI is a SINGLE command that runs four provider invocations in sequence (steps 2, 4, 5, 7) plus three deterministic controller actions (steps 1, 3, 6, 8). Each provider invocation goes through the existing PR3+PR4 watchdog path so sandbox enforcement, trace events, and waste detection apply uniformly. The four artifacts (`research_question.json`, `paper_digest.json`, `fusion_proposal.json`, `submission.csv`) land under per-step worktrees keyed by each invocation's own `experiment_id`. The scoreboard gets FOUR rows per research-proxy invocation — one per provider invocation, with experiment_type research_proxy_question / research_proxy_digest / research_proxy_fusion / research_proxy_implementation — each carrying its own usage_proxy. The `<fusion_id:fusion_NNNN>` token appears in artifact_paths starting at row 3 (fusion), since fusion_id is first known after step 5; rows 1-2 (question, digest) are written before fusion_id is available.
 
-If `score_fusion_proposal` returns below `MIN_FUSION_SCORE` OR `is_eligible` returns False, the CLI halts at step 6 with `_persist_blocked_experiment(...)` (Phase=NEEDS_HUMAN, breaker_or_reason="FusionGateBlocked"). The proxy implementation (step 7) is NOT invoked — that's the deterministic gate the spec calls out.
+If `score_fusion_proposal` returns below `MIN_FUSION_SCORE` OR `is_eligible` returns False, the CLI halts at step 6. Rows 1-3 (question, digest, fusion) are already persisted as "completed". A synthetic fourth row (experiment_type="research_proxy_implementation", status="blocked") is inserted via the local `_persist_row` helper tagged `<blocked:FusionGateBlocked>`. The proxy implementation (step 7) is NOT invoked — that's the deterministic gate the spec calls out.
 
 Step 8 ("Controller evaluates the proxy") in PR5 means: evaluate the stub-emitted `submission.csv` against `hidden_labels.csv` via the existing `evaluate_fixture_submission`. Since stub_codex emits the same 0.5-constant submission as calibration, the score will be ~0.5 — consistent with calibration. The point is to prove the pipeline produces a SCORED row tagged with the fusion_id, not to win the fixture. PR7 with real Codex will produce non-trivial proxy implementations.
 
@@ -1928,7 +1928,13 @@ EOF
 
 - [ ] **Step 1: Add the imports + constant + subcommand to cli.py**
 
-In `arena/cli.py`, add the following imports near the existing `from arena.research_proxy.*` block (place after the `arena.providers.*` imports):
+In `arena/cli.py`, first ensure `ProviderResult` is on the existing `from arena.providers.base import` line (it may already be there from PR2/PR4; do NOT add a duplicate import):
+
+```python
+from arena.providers.base import ProviderAdapter, ProviderResult, UsageProxy
+```
+
+Then add the following imports near the existing `from arena.research_proxy.*` block (place after the `arena.providers.*` imports):
 
 ```python
 from arena.research_proxy.fusion_proposal import (
@@ -1972,49 +1978,44 @@ def research_proxy(
     """Run the §6.2 research-fusion proxy loop steps 1-8 against the
     first method note in fixtures/<slug>/paper_bundle/.
 
-    Steps:
-    1. Build research_question task packet (controller).
-    2. stub_claude emits research_question.json.
-    3. Validate schema (controller).
-    4. stub_claude digests the method note → paper_digest.json.
-    5. stub_claude proposes a fusion → fusion_proposal.json.
-    6. fusion_scorer + is_eligible — pure deterministic gate. If
-       score < MIN_FUSION_SCORE OR is_eligible returns False, persist
-       a status=blocked row and exit 2 BEFORE invoking stub_codex.
-    7. stub_codex implements the proxy → submission.csv tagged with
-       <fusion_id:fusion_NNNN>.
-    8. Controller evaluates the proxy via evaluate_fixture_submission.
+    Persists FOUR experiment rows under one run_id — one per provider
+    invocation (research_proxy_question, research_proxy_digest,
+    research_proxy_fusion, research_proxy_implementation). Each row carries
+    its own usage_proxy from the corresponding ProviderResult, so
+    `arena budget status` and pre-invoke caps see all four calls. The
+    fusion_id token appears in artifact_paths starting from row 3 (when
+    fusion_id is first known). The implementation row (row 4) gets the
+    score via `arena evaluate`'s flow.
 
-    Persists ONE experiment row tagged experiment_type="research_proxy"
-    with the fusion_id token in artifact_paths. The same TraceStore
-    receives provider_invoked / task_finished events for each
-    sub-invocation; arena replay <run_id> reconstructs the full chain.
+    On step-6 gate failure, rows 1-3 are completed and row 4 is inserted
+    as status=blocked tagged FusionGateBlocked. On mid-chain exception
+    (KillSwitchActive / BudgetExceeded / SandboxViolation), the
+    in-flight step's row is inserted as status=blocked with the partial
+    state captured.
     """
     if provider not in {"stub_claude"}:
         raise typer.BadParameter(
             f"unknown research provider {provider!r}; PR5 supports only stub_claude"
         )
 
-    run_id = _latest_run_id()
-    if run_id is None:
-        raise typer.BadParameter(
-            f"no run for {competition_slug}; run `arena init-fixture {competition_slug}` first"
-        )
-    store = _store()
-    experiment_id = store.get_next_experiment_id(competition_slug)
-    # task_id mirrors experiment_id's numeric suffix so traces are colocated
-    # under one events.jsonl per research-proxy invocation.
-    task_id = experiment_id.replace("exp_", "task_")
     method_note_path = (
         f"fixtures/{competition_slug}/paper_bundle/method_note_001.md"
     )
     if not Path(method_note_path).exists():
         raise typer.BadParameter(f"method note missing: {method_note_path}")
 
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(
+            f"no run for {competition_slug}; "
+            f"run `arena init-fixture {competition_slug}` first"
+        )
+    store = _store()
+
     trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
     sandbox_policy = SandboxPolicy.from_packet(
         {
-            "allowed_paths": [f"worktrees/{competition_slug}/{experiment_id}/"],
+            "allowed_paths": [],  # set per-step
             "blocked_paths": [
                 "~/.kaggle/",
                 "~/.codex/",
@@ -2025,40 +2026,134 @@ def research_proxy(
         },
         workspace_root=Path.cwd(),
     )
-    sandbox = SandboxRunner(sandbox_policy)
+
     research_adapter = _get_provider(provider, event_emitter=trace_store)
     impl_adapter = _get_provider("stub_codex", event_emitter=trace_store)
 
-    governor = BudgetGovernor(Phase0HardCeilings.from_env())
+    # Seed governor accumulators from prior usage on this run so PR5
+    # respects run-level provider-call caps already consumed by
+    # calibration or earlier research-proxy invocations.
+    totals = store.get_run_usage_totals(competition_slug, run_id)
+    accumulators = RunAccumulators(
+        provider_calls=int(totals["provider_calls"]),
+        codex_calls=int(totals["codex_calls"]),
+        claude_calls=int(totals["claude_calls"]),
+        wall_seconds=float(totals["wall_seconds"]),
+        input_chars=int(totals["input_chars"]),
+        output_chars=int(totals["output_chars"]),
+        waste_events=int(totals["waste_events"]),
+    )
+    governor = BudgetGovernor(Phase0HardCeilings.from_env(), accumulators=accumulators)
     watchdog = Watchdog(governor=governor)
 
-    def _guarded_invoke(adapter: ProviderAdapter, packet: dict) -> ProviderResult:
-        """Run check_can_invoke + wrap_invoke as a single guarded call.
+    def _step_ids() -> tuple[str, str]:
+        """Mint matched (experiment_id, task_id) for the next step.
 
-        check_can_invoke catches kill-switch activations and pre-invoke
-        provider-call cap violations BEFORE any invoke work runs.
-        wrap_invoke catches SandboxViolation, mid-invoke BudgetExceeded
-        (live waste detector), and post-invoke BudgetExceeded.
+        Each invocation gets its own row in the experiments table so
+        provider_calls (derived from COUNT(*) by get_run_usage_totals) is
+        accurate. task_id matches the numeric suffix so trace events
+        cluster by step in arena replay output.
         """
+        exp_id = store.get_next_experiment_id(competition_slug)
+        task_id = exp_id.replace("exp_", "task_")
+        return exp_id, task_id
+
+    def _guarded_invoke(adapter: ProviderAdapter, packet: dict) -> ProviderResult:
+        """Run check_can_invoke + wrap_invoke with the same sandbox.
+
+        check_can_invoke catches kill-switch + pre-invoke provider-call cap
+        BEFORE any invoke work runs. wrap_invoke catches SandboxViolation,
+        mid-invoke BudgetExceeded (live waste detector), and post-invoke
+        BudgetExceeded.
+        """
+        # Build a packet-scoped sandbox: each step's allowed_paths is its
+        # own experiment worktree.
+        per_step_sandbox = SandboxRunner(
+            SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
+        )
         watchdog.check_can_invoke(adapter.name)
         return watchdog.wrap_invoke(
-            adapter, packet, sandbox=sandbox, event_emitter=trace_store
+            adapter, packet, sandbox=per_step_sandbox, event_emitter=trace_store
         )
 
+    def _persist_row(
+        *,
+        experiment_id: str,
+        task_id: str,
+        experiment_type: str,
+        adapter_name: str,
+        adapter_version: str,
+        status: str,
+        artifact_paths: list[str],
+        usage_proxy: dict | None,
+        score: float | None = None,
+        valid_submission: bool | None = None,
+    ) -> None:
+        """Insert one research-proxy experiment row with consistent shape.
+
+        usage_proxy=None means no invocation completed (gate-block /
+        pre-invoke failure); the row records zeros.
+        """
+        store.insert_experiment(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            competition_slug=competition_slug,
+            task_id=task_id,
+            experiment_type=experiment_type,
+            provider=adapter_name,
+            provider_version=adapter_version,
+            status=status,
+            metric_name="roc_auc",
+            valid_submission=valid_submission,
+            artifact_paths=artifact_paths,
+            trace_path=None,
+            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            input_chars=int(usage_proxy["input_chars"]) if usage_proxy else 0,
+            output_chars=int(usage_proxy["output_chars"]) if usage_proxy else 0,
+            wall_seconds=float(usage_proxy["wall_seconds"]) if usage_proxy else 0.0,
+            shell_commands=int(usage_proxy["shell_commands"]) if usage_proxy else 0,
+            failed_commands=int(usage_proxy["failed_commands"]) if usage_proxy else 0,
+            waste_events=int(usage_proxy["waste_events"]) if usage_proxy else 0,
+        )
+        if score is not None:
+            store.update_experiment_score(experiment_id, score=score)
+
+    # Track the in-flight step so a mid-chain exception can persist a
+    # blocked row for the failing step.
+    in_flight: dict[str, str | None] = {
+        "experiment_id": None,
+        "task_id": None,
+        "experiment_type": None,
+        "adapter_name": None,
+        "adapter_version": None,
+    }
+
+    fusion_id_known: str | None = None  # populated after step 5
+
     try:
-        create_workspace(WORKTREE_ROOT, competition_slug, experiment_id)
+        # Step 1+2+3: research_question task → stub_claude → validate.
+        rq_exp, rq_task = _step_ids()
+        in_flight.update(
+            experiment_id=rq_exp,
+            task_id=rq_task,
+            experiment_type="research_proxy_question",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, rq_exp)
         trace_store.emit(
             event_type="run_started",
             severity="info",
-            payload={"phase": Phase.NEW.value, "message": "research-proxy run started"},
+            payload={
+                "phase": Phase.NEW.value,
+                "message": "research-proxy run started",
+            },
         )
-
-        # Step 1+2: research question task → stub_claude emits research_question.json.
         rq_packet = make_research_question_packet(
             competition_slug=competition_slug,
             run_id=run_id,
-            experiment_id=experiment_id,
-            task_id=task_id,
+            experiment_id=rq_exp,
+            task_id=rq_task,
             question_id="rq_0001",
             source_refs=[method_note_path],
         )
@@ -2066,21 +2161,37 @@ def research_proxy(
         rq_artifact = next(
             a for a in rq_result.artifacts if a.endswith("research_question.json")
         )
-        # Step 3: validate (raises on failure — propagates as a typer error).
         rq_payload = json.loads(Path(rq_artifact).read_text(encoding="utf-8"))
         from arena.schemas.validate import validate as _validate_schema
 
         _validate_schema("research_question", rq_payload)
+        _persist_row(
+            experiment_id=rq_exp,
+            task_id=rq_task,
+            experiment_type="research_proxy_question",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=[rq_artifact],
+            usage_proxy=rq_result.usage_proxy,
+        )
         console.print(
             f"[green]step 1-3 ok[/green]: research_question {rq_payload['question_id']}"
         )
 
-        # Step 4: digest → stub_claude emits paper_digest.json.
+        # Step 4: digest → paper_digest.json.
+        digest_exp, digest_task = _step_ids()
+        in_flight.update(
+            experiment_id=digest_exp,
+            task_id=digest_task,
+            experiment_type="research_proxy_digest",
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, digest_exp)
         digest_packet = make_method_digest_packet(
             competition_slug=competition_slug,
             run_id=run_id,
-            experiment_id=experiment_id,
-            task_id=task_id,
+            experiment_id=digest_exp,
+            task_id=digest_task,
             digest_id="pd_0001",
             method_note_path=method_note_path,
         )
@@ -2090,14 +2201,33 @@ def research_proxy(
         )
         digest_payload = json.loads(Path(digest_artifact).read_text(encoding="utf-8"))
         validate_paper_digest(digest_payload)
-        console.print(f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}")
+        _persist_row(
+            experiment_id=digest_exp,
+            task_id=digest_task,
+            experiment_type="research_proxy_digest",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=[digest_artifact],
+            usage_proxy=digest_result.usage_proxy,
+        )
+        console.print(
+            f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}"
+        )
 
-        # Step 5: fusion proposal → stub_claude emits fusion_proposal.json.
+        # Step 5: fusion proposal → fusion_proposal.json.
+        fp_exp, fp_task = _step_ids()
+        in_flight.update(
+            experiment_id=fp_exp,
+            task_id=fp_task,
+            experiment_type="research_proxy_fusion",
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, fp_exp)
         fp_packet = make_fusion_proposal_packet(
             competition_slug=competition_slug,
             run_id=run_id,
-            experiment_id=experiment_id,
-            task_id=task_id,
+            experiment_id=fp_exp,
+            task_id=fp_task,
             fusion_id="fusion_0001",
             digest_path=digest_artifact,
         )
@@ -2107,106 +2237,82 @@ def research_proxy(
         )
         fp_payload = json.loads(Path(fp_artifact).read_text(encoding="utf-8"))
         validate_fusion_proposal(fp_payload)
+        fusion_id_known = fp_payload["fusion_id"]
+        fusion_token = f"<{FUSION_ID_TAG_PREFIX}:{fusion_id_known}>"
+        _persist_row(
+            experiment_id=fp_exp,
+            task_id=fp_task,
+            experiment_type="research_proxy_fusion",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=[fp_artifact, fusion_token],
+            usage_proxy=fp_result.usage_proxy,
+        )
         console.print(
-            f"[green]step 5 ok[/green]: fusion_proposal {fp_payload['fusion_id']}"
+            f"[green]step 5 ok[/green]: fusion_proposal {fusion_id_known}"
         )
 
-        # Step 6: deterministic gate. Halt before stub_codex if score is too
-        # low OR eligibility checklist fails.
+        # Step 6: deterministic gate. Halt before stub_codex if score is
+        # too low OR is_eligible returns False. Inserts a blocked row for
+        # the implementation step (which never runs).
         fusion_score = score_fusion_proposal(fp_payload)
         eligible, reasons = is_eligible(fp_payload)
         console.print(
-            f"[blue]step 6 score={fusion_score.score:.3f} (cost={fusion_score.cost:.2f} "
-            f"risk={fusion_score.risk:.2f} fit={fusion_score.fit:.2f}) eligible={eligible}[/blue]"
+            f"[blue]step 6 score={fusion_score.score:.3f} "
+            f"(cost={fusion_score.cost:.2f} risk={fusion_score.risk:.2f} "
+            f"fit={fusion_score.fit:.2f}) eligible={eligible}[/blue]"
         )
         if fusion_score.score < MIN_FUSION_SCORE or not eligible:
             gate_message = (
                 f"fusion gate failed: score={fusion_score.score:.3f} "
                 f"(min={MIN_FUSION_SCORE}); reasons={reasons or ['low score']}"
             )
-            # No proxy implementation; persist a blocked row and exit.
-            # Gate failed; sum what we did spend so the blocked row carries
-            # honest usage rather than zeros.
-            partial_usage = {
-                "input_chars": (
-                    rq_result.usage_proxy.get("input_chars", 0)
-                    + digest_result.usage_proxy.get("input_chars", 0)
-                    + fp_result.usage_proxy.get("input_chars", 0)
-                ),
-                "output_chars": (
-                    rq_result.usage_proxy.get("output_chars", 0)
-                    + digest_result.usage_proxy.get("output_chars", 0)
-                    + fp_result.usage_proxy.get("output_chars", 0)
-                ),
-                "wall_seconds": (
-                    rq_result.usage_proxy.get("wall_seconds", 0.0)
-                    + digest_result.usage_proxy.get("wall_seconds", 0.0)
-                    + fp_result.usage_proxy.get("wall_seconds", 0.0)
-                ),
-                "shell_commands": (
-                    rq_result.usage_proxy.get("shell_commands", 0)
-                    + digest_result.usage_proxy.get("shell_commands", 0)
-                    + fp_result.usage_proxy.get("shell_commands", 0)
-                ),
-                "failed_commands": (
-                    rq_result.usage_proxy.get("failed_commands", 0)
-                    + digest_result.usage_proxy.get("failed_commands", 0)
-                    + fp_result.usage_proxy.get("failed_commands", 0)
-                ),
-                "waste_events": (
-                    rq_result.usage_proxy.get("waste_events", 0)
-                    + digest_result.usage_proxy.get("waste_events", 0)
-                    + fp_result.usage_proxy.get("waste_events", 0)
-                ),
-            }
-            store.insert_experiment(
-                experiment_id=experiment_id,
-                run_id=run_id,
-                competition_slug=competition_slug,
-                task_id=fp_packet["task_id"],
-                experiment_type="research_proxy",
-                provider=research_adapter.name,
-                provider_version=research_adapter.version,
+            blocked_exp, blocked_task = _step_ids()
+            create_workspace(WORKTREE_ROOT, competition_slug, blocked_exp)
+            _persist_row(
+                experiment_id=blocked_exp,
+                task_id=blocked_task,
+                experiment_type="research_proxy_implementation",
+                adapter_name=impl_adapter.name,
+                adapter_version=impl_adapter.version,
                 status="blocked",
-                metric_name="roc_auc",
-                valid_submission=None,
                 artifact_paths=[
-                    rq_artifact,
-                    digest_artifact,
-                    fp_artifact,
-                    f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
-                    f"<blocked:FusionGateBlocked>",
+                    fusion_token,
+                    "<blocked:FusionGateBlocked>",
                     f"<message:{gate_message[:200]}>",
                 ],
-                trace_path=None,
-                created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-                input_chars=partial_usage["input_chars"],
-                output_chars=partial_usage["output_chars"],
-                wall_seconds=partial_usage["wall_seconds"],
-                shell_commands=partial_usage["shell_commands"],
-                failed_commands=partial_usage["failed_commands"],
-                waste_events=partial_usage["waste_events"],
+                usage_proxy=None,
             )
             console.print(f"[red]{gate_message}[/red]")
             raise typer.Exit(code=2)
 
         # Step 7: stub_codex implements the proxy.
+        proxy_exp, proxy_task = _step_ids()
+        in_flight.update(
+            experiment_id=proxy_exp,
+            task_id=proxy_task,
+            experiment_type="research_proxy_implementation",
+            adapter_name=impl_adapter.name,
+            adapter_version=impl_adapter.version,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, proxy_exp)
         proxy_packet = {
             "schema_version": "task_packet.v1",
-            "task_id": task_id,
+            "task_id": proxy_task,
             "competition_slug": competition_slug,
-            "experiment_id": experiment_id,
+            "experiment_id": proxy_exp,
             "provider": "stub_codex",
             "role": "implementation",
             "phase": "FUSION_PROXY_IMPLEMENTED",
             "objective": (
                 f"Implement the smallest proxy test from fusion_proposal "
-                f"{fp_payload['fusion_id']}. Inputs[0] is the fusion proposal "
+                f"{fusion_id_known}. Inputs[0] is the fusion proposal "
                 "path; emit submission.csv that satisfies "
                 "fixtures/<slug>/sample_submission.csv columns."
             ),
             "inputs": [fp_artifact, f"fixtures/{competition_slug}/test.csv"],
-            "allowed_paths": [f"worktrees/{competition_slug}/{experiment_id}/"],
+            "allowed_paths": [f"worktrees/{competition_slug}/{proxy_exp}/"],
             "blocked_paths": [
                 "~/.kaggle/",
                 "~/.codex/",
@@ -2228,9 +2334,11 @@ def research_proxy(
         submission_path = next(
             a for a in proxy_result.artifacts if a.endswith("submission.csv")
         )
+        # stub_codex appends <fusion_id:fusion_NNNN> on FUSION_PROXY_IMPLEMENTED.
+        # Use the existing token if present, otherwise fall through to fusion_token.
         fusion_id_token = next(
             (a for a in proxy_result.artifacts if a.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
-            f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
+            fusion_token,
         )
         console.print(f"[green]step 7 ok[/green]: proxy submission {submission_path}")
 
@@ -2238,110 +2346,99 @@ def research_proxy(
         hidden = FIXTURES_ROOT / competition_slug / "hidden_labels.csv"
         eval_result = evaluate_fixture_submission(submission_path, hidden)
         if not eval_result.valid_submission:
+            _persist_row(
+                experiment_id=proxy_exp,
+                task_id=proxy_task,
+                experiment_type="research_proxy_implementation",
+                adapter_name=impl_adapter.name,
+                adapter_version=impl_adapter.version,
+                status="blocked",
+                artifact_paths=[
+                    submission_path,
+                    fusion_id_token,
+                    "<blocked:InvalidSubmission>",
+                    f"<message:{(eval_result.error or 'invalid')[:200]}>",
+                ],
+                usage_proxy=proxy_result.usage_proxy,
+            )
             console.print(f"[red]step 8 invalid submission: {eval_result.error}[/red]")
             raise typer.Exit(code=1)
         assert eval_result.score is not None
         console.print(f"[green]step 8 ok[/green]: score={eval_result.score:.6f}")
 
-        # PR5: sum the four provider-call usage_proxy values so the budget
-        # governor + arena budget status see the actual cost of a research-proxy
-        # invocation, not zero.
-        total_usage = {
-            "input_chars": (
-                rq_result.usage_proxy.get("input_chars", 0)
-                + digest_result.usage_proxy.get("input_chars", 0)
-                + fp_result.usage_proxy.get("input_chars", 0)
-                + proxy_result.usage_proxy.get("input_chars", 0)
-            ),
-            "output_chars": (
-                rq_result.usage_proxy.get("output_chars", 0)
-                + digest_result.usage_proxy.get("output_chars", 0)
-                + fp_result.usage_proxy.get("output_chars", 0)
-                + proxy_result.usage_proxy.get("output_chars", 0)
-            ),
-            "wall_seconds": (
-                rq_result.usage_proxy.get("wall_seconds", 0.0)
-                + digest_result.usage_proxy.get("wall_seconds", 0.0)
-                + fp_result.usage_proxy.get("wall_seconds", 0.0)
-                + proxy_result.usage_proxy.get("wall_seconds", 0.0)
-            ),
-            "shell_commands": (
-                rq_result.usage_proxy.get("shell_commands", 0)
-                + digest_result.usage_proxy.get("shell_commands", 0)
-                + fp_result.usage_proxy.get("shell_commands", 0)
-                + proxy_result.usage_proxy.get("shell_commands", 0)
-            ),
-            "failed_commands": (
-                rq_result.usage_proxy.get("failed_commands", 0)
-                + digest_result.usage_proxy.get("failed_commands", 0)
-                + fp_result.usage_proxy.get("failed_commands", 0)
-                + proxy_result.usage_proxy.get("failed_commands", 0)
-            ),
-            "waste_events": (
-                rq_result.usage_proxy.get("waste_events", 0)
-                + digest_result.usage_proxy.get("waste_events", 0)
-                + fp_result.usage_proxy.get("waste_events", 0)
-                + proxy_result.usage_proxy.get("waste_events", 0)
-            ),
-        }
-        # Persist the row.
-        store.insert_experiment(
-            experiment_id=experiment_id,
-            run_id=run_id,
-            competition_slug=competition_slug,
-            task_id=proxy_packet["task_id"],
-            experiment_type="research_proxy",
-            provider=impl_adapter.name,
-            provider_version=impl_adapter.version,
+        _persist_row(
+            experiment_id=proxy_exp,
+            task_id=proxy_task,
+            experiment_type="research_proxy_implementation",
+            adapter_name=impl_adapter.name,
+            adapter_version=impl_adapter.version,
             status="completed",
-            metric_name="roc_auc",
+            artifact_paths=[submission_path, fusion_id_token],
+            usage_proxy=proxy_result.usage_proxy,
+            score=eval_result.score,
             valid_submission=True,
-            artifact_paths=[
-                rq_artifact,
-                digest_artifact,
-                fp_artifact,
-                submission_path,
-                fusion_id_token,
-            ],
-            trace_path=None,
-            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-            input_chars=total_usage["input_chars"],
-            output_chars=total_usage["output_chars"],
-            wall_seconds=total_usage["wall_seconds"],
-            shell_commands=total_usage["shell_commands"],
-            failed_commands=total_usage["failed_commands"],
-            waste_events=total_usage["waste_events"],
         )
-        store.update_experiment_score(experiment_id, score=eval_result.score)
 
         # Emit score_recorded for replay (mirrors the evaluate command).
         trace_store.emit(
             event_type="score_recorded",
             severity="info",
-            task_id=proxy_packet["task_id"],
+            task_id=proxy_task,
             payload={
                 "score": eval_result.score,
                 "metric_name": "roc_auc",
-                "experiment_id": experiment_id,
+                "experiment_id": proxy_exp,
                 "status": "valid",
             },
         )
 
         console.print(
             f"[bold green]research-proxy complete[/bold green] — "
-            f"fusion_id={fp_payload['fusion_id']} score={eval_result.score:.6f}"
+            f"fusion_id={fusion_id_known} score={eval_result.score:.6f}"
         )
     except KillSwitchActive as exc:
+        _persist_inflight_blocked(_persist_row, in_flight, "KillSwitchActive", str(exc))
         console.print(f"[red]kill switch active: {exc}[/red]")
         raise typer.Exit(code=2) from exc
     except BudgetExceeded as exc:
+        _persist_inflight_blocked(
+            _persist_row, in_flight, exc.breaker.value, str(exc)
+        )
         console.print(f"[red]budget exceeded ({exc.breaker.value}): {exc}[/red]")
         raise typer.Exit(code=2) from exc
     except SandboxViolation as exc:
+        _persist_inflight_blocked(
+            _persist_row, in_flight, exc.breaker.value, str(exc)
+        )
         console.print(
             f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]"
         )
         raise typer.Exit(code=2) from exc
+
+
+def _persist_inflight_blocked(
+    persist_row,
+    in_flight: dict,
+    breaker_or_reason: str,
+    message: str,
+) -> None:
+    """Insert a status=blocked row for the in-flight step on mid-chain
+    exception. Skips if no step has started yet."""
+    if in_flight["experiment_id"] is None:
+        return
+    persist_row(
+        experiment_id=in_flight["experiment_id"],
+        task_id=in_flight["task_id"],
+        experiment_type=in_flight["experiment_type"],
+        adapter_name=in_flight["adapter_name"] or "unknown",
+        adapter_version=in_flight["adapter_version"] or "unknown",
+        status="blocked",
+        artifact_paths=[
+            f"<blocked:{breaker_or_reason}>",
+            f"<message:{message[:200]}>",
+        ],
+        usage_proxy=None,
+    )
 ```
 
 - [ ] **Step 2: Write the failing CLI tests**
@@ -2365,7 +2462,7 @@ def test_research_proxy_runs_steps_1_through_8(
 ) -> None:
     """End-to-end: arena research-proxy tabular_binary_v1 --provider stub_claude
     runs steps 1-8 against method_note_001.md and produces all 4 artifacts +
-    a scoreboard row tagged with <fusion_id:fusion_0001>."""
+    four scoreboard rows (one per provider invocation)."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
 
@@ -2379,25 +2476,42 @@ def test_research_proxy_runs_steps_1_through_8(
     assert "fusion_id=fusion_0001" in result.output
     assert "score=" in result.output
 
-    # All four artifacts under the experiment worktree.
-    workspace = fixture_workspace / "worktrees" / "tabular_binary_v1" / "exp_0001"
-    assert (workspace / "research_question.json").exists()
-    assert (workspace / "paper_digest.json").exists()
-    assert (workspace / "fusion_proposal.json").exists()
-    assert (workspace / "submission.csv").exists()
+    # Artifacts land in separate per-step worktrees (exp_0001 through exp_0004).
+    wt_root = fixture_workspace / "worktrees" / "tabular_binary_v1"
+    assert (wt_root / "exp_0001" / "research_question.json").exists()
+    assert (wt_root / "exp_0002" / "paper_digest.json").exists()
+    assert (wt_root / "exp_0003" / "fusion_proposal.json").exists()
+    assert (wt_root / "exp_0004" / "submission.csv").exists()
 
-    # Scoreboard row with the fusion_id token.
+    # Four scoreboard rows: question, digest, fusion, implementation.
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
     try:
-        exp = store.get_latest_experiment("tabular_binary_v1")
-        assert exp is not None
-        assert exp["experiment_type"] == "research_proxy"
-        assert exp["status"] == "completed"
-        artifact_paths = json.loads(exp["artifact_paths"])
-        assert any("<fusion_id:fusion_0001>" in p for p in artifact_paths)
-        # The deterministic 0.5 score lands on the row.
-        assert exp["score"] is not None
+        rows = store._require_conn().execute(
+            "SELECT experiment_id, experiment_type, status, score, artifact_paths "
+            "FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
+            ("tabular_binary_v1",),
+        ).fetchall()
+        types = [r["experiment_type"] for r in rows]
+        assert "research_proxy_question" in types
+        assert "research_proxy_digest" in types
+        assert "research_proxy_fusion" in types
+        assert "research_proxy_implementation" in types
+        # All four completed.
+        assert all(r["status"] == "completed" for r in rows)
+        # Fusion + implementation rows carry the fusion_id token.
+        fusion_rows = [r for r in rows if r["experiment_type"] == "research_proxy_fusion"]
+        assert len(fusion_rows) == 1
+        assert any(
+            "<fusion_id:fusion_0001>" in p
+            for p in json.loads(fusion_rows[0]["artifact_paths"])
+        )
+        # Implementation row has the score.
+        impl_rows = [
+            r for r in rows if r["experiment_type"] == "research_proxy_implementation"
+        ]
+        assert len(impl_rows) == 1
+        assert impl_rows[0]["score"] is not None
     finally:
         store.close()
 
@@ -2406,8 +2520,8 @@ def test_research_proxy_halts_at_fusion_gate_below_min_score(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Force MIN_FUSION_SCORE above the deterministic stub's score so the
-    chain halts at step 6. Asserts a status=blocked row and that submission.csv
-    is NOT created (stub_codex was never invoked)."""
+    chain halts at step 6. Asserts rows 1-3 completed + row 4 blocked, and
+    that submission.csv is NOT created (stub_codex was never invoked)."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
     monkeypatch.setattr(
@@ -2425,19 +2539,35 @@ def test_research_proxy_halts_at_fusion_gate_below_min_score(
     assert result.exit_code == 2
     assert "fusion gate failed" in result.output
 
-    workspace = fixture_workspace / "worktrees" / "tabular_binary_v1" / "exp_0001"
-    # Steps 1-5 produced their artifacts; step 7 did NOT.
-    assert (workspace / "fusion_proposal.json").exists()
-    assert not (workspace / "submission.csv").exists()
+    wt_root = fixture_workspace / "worktrees" / "tabular_binary_v1"
+    # Steps 1-5 produced their artifacts (exp_0001 through exp_0003); step 7 did NOT.
+    assert (wt_root / "exp_0003" / "fusion_proposal.json").exists()
+    assert not any((wt_root / f"exp_{i:04d}" / "submission.csv").exists() for i in range(1, 6))
 
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
     try:
-        exp = store.get_latest_experiment("tabular_binary_v1")
-        assert exp is not None
-        assert exp["status"] == "blocked"
-        artifact_paths = json.loads(exp["artifact_paths"])
-        assert any("<blocked:FusionGateBlocked>" in p for p in artifact_paths)
+        rows = store._require_conn().execute(
+            "SELECT experiment_type, status, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? ORDER BY experiment_id",
+            ("tabular_binary_v1",),
+        ).fetchall()
+        # Steps 1-3 + 5 produced their rows as completed; step 7 (impl)
+        # is the one that's blocked at the gate.
+        types_and_status = [(r["experiment_type"], r["status"]) for r in rows]
+        assert ("research_proxy_question", "completed") in types_and_status
+        assert ("research_proxy_digest", "completed") in types_and_status
+        assert ("research_proxy_fusion", "completed") in types_and_status
+        # The blocked row is the implementation (gate-failure stand-in).
+        impl_rows = [
+            r for r in rows if r["experiment_type"] == "research_proxy_implementation"
+        ]
+        assert len(impl_rows) == 1
+        assert impl_rows[0]["status"] == "blocked"
+        assert any(
+            "<blocked:FusionGateBlocked>" in p
+            for p in json.loads(impl_rows[0]["artifact_paths"])
+        )
     finally:
         store.close()
 
@@ -2519,8 +2649,9 @@ def test_research_proxy_blocks_on_pre_invoke_budget_cap(
 def test_research_proxy_does_not_collide_after_calibration(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Calibration first creates exp_0001; research-proxy must mint a
-    fresh experiment_id (exp_0002+) via get_next_experiment_id."""
+    """Calibration first creates exp_0001; research-proxy mints 4 more
+    (exp_0002 through exp_0005) via get_next_experiment_id — one per
+    provider invocation, with no primary-key collision."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
 
@@ -2528,7 +2659,7 @@ def test_research_proxy_does_not_collide_after_calibration(
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
     runner.invoke(app, ["plan", "tabular_binary_v1"])
     runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
-    # Now research-proxy MUST get a different experiment_id.
+    # Now research-proxy MUST get different experiment_ids (exp_0002 through exp_0005).
     result = runner.invoke(
         app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
     )
@@ -2537,16 +2668,16 @@ def test_research_proxy_does_not_collide_after_calibration(
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
     try:
-        # We should have at least 2 distinct experiment_ids.
         rows = store._require_conn().execute(
             "SELECT experiment_id FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
             ("tabular_binary_v1",),
         ).fetchall()
         ids = [r["experiment_id"] for r in rows]
-        assert "exp_0001" in ids
-        assert "exp_0002" in ids
-        # Both should be distinct.
-        assert len(set(ids)) >= 2
+        assert "exp_0001" in ids  # calibration
+        # research-proxy persists 4 rows; total ≥ 5 distinct IDs.
+        assert len(set(ids)) >= 5
+        # And the research-proxy rows are exp_0002 through exp_0005.
+        assert {"exp_0002", "exp_0003", "exp_0004", "exp_0005"}.issubset(set(ids))
     finally:
         store.close()
 
@@ -2554,10 +2685,11 @@ def test_research_proxy_does_not_collide_after_calibration(
 def test_research_proxy_persists_usage_totals(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The 4 provider-call usage_proxy values must be summed and stored
-    on the experiment row so arena budget status sees actual cost,
-    not zeros. Stubs report zero usage, but output_chars from the
-    submission.csv emission is non-zero — that's a useful smoke check."""
+    """Each of the 4 per-invocation usage_proxy values must be stored on
+    its own experiment row so arena budget status sees actual cost per step.
+    Stubs report zero usage, but stub_codex's submission.csv contributes
+    output_chars (the file size is read in build_result) — that's a useful
+    smoke check for the implementation row."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
 
@@ -2571,25 +2703,98 @@ def test_research_proxy_persists_usage_totals(
     store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
     store.connect()
     try:
-        exp = store.get_latest_experiment("tabular_binary_v1")
-        assert exp is not None
-        # Stub providers return zero for chars/wall_seconds/shell/failed/waste,
-        # but stub_codex's submission.csv contributes output_chars (the
-        # file size is read in build_result). So at minimum output_chars > 0
-        # for the proxy step's contribution.
-        assert exp["output_chars"] >= 0
-        # All the other fields are integer-valued and should be 0+.
-        assert exp["input_chars"] >= 0
-        assert exp["wall_seconds"] >= 0.0
-        assert exp["shell_commands"] >= 0
-        assert exp["failed_commands"] >= 0
-        assert exp["waste_events"] >= 0
+        rows = store._require_conn().execute(
+            "SELECT experiment_type, output_chars, input_chars, wall_seconds, "
+            "shell_commands, failed_commands, waste_events "
+            "FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
+            ("tabular_binary_v1",),
+        ).fetchall()
+        assert len(rows) == 4
+        # All 4 rows have non-negative usage fields.
+        for row in rows:
+            assert row["output_chars"] >= 0
+            assert row["input_chars"] >= 0
+            assert row["wall_seconds"] >= 0.0
+            assert row["shell_commands"] >= 0
+            assert row["failed_commands"] >= 0
+            assert row["waste_events"] >= 0
+        # Implementation row (stub_codex) contributes output_chars from
+        # the submission.csv file size read in build_result.
+        impl_row = next(r for r in rows if r["experiment_type"] == "research_proxy_implementation")
+        assert impl_row["output_chars"] >= 0
+    finally:
+        store.close()
+
+
+def test_research_proxy_respects_run_level_provider_call_cap_after_calibration(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Calibration consumes one provider call; cap research-proxy at the
+    new total to verify the governor seeds from get_run_usage_totals."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+
+    # Calibration consumed 1 provider call. Cap research-proxy at 1 so its
+    # very first invoke fails check_can_invoke (would-be call count = 2).
+    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "1")
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code != 0
+    output_lower = result.output.lower()
+    assert "budget exceeded" in output_lower or "provider" in output_lower
+
+
+def test_research_proxy_persists_blocked_row_on_mid_chain_provider_call_cap(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the provider-call cap allows N invocations and research-proxy
+    needs N+1, the (N+1)th invocation halts via check_can_invoke. The
+    in-flight step's row must be persisted as status=blocked so the
+    scoreboard accurately reflects partial progress."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+
+    # Cap at 2 provider calls. Step 2 + Step 4 succeed; Step 5 fails
+    # check_can_invoke (third call would-be).
+    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "2")
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code != 0
+    assert "budget exceeded" in result.output.lower() or "ProviderCallBreaker" in result.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        # Steps 1-2-3 (research_proxy_question) and step 4 (digest) succeeded;
+        # step 5 (fusion) is the one that hit the cap.
+        rows = store._require_conn().execute(
+            "SELECT experiment_type, status FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
+            ("tabular_binary_v1",),
+        ).fetchall()
+        types_and_status = [(r["experiment_type"], r["status"]) for r in rows]
+        # Two completed (question, digest) + one blocked (fusion).
+        assert ("research_proxy_question", "completed") in types_and_status
+        assert ("research_proxy_digest", "completed") in types_and_status
+        assert any(
+            t == "research_proxy_fusion" and s == "blocked"
+            for t, s in types_and_status
+        )
     finally:
         store.close()
 ```
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_cli_research_proxy.py -v`
-Expected: 8 passed.
+Expected: 10 passed.
 
 - [ ] **Step 3: Run full suite + lint + mypy + all CI scripts**
 
@@ -2606,40 +2811,51 @@ Expected: 8 passed.
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 271 tests pass (was 263; +8 cli research-proxy tests). All 6 CI scripts green. ruff/format/mypy clean.
+Expected: 273 tests pass (was 263; +10 cli research-proxy tests). All 6 CI scripts green. ruff/format/mypy clean.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add arena/cli.py tests/test_cli_research_proxy.py
 git commit -m "$(cat <<'EOF'
-feat(cli): arena research-proxy orchestrates §6.2 steps 1-8
+feat(cli): arena research-proxy orchestrates §6.2 steps 1-8 with 4-row design
 
 New Typer subcommand `research-proxy <slug> --provider stub_claude`
-orchestrates the 8-step research-fusion proxy loop in a single
-experiment_id. Each provider invocation goes through watchdog.wrap_invoke
-so PR3 sandbox enforcement, PR4 trace events, and PR4 live waste
-detection apply uniformly to every sub-step.
+orchestrates the 8-step research-fusion proxy loop. Each of the 4 provider
+invocations gets its own experiment_id (via get_next_experiment_id) and
+task_id (matching suffix) so COUNT(*) and per-task trace replay both
+work correctly. Each invocation goes through _guarded_invoke (check_can_invoke
++ wrap_invoke) so PR3 sandbox enforcement, PR4 trace events, and PR4 live
+waste detection apply uniformly.
+
+BudgetGovernor is seeded from store.get_run_usage_totals(slug, run_id) so
+run-level provider-call caps correctly account for prior calibration or
+earlier research-proxy invocations.
 
 Step 6 (fusion_scorer + is_eligible) is a pure function gate. If the
 proposal scores below MIN_FUSION_SCORE OR fails the §6.3 eligibility
-checklist, the CLI halts BEFORE invoking stub_codex, persists a
-status=blocked row tagged <blocked:FusionGateBlocked> +
-<message:...>, and exits code 2. No submission.csv is written.
+checklist, the CLI inserts a blocked row for the implementation step
+(which never runs) and exits code 2. Rows 1-3 (question/digest/fusion)
+are already persisted as completed. No submission.csv is written.
 
-On success, the scoreboard row carries:
-- experiment_type="research_proxy"
-- status="completed"
-- artifact_paths includes all 4 artifacts + <fusion_id:fusion_NNNN>
+On success, four rows are persisted:
+- research_proxy_question (row 1) — rq artifact
+- research_proxy_digest (row 2) — digest artifact
+- research_proxy_fusion (row 3) — fusion artifact + fusion_id token
+- research_proxy_implementation (row 4) — submission.csv + score
 
-The trace store receives provider_invoked + task_finished events for
-each provider invocation plus run_started + score_recorded for the
-controller actions. arena replay <run_id> reconstructs the full chain.
+On mid-chain exception (KillSwitchActive / BudgetExceeded /
+SandboxViolation), _persist_inflight_blocked inserts a blocked row
+for the in-flight step so partial progress is recorded.
 
-Tests cover happy path (all 4 artifacts, score recorded, fusion_id
-token persisted), gate-blocks-on-low-score (status=blocked, no
-submission.csv), unknown-provider rejection, and missing-method-note
-fail-fast.
+The trace store receives run_started + score_recorded for the controller
+actions. arena replay <run_id> reconstructs the full chain via 4 task_ids.
+
+Tests (10): happy path (4 rows, all completed, fusion_id on rows 3+4,
+score on row 4), gate-block (3 completed + 1 blocked impl), unknown-provider
+rejection, missing-method-note fail-fast, kill-switch halt, pre-invoke cap
+at 0, collision-free IDs after calibration, per-row usage values, run-level
+cap after calibration, mid-chain cap blocked-row.
 
 PR5 explicitly does NOT close the loop with review or memory proposal
 — that's PR6's research_review.json + memory_update.json work.
@@ -2691,11 +2907,13 @@ def _emit_proposal_via_cli(
         app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
     )
     assert result.exit_code == 0
+    # With the 4-row design, step 3 (exp_0001), step 4 (exp_0002), step 5 (exp_0003),
+    # step 7 (exp_0004). fusion_proposal.json is written by the third invocation.
     fp_path = (
         fixture_workspace
         / "worktrees"
         / "tabular_binary_v1"
-        / "exp_0001"
+        / "exp_0003"
         / "fusion_proposal.json"
     )
     return json.loads(fp_path.read_text(encoding="utf-8"))
@@ -2789,7 +3007,7 @@ Expected: 8 passed.
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 279 tests pass (was 271; +8). All checks clean.
+Expected: 281 tests pass (was 273; +8). All checks clean.
 
 - [ ] **Step 3: Commit**
 
@@ -2857,11 +3075,11 @@ pytest tests/test_research_proxy_eligibility.py tests/test_cli_research_proxy.py
 
 PR5 acceptance is met when:
 
-1. `arena research-proxy tabular_binary_v1 --provider stub_claude` runs steps 1 → 8 against `fixtures/tabular_binary_v1/paper_bundle/method_note_001.md`, producing all 4 artifacts (research_question.json, paper_digest.json, fusion_proposal.json, submission.csv) under the experiment worktree.
+1. `arena research-proxy tabular_binary_v1 --provider stub_claude` runs steps 1 → 8 against `fixtures/tabular_binary_v1/paper_bundle/method_note_001.md`, producing all 4 artifacts (research_question.json, paper_digest.json, fusion_proposal.json, submission.csv) in separate per-step worktrees.
 2. All fusion proposals satisfy the §6.3 eligibility checklist (verified by `tests/test_research_proxy_eligibility.py`).
-3. The scoreboard records the proxy result with `experiment_type="research_proxy"`, `status="completed"`, and `<fusion_id:fusion_NNNN>` in `artifact_paths`.
-4. The deterministic gate at step 6 halts the chain (status=blocked, exit code 2) when `score < MIN_FUSION_SCORE` OR `is_eligible` returns False — no submission.csv is written.
-5. `arena replay <run_id>` reconstructs the full 4-step chain from the trace store.
+3. The scoreboard records FOUR experiment rows (experiment_type = research_proxy_question / research_proxy_digest / research_proxy_fusion / research_proxy_implementation), all `status="completed"`, with `<fusion_id:fusion_NNNN>` in rows 3-4.
+4. The deterministic gate at step 6 halts the chain when `score < MIN_FUSION_SCORE` OR `is_eligible` returns False — rows 1-3 are completed, row 4 is inserted as status=blocked tagged FusionGateBlocked, exit code 2, no submission.csv written.
+5. `arena replay <run_id>` reconstructs the full 4-step chain from the trace store, with 4 distinct task_ids producing 4 task summaries.
 6. PR1 + PR2 + PR3 + PR4 e2e tests still pass — the new role/phase dispatch is additive.
 
 This unblocks PR6 (Reviews + Memory + Self-Improvement Freeze). PR6 will:
@@ -2921,10 +3139,12 @@ No gaps.
 1. **`arena research-proxy` is ONE command, not four queue dequeues.** The spec says "runs steps 1 → 8 against method_note_001.md" — one command. Four sub-invocations through `wrap_invoke` give us the same observability + sandbox benefits without forcing the operator to dequeue four times. PR7's real-provider runs may want to break this apart for resumability, but PR5 keeps it monolithic.
 2. **`fusion_scorer` is a pure function gate, not a provider invocation.** §6.2 step 6 is "Controller scores the fusion deterministically" — that's a controller action, not a Claude/Codex action. The score is computed from the FusionProposal payload alone; no LLM call.
 3. **Stub providers dispatch on `(role, phase)`** rather than only on role. This is necessary because role="research_proxy" alone doesn't tell the stub which artifact to emit (research_question vs digest vs fusion_proposal). The `(role, phase)` tuple is the natural key.
-4. **`<fusion_id:fusion_NNNN>` in artifact_paths** mirrors PR4's `<PROVIDER_VERSION_CHANGED:from=...>` pattern — metadata in artifact_paths, no schema migration. Future PR (probably PR6 or PR7) might add a `fusion_id` column to the experiments table; until then the token is the link.
-5. **Step 7 uses stub_codex, not the `--provider` arg.** The CLI's `--provider` is for the research provider (steps 2/4/5). The implementation provider for step 7 is hardcoded to stub_codex. PR7 with real Codex can revisit, but for Phase 0 separating the two by role is correct.
-6. **Gate failure persists a `<blocked:FusionGateBlocked>` row** rather than a Phase enum value. FusionGateBlocked is NOT a Breaker enum value either — it's a controller-decision tag, similar to PROVIDER_VERSION_CHANGED. Adding a Breaker would require updating the schema's `breaker` enum, which is out of scope for PR5. The token in artifact_paths is sufficient.
-7. **`get_next_experiment_id` mints a fresh experiment_id per invocation.** `_latest_run_id()` is called instead of `_new_run_id()`, reusing the existing run created by `arena init-fixture`. `store.get_next_experiment_id(competition_slug)` then mints a collision-free experiment_id (exp_0001, exp_0002, …) regardless of whether calibration already ran. If no run exists yet the CLI fails fast with a clear error message directing the operator to run `arena init-fixture` first.
+4. **`<fusion_id:fusion_NNNN>` token appears in artifact_paths starting at row 3 (fusion proposal) and row 4 (implementation).** Rows 1-2 (question, digest) are written before fusion_id is known — it's only extracted from the fusion_proposal.json payload after step 5 returns. This mirrors PR4's `<PROVIDER_VERSION_CHANGED:from=...>` pattern — metadata in artifact_paths, no schema migration. Future PR (probably PR6 or PR7) might add a `fusion_id` column to the experiments table; until then the token is the link.
+5. **Each provider invocation produces its own experiment row** with its own experiment_id (via `get_next_experiment_id`) and task_id (matching suffix). usage_proxy from each ProviderResult is persisted on its own row, so `arena budget status` and pre-invoke caps see all four calls correctly. This is the "per-row" pattern consistent with calibration's one-row-per-run-next.
+6. **Gate failure persists a `<blocked:FusionGateBlocked>` row** rather than a Phase enum value. FusionGateBlocked is NOT a Breaker enum value either — it's a controller-decision tag, similar to PROVIDER_VERSION_CHANGED. Adding a Breaker would require updating the schema's `breaker` enum, which is out of scope for PR5. The token in artifact_paths is sufficient. The gate-failure row has experiment_type="research_proxy_implementation" (the step that would have run) so COUNT(*) correctly shows 4 total provider-call slots were processed.
+7. **`get_next_experiment_id` is called once per provider invocation.** `_latest_run_id()` is called instead of `_new_run_id()`, reusing the existing run created by `arena init-fixture`. Each of the 4 invocations calls `store.get_next_experiment_id(competition_slug)` to mint a collision-free experiment_id (exp_0002 through exp_0005 after calibration's exp_0001). If no run exists yet the CLI fails fast with a clear error message.
+11. **Persisting four rows (one per provider invocation) means COUNT(*) — the basis for `provider_calls` in `get_run_usage_totals` — accurately counts research-proxy's four sub-invocations.** Other approaches (one row + new column, or reading from traces) would have required either a schema migration or coupling the budget governor to the trace store. Per-row is consistent with calibration's one-row-per-run-next pattern.
+12. **BudgetGovernor is seeded from `store.get_run_usage_totals(slug, run_id)`** before the first `check_can_invoke` call. This mirrors `arena run-next`'s approach (PR2) and ensures calibration's provider call is visible to research-proxy's pre-invoke cap check. Without seeding, research-proxy would allow one extra call beyond the total cap on the first invocation after calibration.
 8. **`MIN_FUSION_SCORE = 0.4` is the gate.** The stub fusion has score ~0.7 (cost=0.8, risk=1.0, fit=0.67), well above 0.4. A random low-cost low-risk proposal might still pass; a real Claude proposal with cost_class=large + 5+ risks would be ~0.27 and gate. The exact threshold is tunable in PR7 once we have data.
 9. **Method notes are read by stub_claude implicitly.** The packet's `inputs` field carries the method-note path so the sandbox sees it as readable, but the stub doesn't actually parse the file — its payload is hardcoded. PR7's real Claude will read inputs[0] and digest it. The current behavior is observable (the path appears in the trace's task_started event payload) but not enforced.
 10. **No `arena/research_proxy/runner.py` orchestration module.** The orchestration logic lives in the CLI command. This is the simplest approach for PR5; if PR6 or PR7 adds a non-CLI caller (e.g., autonomous loop scheduler), the orchestration could be extracted.
