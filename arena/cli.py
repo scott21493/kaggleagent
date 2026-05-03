@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1746,8 +1747,9 @@ def self_improve_scan(competition_slug: str) -> None:
     writes SELF_IMPROVEMENT_FROZEN.md sentinel at the repo root.
 
     Idempotent: re-running against unchanged scoreboard state does not
-    duplicate proposals (content-hash dedup via (kind, sorted
-    evidence_refs)).
+    duplicate proposals (content-hash dedup via (problem, sorted
+    evidence_refs); the same key the helper builds at the bottom of
+    this module).
     """
     run_id = _latest_run_id()
     if run_id is None:
@@ -1781,7 +1783,16 @@ def self_improve_scan(competition_slug: str) -> None:
 
     new_proposal_paths: list[str] = []
     for finding in findings:
-        h = _finding_content_hash(finding.problem, sorted(finding.evidence_refs))
+        # Mirror make_self_improvement_proposal's empty-evidence fallback
+        # (proposal.py: list(finding.evidence_refs) or [f"finding:{kind}"])
+        # so the dedup hash matches what's persisted on disk. Without
+        # this, a Finding with empty evidence_refs would hash to
+        # sorted([]) on first scan but the persisted proposal stores
+        # ["finding:<kind>"], making the second-scan hash differ and
+        # producing a duplicate sip_NNNN.json. No current Finding kind
+        # produces empty evidence_refs, but pin the invariant here.
+        refs = sorted(finding.evidence_refs) or [f"finding:{finding.kind}"]
+        h = _finding_content_hash(finding.problem, refs)
         if h in existing_hashes:
             continue
         sip_id = get_next_sip_id(proposals_dir)
@@ -1821,6 +1832,13 @@ def self_improve_scan(competition_slug: str) -> None:
     }
     if decision.frozen:
         payload["path"] = str(sentinel_path)
+    # task_id="self_improvement_scan" routes the event to
+    # traces/<run_id>/self_improvement_scan/events.jsonl rather than
+    # the run-level traces/<run_id>/run.jsonl. Replay tooling that
+    # rglob's events.jsonl picks it up; grouping the controller-action
+    # event under a pseudo-task name keeps the per-scan history
+    # together for ops review. (memory propose still routes to
+    # run.jsonl by design — that command can fire many times per run.)
     trace_store.emit(
         event_type="self_improvement_scan_completed",
         severity="warning" if decision.frozen else "info",
@@ -1837,8 +1855,6 @@ def self_improve_scan(competition_slug: str) -> None:
 def _finding_content_hash(problem: str, evidence_refs: list[str]) -> str:
     """Stable content hash for idempotency: same problem + same
     evidence refs → same hash → no duplicate proposal."""
-    import hashlib
-
     h = hashlib.sha256()
     h.update(problem.encode("utf-8"))
     for ref in evidence_refs:
