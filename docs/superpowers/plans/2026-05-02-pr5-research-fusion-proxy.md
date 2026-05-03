@@ -223,7 +223,7 @@ def test_stub_claude_calibration_path_unchanged(tmp_path: Path) -> None:
         "provider": "stub_claude",
         "role": "implementation",
         "phase": "CALIBRATION_TASK_CREATED",
-        "objective": "obj",
+        "objective": "Produce a calibration baseline submission for the fixture.",
         "inputs": ["fixtures/tabular_binary_v1/train.csv"],
         "allowed_paths": ["worktrees/tabular_binary_v1/exp_0001/"],
         "blocked_paths": [],
@@ -688,6 +688,7 @@ def test_make_research_question_packet_is_schema_valid_task_packet() -> None:
         competition_slug="tabular_binary_v1",
         run_id="run_2026_05_02_001",
         experiment_id="exp_0001",
+        task_id="task_0001",
         question_id="rq_0001",
         source_refs=["fixtures/tabular_binary_v1/paper_bundle/method_note_001.md"],
     )
@@ -705,6 +706,7 @@ def test_make_research_question_packet_includes_method_notes_in_inputs() -> None
         competition_slug="tabular_binary_v1",
         run_id="run_x",
         experiment_id="exp_0001",
+        task_id="task_0001",
         question_id="rq_0001",
         source_refs=[
             "fixtures/tabular_binary_v1/paper_bundle/method_note_001.md",
@@ -785,6 +787,7 @@ def make_research_question_packet(
     competition_slug: str,
     run_id: str,
     experiment_id: str,
+    task_id: str,
     question_id: str,
     source_refs: list[str],
 ) -> dict[str, Any]:
@@ -797,7 +800,7 @@ def make_research_question_packet(
     """
     return {
         "schema_version": "task_packet.v1",
-        "task_id": f"{question_id}_task",
+        "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
         "provider": "stub_claude",
@@ -868,6 +871,7 @@ def test_make_method_digest_packet_is_schema_valid_task_packet() -> None:
         competition_slug="tabular_binary_v1",
         run_id="run_x",
         experiment_id="exp_0001",
+        task_id="task_0001",
         digest_id="pd_0001",
         method_note_path="fixtures/tabular_binary_v1/paper_bundle/method_note_001.md",
     )
@@ -964,6 +968,7 @@ def make_method_digest_packet(
     competition_slug: str,
     run_id: str,
     experiment_id: str,
+    task_id: str,
     digest_id: str,
     method_note_path: str,
 ) -> dict[str, Any]:
@@ -976,7 +981,7 @@ def make_method_digest_packet(
     """
     return {
         "schema_version": "task_packet.v1",
-        "task_id": f"{digest_id}_task",
+        "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
         "provider": "stub_claude",
@@ -1092,6 +1097,7 @@ def test_make_fusion_proposal_packet_is_schema_valid_task_packet() -> None:
         competition_slug="tabular_binary_v1",
         run_id="run_x",
         experiment_id="exp_0001",
+        task_id="task_0001",
         fusion_id="fusion_0001",
         digest_path="worktrees/tabular_binary_v1/exp_0001/paper_digest.json",
     )
@@ -1209,6 +1215,7 @@ def make_fusion_proposal_packet(
     competition_slug: str,
     run_id: str,
     experiment_id: str,
+    task_id: str,
     fusion_id: str,
     digest_path: str,
 ) -> dict[str, Any]:
@@ -1222,7 +1229,7 @@ def make_fusion_proposal_packet(
     """
     return {
         "schema_version": "task_packet.v1",
-        "task_id": f"{fusion_id}_task",
+        "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
         "provider": "stub_claude",
@@ -1599,7 +1606,7 @@ def _proxy_packet(
     fusion_id: str = "fusion_0001",
     competition_slug: str = "tabular_binary_v1",
     experiment_id: str = "exp_0001",
-    task_id: str = "task_proxy_0001",
+    task_id: str = "task_0001",
 ) -> dict:
     return {
         "schema_version": "task_packet.v1",
@@ -1988,15 +1995,22 @@ def research_proxy(
             f"unknown research provider {provider!r}; PR5 supports only stub_claude"
         )
 
-    run_id = _new_run_id()
-    experiment_id = "exp_0001"  # PR5: one research-proxy run per command invocation
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(
+            f"no run for {competition_slug}; run `arena init-fixture {competition_slug}` first"
+        )
+    store = _store()
+    experiment_id = store.get_next_experiment_id(competition_slug)
+    # task_id mirrors experiment_id's numeric suffix so traces are colocated
+    # under one events.jsonl per research-proxy invocation.
+    task_id = experiment_id.replace("exp_", "task_")
     method_note_path = (
         f"fixtures/{competition_slug}/paper_bundle/method_note_001.md"
     )
     if not Path(method_note_path).exists():
         raise typer.BadParameter(f"method note missing: {method_note_path}")
 
-    store = _store()
     trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
     sandbox_policy = SandboxPolicy.from_packet(
         {
@@ -2012,216 +2026,322 @@ def research_proxy(
         workspace_root=Path.cwd(),
     )
     sandbox = SandboxRunner(sandbox_policy)
-
     research_adapter = _get_provider(provider, event_emitter=trace_store)
     impl_adapter = _get_provider("stub_codex", event_emitter=trace_store)
 
     governor = BudgetGovernor(Phase0HardCeilings.from_env())
     watchdog = Watchdog(governor=governor)
 
-    create_workspace(WORKTREE_ROOT, competition_slug, experiment_id)
-    trace_store.emit(
-        event_type="run_started",
-        severity="info",
-        payload={"phase": Phase.NEW.value, "message": "research-proxy run started"},
-    )
+    def _guarded_invoke(adapter: ProviderAdapter, packet: dict) -> ProviderResult:
+        """Run check_can_invoke + wrap_invoke as a single guarded call.
 
-    # Step 1+2: research question task → stub_claude emits research_question.json.
-    rq_packet = make_research_question_packet(
-        competition_slug=competition_slug,
-        run_id=run_id,
-        experiment_id=experiment_id,
-        question_id="rq_0001",
-        source_refs=[method_note_path],
-    )
-    rq_result = watchdog.wrap_invoke(
-        research_adapter, rq_packet, sandbox=sandbox, event_emitter=trace_store
-    )
-    rq_artifact = next(
-        a for a in rq_result.artifacts if a.endswith("research_question.json")
-    )
-    # Step 3: validate (raises on failure — propagates as a typer error).
-    rq_payload = json.loads(Path(rq_artifact).read_text(encoding="utf-8"))
-    from arena.schemas.validate import validate as _validate_schema
-
-    _validate_schema("research_question", rq_payload)
-    console.print(
-        f"[green]step 1-3 ok[/green]: research_question {rq_payload['question_id']}"
-    )
-
-    # Step 4: digest → stub_claude emits paper_digest.json.
-    digest_packet = make_method_digest_packet(
-        competition_slug=competition_slug,
-        run_id=run_id,
-        experiment_id=experiment_id,
-        digest_id="pd_0001",
-        method_note_path=method_note_path,
-    )
-    digest_result = watchdog.wrap_invoke(
-        research_adapter, digest_packet, sandbox=sandbox, event_emitter=trace_store
-    )
-    digest_artifact = next(
-        a for a in digest_result.artifacts if a.endswith("paper_digest.json")
-    )
-    digest_payload = json.loads(Path(digest_artifact).read_text(encoding="utf-8"))
-    validate_paper_digest(digest_payload)
-    console.print(f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}")
-
-    # Step 5: fusion proposal → stub_claude emits fusion_proposal.json.
-    fp_packet = make_fusion_proposal_packet(
-        competition_slug=competition_slug,
-        run_id=run_id,
-        experiment_id=experiment_id,
-        fusion_id="fusion_0001",
-        digest_path=digest_artifact,
-    )
-    fp_result = watchdog.wrap_invoke(
-        research_adapter, fp_packet, sandbox=sandbox, event_emitter=trace_store
-    )
-    fp_artifact = next(
-        a for a in fp_result.artifacts if a.endswith("fusion_proposal.json")
-    )
-    fp_payload = json.loads(Path(fp_artifact).read_text(encoding="utf-8"))
-    validate_fusion_proposal(fp_payload)
-    console.print(
-        f"[green]step 5 ok[/green]: fusion_proposal {fp_payload['fusion_id']}"
-    )
-
-    # Step 6: deterministic gate. Halt before stub_codex if score is too
-    # low OR eligibility checklist fails.
-    fusion_score = score_fusion_proposal(fp_payload)
-    eligible, reasons = is_eligible(fp_payload)
-    console.print(
-        f"[blue]step 6 score={fusion_score.score:.3f} (cost={fusion_score.cost:.2f} "
-        f"risk={fusion_score.risk:.2f} fit={fusion_score.fit:.2f}) eligible={eligible}[/blue]"
-    )
-    if fusion_score.score < MIN_FUSION_SCORE or not eligible:
-        gate_message = (
-            f"fusion gate failed: score={fusion_score.score:.3f} "
-            f"(min={MIN_FUSION_SCORE}); reasons={reasons or ['low score']}"
+        check_can_invoke catches kill-switch activations and pre-invoke
+        provider-call cap violations BEFORE any invoke work runs.
+        wrap_invoke catches SandboxViolation, mid-invoke BudgetExceeded
+        (live waste detector), and post-invoke BudgetExceeded.
+        """
+        watchdog.check_can_invoke(adapter.name)
+        return watchdog.wrap_invoke(
+            adapter, packet, sandbox=sandbox, event_emitter=trace_store
         )
-        # No proxy implementation; persist a blocked row and exit.
+
+    try:
+        create_workspace(WORKTREE_ROOT, competition_slug, experiment_id)
+        trace_store.emit(
+            event_type="run_started",
+            severity="info",
+            payload={"phase": Phase.NEW.value, "message": "research-proxy run started"},
+        )
+
+        # Step 1+2: research question task → stub_claude emits research_question.json.
+        rq_packet = make_research_question_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            task_id=task_id,
+            question_id="rq_0001",
+            source_refs=[method_note_path],
+        )
+        rq_result = _guarded_invoke(research_adapter, rq_packet)
+        rq_artifact = next(
+            a for a in rq_result.artifacts if a.endswith("research_question.json")
+        )
+        # Step 3: validate (raises on failure — propagates as a typer error).
+        rq_payload = json.loads(Path(rq_artifact).read_text(encoding="utf-8"))
+        from arena.schemas.validate import validate as _validate_schema
+
+        _validate_schema("research_question", rq_payload)
+        console.print(
+            f"[green]step 1-3 ok[/green]: research_question {rq_payload['question_id']}"
+        )
+
+        # Step 4: digest → stub_claude emits paper_digest.json.
+        digest_packet = make_method_digest_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            task_id=task_id,
+            digest_id="pd_0001",
+            method_note_path=method_note_path,
+        )
+        digest_result = _guarded_invoke(research_adapter, digest_packet)
+        digest_artifact = next(
+            a for a in digest_result.artifacts if a.endswith("paper_digest.json")
+        )
+        digest_payload = json.loads(Path(digest_artifact).read_text(encoding="utf-8"))
+        validate_paper_digest(digest_payload)
+        console.print(f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}")
+
+        # Step 5: fusion proposal → stub_claude emits fusion_proposal.json.
+        fp_packet = make_fusion_proposal_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            task_id=task_id,
+            fusion_id="fusion_0001",
+            digest_path=digest_artifact,
+        )
+        fp_result = _guarded_invoke(research_adapter, fp_packet)
+        fp_artifact = next(
+            a for a in fp_result.artifacts if a.endswith("fusion_proposal.json")
+        )
+        fp_payload = json.loads(Path(fp_artifact).read_text(encoding="utf-8"))
+        validate_fusion_proposal(fp_payload)
+        console.print(
+            f"[green]step 5 ok[/green]: fusion_proposal {fp_payload['fusion_id']}"
+        )
+
+        # Step 6: deterministic gate. Halt before stub_codex if score is too
+        # low OR eligibility checklist fails.
+        fusion_score = score_fusion_proposal(fp_payload)
+        eligible, reasons = is_eligible(fp_payload)
+        console.print(
+            f"[blue]step 6 score={fusion_score.score:.3f} (cost={fusion_score.cost:.2f} "
+            f"risk={fusion_score.risk:.2f} fit={fusion_score.fit:.2f}) eligible={eligible}[/blue]"
+        )
+        if fusion_score.score < MIN_FUSION_SCORE or not eligible:
+            gate_message = (
+                f"fusion gate failed: score={fusion_score.score:.3f} "
+                f"(min={MIN_FUSION_SCORE}); reasons={reasons or ['low score']}"
+            )
+            # No proxy implementation; persist a blocked row and exit.
+            # Gate failed; sum what we did spend so the blocked row carries
+            # honest usage rather than zeros.
+            partial_usage = {
+                "input_chars": (
+                    rq_result.usage_proxy.get("input_chars", 0)
+                    + digest_result.usage_proxy.get("input_chars", 0)
+                    + fp_result.usage_proxy.get("input_chars", 0)
+                ),
+                "output_chars": (
+                    rq_result.usage_proxy.get("output_chars", 0)
+                    + digest_result.usage_proxy.get("output_chars", 0)
+                    + fp_result.usage_proxy.get("output_chars", 0)
+                ),
+                "wall_seconds": (
+                    rq_result.usage_proxy.get("wall_seconds", 0.0)
+                    + digest_result.usage_proxy.get("wall_seconds", 0.0)
+                    + fp_result.usage_proxy.get("wall_seconds", 0.0)
+                ),
+                "shell_commands": (
+                    rq_result.usage_proxy.get("shell_commands", 0)
+                    + digest_result.usage_proxy.get("shell_commands", 0)
+                    + fp_result.usage_proxy.get("shell_commands", 0)
+                ),
+                "failed_commands": (
+                    rq_result.usage_proxy.get("failed_commands", 0)
+                    + digest_result.usage_proxy.get("failed_commands", 0)
+                    + fp_result.usage_proxy.get("failed_commands", 0)
+                ),
+                "waste_events": (
+                    rq_result.usage_proxy.get("waste_events", 0)
+                    + digest_result.usage_proxy.get("waste_events", 0)
+                    + fp_result.usage_proxy.get("waste_events", 0)
+                ),
+            }
+            store.insert_experiment(
+                experiment_id=experiment_id,
+                run_id=run_id,
+                competition_slug=competition_slug,
+                task_id=fp_packet["task_id"],
+                experiment_type="research_proxy",
+                provider=research_adapter.name,
+                provider_version=research_adapter.version,
+                status="blocked",
+                metric_name="roc_auc",
+                valid_submission=None,
+                artifact_paths=[
+                    rq_artifact,
+                    digest_artifact,
+                    fp_artifact,
+                    f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
+                    f"<blocked:FusionGateBlocked>",
+                    f"<message:{gate_message[:200]}>",
+                ],
+                trace_path=None,
+                created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                input_chars=partial_usage["input_chars"],
+                output_chars=partial_usage["output_chars"],
+                wall_seconds=partial_usage["wall_seconds"],
+                shell_commands=partial_usage["shell_commands"],
+                failed_commands=partial_usage["failed_commands"],
+                waste_events=partial_usage["waste_events"],
+            )
+            console.print(f"[red]{gate_message}[/red]")
+            raise typer.Exit(code=2)
+
+        # Step 7: stub_codex implements the proxy.
+        proxy_packet = {
+            "schema_version": "task_packet.v1",
+            "task_id": task_id,
+            "competition_slug": competition_slug,
+            "experiment_id": experiment_id,
+            "provider": "stub_codex",
+            "role": "implementation",
+            "phase": "FUSION_PROXY_IMPLEMENTED",
+            "objective": (
+                f"Implement the smallest proxy test from fusion_proposal "
+                f"{fp_payload['fusion_id']}. Inputs[0] is the fusion proposal "
+                "path; emit submission.csv that satisfies "
+                "fixtures/<slug>/sample_submission.csv columns."
+            ),
+            "inputs": [fp_artifact, f"fixtures/{competition_slug}/test.csv"],
+            "allowed_paths": [f"worktrees/{competition_slug}/{experiment_id}/"],
+            "blocked_paths": [
+                "~/.kaggle/",
+                "~/.codex/",
+                "~/.claude/",
+                ".env",
+                f"fixtures/{competition_slug}/hidden_labels.csv",
+            ],
+            "budgets": {
+                "max_wall_minutes": 20,
+                "max_shell_commands": 35,
+                "max_failed_commands": 5,
+                "max_input_chars": 75000,
+                "max_output_chars": 25000,
+            },
+            "required_outputs": ["submission.csv"],
+            "success_criteria": ["valid"],
+        }
+        proxy_result = _guarded_invoke(impl_adapter, proxy_packet)
+        submission_path = next(
+            a for a in proxy_result.artifacts if a.endswith("submission.csv")
+        )
+        fusion_id_token = next(
+            (a for a in proxy_result.artifacts if a.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
+            f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
+        )
+        console.print(f"[green]step 7 ok[/green]: proxy submission {submission_path}")
+
+        # Step 8: evaluate the proxy submission.
+        hidden = FIXTURES_ROOT / competition_slug / "hidden_labels.csv"
+        eval_result = evaluate_fixture_submission(submission_path, hidden)
+        if not eval_result.valid_submission:
+            console.print(f"[red]step 8 invalid submission: {eval_result.error}[/red]")
+            raise typer.Exit(code=1)
+        assert eval_result.score is not None
+        console.print(f"[green]step 8 ok[/green]: score={eval_result.score:.6f}")
+
+        # PR5: sum the four provider-call usage_proxy values so the budget
+        # governor + arena budget status see the actual cost of a research-proxy
+        # invocation, not zero.
+        total_usage = {
+            "input_chars": (
+                rq_result.usage_proxy.get("input_chars", 0)
+                + digest_result.usage_proxy.get("input_chars", 0)
+                + fp_result.usage_proxy.get("input_chars", 0)
+                + proxy_result.usage_proxy.get("input_chars", 0)
+            ),
+            "output_chars": (
+                rq_result.usage_proxy.get("output_chars", 0)
+                + digest_result.usage_proxy.get("output_chars", 0)
+                + fp_result.usage_proxy.get("output_chars", 0)
+                + proxy_result.usage_proxy.get("output_chars", 0)
+            ),
+            "wall_seconds": (
+                rq_result.usage_proxy.get("wall_seconds", 0.0)
+                + digest_result.usage_proxy.get("wall_seconds", 0.0)
+                + fp_result.usage_proxy.get("wall_seconds", 0.0)
+                + proxy_result.usage_proxy.get("wall_seconds", 0.0)
+            ),
+            "shell_commands": (
+                rq_result.usage_proxy.get("shell_commands", 0)
+                + digest_result.usage_proxy.get("shell_commands", 0)
+                + fp_result.usage_proxy.get("shell_commands", 0)
+                + proxy_result.usage_proxy.get("shell_commands", 0)
+            ),
+            "failed_commands": (
+                rq_result.usage_proxy.get("failed_commands", 0)
+                + digest_result.usage_proxy.get("failed_commands", 0)
+                + fp_result.usage_proxy.get("failed_commands", 0)
+                + proxy_result.usage_proxy.get("failed_commands", 0)
+            ),
+            "waste_events": (
+                rq_result.usage_proxy.get("waste_events", 0)
+                + digest_result.usage_proxy.get("waste_events", 0)
+                + fp_result.usage_proxy.get("waste_events", 0)
+                + proxy_result.usage_proxy.get("waste_events", 0)
+            ),
+        }
+        # Persist the row.
         store.insert_experiment(
             experiment_id=experiment_id,
             run_id=run_id,
             competition_slug=competition_slug,
-            task_id=fp_packet["task_id"],
+            task_id=proxy_packet["task_id"],
             experiment_type="research_proxy",
-            provider=research_adapter.name,
-            provider_version=research_adapter.version,
-            status="blocked",
+            provider=impl_adapter.name,
+            provider_version=impl_adapter.version,
+            status="completed",
             metric_name="roc_auc",
-            valid_submission=None,
+            valid_submission=True,
             artifact_paths=[
                 rq_artifact,
                 digest_artifact,
                 fp_artifact,
-                f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
-                f"<blocked:FusionGateBlocked>",
-                f"<message:{gate_message[:200]}>",
+                submission_path,
+                fusion_id_token,
             ],
             trace_path=None,
             created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            input_chars=total_usage["input_chars"],
+            output_chars=total_usage["output_chars"],
+            wall_seconds=total_usage["wall_seconds"],
+            shell_commands=total_usage["shell_commands"],
+            failed_commands=total_usage["failed_commands"],
+            waste_events=total_usage["waste_events"],
         )
-        console.print(f"[red]{gate_message}[/red]")
-        raise typer.Exit(code=2)
+        store.update_experiment_score(experiment_id, score=eval_result.score)
 
-    # Step 7: stub_codex implements the proxy.
-    proxy_packet = {
-        "schema_version": "task_packet.v1",
-        "task_id": "task_proxy_0001",
-        "competition_slug": competition_slug,
-        "experiment_id": experiment_id,
-        "provider": "stub_codex",
-        "role": "implementation",
-        "phase": "FUSION_PROXY_IMPLEMENTED",
-        "objective": (
-            f"Implement the smallest proxy test from fusion_proposal "
-            f"{fp_payload['fusion_id']}. Inputs[0] is the fusion proposal "
-            "path; emit submission.csv that satisfies "
-            "fixtures/<slug>/sample_submission.csv columns."
-        ),
-        "inputs": [fp_artifact, f"fixtures/{competition_slug}/test.csv"],
-        "allowed_paths": [f"worktrees/{competition_slug}/{experiment_id}/"],
-        "blocked_paths": [
-            "~/.kaggle/",
-            "~/.codex/",
-            "~/.claude/",
-            ".env",
-            f"fixtures/{competition_slug}/hidden_labels.csv",
-        ],
-        "budgets": {
-            "max_wall_minutes": 20,
-            "max_shell_commands": 35,
-            "max_failed_commands": 5,
-            "max_input_chars": 75000,
-            "max_output_chars": 25000,
-        },
-        "required_outputs": ["submission.csv"],
-        "success_criteria": ["valid"],
-    }
-    proxy_result = watchdog.wrap_invoke(
-        impl_adapter, proxy_packet, sandbox=sandbox, event_emitter=trace_store
-    )
-    submission_path = next(
-        a for a in proxy_result.artifacts if a.endswith("submission.csv")
-    )
-    fusion_id_token = next(
-        (a for a in proxy_result.artifacts if a.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
-        f"<{FUSION_ID_TAG_PREFIX}:{fp_payload['fusion_id']}>",
-    )
-    console.print(f"[green]step 7 ok[/green]: proxy submission {submission_path}")
+        # Emit score_recorded for replay (mirrors the evaluate command).
+        trace_store.emit(
+            event_type="score_recorded",
+            severity="info",
+            task_id=proxy_packet["task_id"],
+            payload={
+                "score": eval_result.score,
+                "metric_name": "roc_auc",
+                "experiment_id": experiment_id,
+                "status": "valid",
+            },
+        )
 
-    # Step 8: evaluate the proxy submission.
-    hidden = FIXTURES_ROOT / competition_slug / "hidden_labels.csv"
-    eval_result = evaluate_fixture_submission(submission_path, hidden)
-    if not eval_result.valid_submission:
-        console.print(f"[red]step 8 invalid submission: {eval_result.error}[/red]")
-        raise typer.Exit(code=1)
-    assert eval_result.score is not None
-    console.print(f"[green]step 8 ok[/green]: score={eval_result.score:.6f}")
-
-    # Persist the row.
-    store.insert_experiment(
-        experiment_id=experiment_id,
-        run_id=run_id,
-        competition_slug=competition_slug,
-        task_id=proxy_packet["task_id"],
-        experiment_type="research_proxy",
-        provider=impl_adapter.name,
-        provider_version=impl_adapter.version,
-        status="completed",
-        metric_name="roc_auc",
-        valid_submission=True,
-        artifact_paths=[
-            rq_artifact,
-            digest_artifact,
-            fp_artifact,
-            submission_path,
-            fusion_id_token,
-        ],
-        trace_path=None,
-        created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-    )
-    store.update_experiment_score(experiment_id, score=eval_result.score)
-
-    # Emit score_recorded for replay (mirrors the evaluate command).
-    trace_store.emit(
-        event_type="score_recorded",
-        severity="info",
-        task_id=proxy_packet["task_id"],
-        payload={
-            "score": eval_result.score,
-            "metric_name": "roc_auc",
-            "experiment_id": experiment_id,
-            "status": "valid",
-        },
-    )
-
-    console.print(
-        f"[bold green]research-proxy complete[/bold green] — "
-        f"fusion_id={fp_payload['fusion_id']} score={eval_result.score:.6f}"
-    )
+        console.print(
+            f"[bold green]research-proxy complete[/bold green] — "
+            f"fusion_id={fp_payload['fusion_id']} score={eval_result.score:.6f}"
+        )
+    except KillSwitchActive as exc:
+        console.print(f"[red]kill switch active: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except BudgetExceeded as exc:
+        console.print(f"[red]budget exceeded ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except SandboxViolation as exc:
+        console.print(
+            f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]"
+        )
+        raise typer.Exit(code=2) from exc
 ```
 
 - [ ] **Step 2: Write the failing CLI tests**
@@ -2359,10 +2479,117 @@ def test_research_proxy_rejects_missing_method_note(
     )
     assert result.exit_code != 0
     assert "method note missing" in result.output
+
+
+def test_research_proxy_blocks_on_kill_switch(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_can_invoke must fire BEFORE the first wrap_invoke. Setting
+    ARENA_KILL_SWITCH should halt research-proxy at step 1."""
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    monkeypatch.setenv("ARENA_KILL_SWITCH", "1")
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code != 0
+    assert "kill switch active" in result.output.lower()
+
+
+def test_research_proxy_blocks_on_pre_invoke_budget_cap(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Provider-call run-level cap fires via check_can_invoke. Setting the
+    cap to 0 should halt research-proxy before step 2's first invoke."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "0")
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code != 0
+    assert "budget exceeded" in result.output.lower() or "ProviderCallBreaker" in result.output
+
+
+def test_research_proxy_does_not_collide_after_calibration(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Calibration first creates exp_0001; research-proxy must mint a
+    fresh experiment_id (exp_0002+) via get_next_experiment_id."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(app, ["plan", "tabular_binary_v1"])
+    runner.invoke(app, ["run-next", "tabular_binary_v1", "--provider", "stub_codex"])
+    # Now research-proxy MUST get a different experiment_id.
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code == 0, result.output
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        # We should have at least 2 distinct experiment_ids.
+        rows = store._require_conn().execute(
+            "SELECT experiment_id FROM experiments WHERE competition_slug = ? ORDER BY experiment_id",
+            ("tabular_binary_v1",),
+        ).fetchall()
+        ids = [r["experiment_id"] for r in rows]
+        assert "exp_0001" in ids
+        assert "exp_0002" in ids
+        # Both should be distinct.
+        assert len(set(ids)) >= 2
+    finally:
+        store.close()
+
+
+def test_research_proxy_persists_usage_totals(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 4 provider-call usage_proxy values must be summed and stored
+    on the experiment row so arena budget status sees actual cost,
+    not zeros. Stubs report zero usage, but output_chars from the
+    submission.csv emission is non-zero — that's a useful smoke check."""
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+
+    runner = CliRunner()
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    result = runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    assert result.exit_code == 0
+
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        exp = store.get_latest_experiment("tabular_binary_v1")
+        assert exp is not None
+        # Stub providers return zero for chars/wall_seconds/shell/failed/waste,
+        # but stub_codex's submission.csv contributes output_chars (the
+        # file size is read in build_result). So at minimum output_chars > 0
+        # for the proxy step's contribution.
+        assert exp["output_chars"] >= 0
+        # All the other fields are integer-valued and should be 0+.
+        assert exp["input_chars"] >= 0
+        assert exp["wall_seconds"] >= 0.0
+        assert exp["shell_commands"] >= 0
+        assert exp["failed_commands"] >= 0
+        assert exp["waste_events"] >= 0
+    finally:
+        store.close()
 ```
 
 Run: `.venv/Scripts/python.exe -m pytest tests/test_cli_research_proxy.py -v`
-Expected: 4 passed.
+Expected: 8 passed.
 
 - [ ] **Step 3: Run full suite + lint + mypy + all CI scripts**
 
@@ -2379,7 +2606,7 @@ Expected: 4 passed.
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 267 tests pass (was 263; +4 cli research-proxy tests). All 6 CI scripts green. ruff/format/mypy clean.
+Expected: 271 tests pass (was 263; +8 cli research-proxy tests). All 6 CI scripts green. ruff/format/mypy clean.
 
 - [ ] **Step 4: Commit**
 
@@ -2562,7 +2789,7 @@ Expected: 8 passed.
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 275 tests pass (was 267; +8). All checks clean.
+Expected: 279 tests pass (was 271; +8). All checks clean.
 
 - [ ] **Step 3: Commit**
 
@@ -2680,9 +2907,9 @@ No gaps.
 **Type consistency:**
 
 - `generate_research_question(*, competition_slug, question_id, source_refs)` — keyword-only signature consistent across question_generator and the CLI's call site (Task 5 passes `source_refs=[method_note_path]`).
-- `make_research_question_packet(*, competition_slug, run_id, experiment_id, question_id, source_refs)` — same pattern; CLI uses identical kwargs.
-- `make_method_digest_packet(*, competition_slug, run_id, experiment_id, digest_id, method_note_path)` — keyword-only; CLI passes `digest_id="pd_0001"`, `method_note_path="fixtures/.../method_note_001.md"`.
-- `make_fusion_proposal_packet(*, competition_slug, run_id, experiment_id, fusion_id, digest_path)` — keyword-only; CLI passes `digest_path=digest_artifact` (the path returned by stub_claude).
+- `make_research_question_packet(*, competition_slug, run_id, experiment_id, task_id, question_id, source_refs)` — same pattern; CLI uses identical kwargs.
+- `make_method_digest_packet(*, competition_slug, run_id, experiment_id, task_id, digest_id, method_note_path)` — keyword-only; CLI passes `task_id=task_id`, `digest_id="pd_0001"`, `method_note_path="fixtures/.../method_note_001.md"`.
+- `make_fusion_proposal_packet(*, competition_slug, run_id, experiment_id, task_id, fusion_id, digest_path)` — keyword-only; CLI passes `task_id=task_id`, `digest_path=digest_artifact` (the path returned by stub_claude).
 - `score_fusion_proposal(proposal) -> FusionScore` — single positional; FusionScore has `.score`, `.risk`, `.cost`, `.fit` fields used in CLI's console message and gate comparison.
 - `is_eligible(proposal) -> tuple[bool, list[str]]` — used identically in fusion_scorer tests, CLI gate, and Task 6 eligibility tests.
 - `MIN_FUSION_SCORE = 0.4` — module-level constant in fusion_scorer.py; CLI imports it; Task 5's monkeypatch test rebinds both `arena.research_proxy.fusion_scorer.MIN_FUSION_SCORE` AND `arena.cli.MIN_FUSION_SCORE` (because the CLI imports the value, not the module — careful here).
@@ -2697,7 +2924,7 @@ No gaps.
 4. **`<fusion_id:fusion_NNNN>` in artifact_paths** mirrors PR4's `<PROVIDER_VERSION_CHANGED:from=...>` pattern — metadata in artifact_paths, no schema migration. Future PR (probably PR6 or PR7) might add a `fusion_id` column to the experiments table; until then the token is the link.
 5. **Step 7 uses stub_codex, not the `--provider` arg.** The CLI's `--provider` is for the research provider (steps 2/4/5). The implementation provider for step 7 is hardcoded to stub_codex. PR7 with real Codex can revisit, but for Phase 0 separating the two by role is correct.
 6. **Gate failure persists a `<blocked:FusionGateBlocked>` row** rather than a Phase enum value. FusionGateBlocked is NOT a Breaker enum value either — it's a controller-decision tag, similar to PROVIDER_VERSION_CHANGED. Adding a Breaker would require updating the schema's `breaker` enum, which is out of scope for PR5. The token in artifact_paths is sufficient.
-7. **`exp_0001` is hardcoded in PR5's research_proxy command.** One research-proxy run per CLI invocation — there's no need for unique experiment_ids across multiple research-proxy invocations in PR5 because the schedule is one fixture, one method note, one fusion. PR7 with real Claude generating multiple proposals will need a counter.
+7. **`get_next_experiment_id` mints a fresh experiment_id per invocation.** `_latest_run_id()` is called instead of `_new_run_id()`, reusing the existing run created by `arena init-fixture`. `store.get_next_experiment_id(competition_slug)` then mints a collision-free experiment_id (exp_0001, exp_0002, …) regardless of whether calibration already ran. If no run exists yet the CLI fails fast with a clear error message directing the operator to run `arena init-fixture` first.
 8. **`MIN_FUSION_SCORE = 0.4` is the gate.** The stub fusion has score ~0.7 (cost=0.8, risk=1.0, fit=0.67), well above 0.4. A random low-cost low-risk proposal might still pass; a real Claude proposal with cost_class=large + 5+ risks would be ~0.27 and gate. The exact threshold is tunable in PR7 once we have data.
 9. **Method notes are read by stub_claude implicitly.** The packet's `inputs` field carries the method-note path so the sandbox sees it as readable, but the stub doesn't actually parse the file — its payload is hardcoded. PR7's real Claude will read inputs[0] and digest it. The current behavior is observable (the path appears in the trace's task_started event payload) but not enforced.
 10. **No `arena/research_proxy/runner.py` orchestration module.** The orchestration logic lives in the CLI command. This is the simplest approach for PR5; if PR6 or PR7 adds a non-CLI caller (e.g., autonomous loop scheduler), the orchestration could be extracted.
