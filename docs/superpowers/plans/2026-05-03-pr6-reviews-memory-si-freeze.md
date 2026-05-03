@@ -54,12 +54,12 @@
 |---|---|
 | `tests/test_stub_claude_review.py` | 5 tests: emits valid research_review.json on FUSION_PROXY_REVIEWED; subject_id from inputs[0]; default decision=accept + risk=low; calibration backward-compat; monkeypatch override. |
 | `tests/test_research_review_packet.py` | 3 tests: builder shape; schema validation; review_id pattern. |
-| `tests/test_cli_review.py` | 7 tests: happy path; missing impl experiment; impl row missing fusion_id token; PR4 fixture-digest drift blocks; provider-version drift tags row; pre-invoke kill switch (no row); post-invoke BudgetExceeded persists row WITH usage_proxy. |
+| `tests/test_cli_review.py` | 8 tests: happy path; missing impl experiment; impl row missing fusion_id token; PR4 fixture-digest drift blocks; provider-version drift tags row; pre-invoke kill switch (no row); post-invoke BudgetExceeded persists row WITH usage_proxy; cross-run linkage (review attaches to impl row's run, not _latest_run_id). |
 | `tests/test_memory_proposal.py` | 6 tests: synthesizes valid memory_update for actionable review; no-op observation for empty review; deterministic proposal_id minting; namespace="research"; review_status="proposed"; evidence array points to review_id. |
 | `tests/test_memory_validator.py` | 4 tests: contradiction detection on modify; operation-specific prior_claim; valid proposals pass; rejects empty evidence. |
 | `tests/test_memory_diff.py` | 3 tests: renders diff against wiki; namespace-scoped output; pure function (no file mutation). |
 | `tests/test_cli_memory_propose.py` | 7 tests: happy path; no-op fallback; missing review experiment; deterministic proposal_id + no scoreboard row; schema-invalid research_review.json caught cleanly; trace event lands under the review row's run (cross-run linkage regression). |
-| `tests/test_self_improvement_scan.py` | 6 tests: detects blocked rows; detects score regression; detects waste threshold; idempotent (no duplicate proposals); proposal IDs monotonic; clean scoreboard produces zero findings. |
+| `tests/test_self_improvement_scan.py` | 7 tests: clean scoreboard produces zero findings; detects blocked rows; detects score regression; detects invalid_submission (fixture-success-rate regression); detects wall_clock_regression (>20% over champion without score improvement); detects provider_calls_regression (>20% over champion without score improvement); treats missing trace as failed_replay. |
 | `tests/test_self_improvement_freeze.py` | 5 tests: each §7.3 trigger fires; apply_freeze writes sentinel; sentinel JSON metadata block parses; is_frozen reads sentinel; unfreeze deletes sentinel. |
 | `tests/test_self_improvement_champion_challenger.py` | 3 tests: returns ComparisonResult; flags regression; pure function. |
 | `tests/test_cli_self_improve_scan.py` | 5 tests: happy path (no findings); finding triggers freeze + sentinel; trace event emitted with allowed payload keys; no scoreboard row; idempotent across runs. |
@@ -1345,9 +1345,10 @@ Emits review_recorded trace event after success (payload uses only
 event.schema.json-permitted keys: review_id, experiment_id, status,
 path).
 
-7 regression tests cover: happy path, missing impl experiment,
+8 regression tests cover: happy path, missing impl experiment,
 non-research-proxy row (no fusion_id token), fixture drift, version
-drift tagging, kill switch, post-invoke BudgetExceeded.
+drift tagging, kill switch, post-invoke BudgetExceeded, cross-run
+linkage (review attaches to impl row's run, not _latest_run_id()).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -2368,8 +2369,11 @@ message, phase=MEMORY_PROPOSAL_CREATED, proposal_id, memory_update_id
 review payload), path (to mem_NNNN.json), paths (to the source
 research_review.json).
 
-5 tests cover happy path, no-scoreboard-row invariant, no-op fallback
-for empty review, missing review experiment, monotonic proposal IDs.
+7 tests cover happy path, no-scoreboard-row invariant, no-op fallback
+for empty review, missing review experiment, monotonic proposal IDs,
+schema-invalid research_review.json caught cleanly, and cross-run
+linkage (memory_proposal_created event attaches to the review row's
+run, not _latest_run_id()).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -3274,8 +3278,10 @@ arena/self_improvement/champion_challenger.py:
   no-improvement, more waste). No I/O, no hidden-label coupling.
   Library-only; PR6's freeze evaluator + PR7's apply gate consume it.
 
-9 tests cover scan happy/blocked/regression paths, proposal schema
-validity, monotonic IDs, and pure-function comparison.
+13 tests cover scan happy/blocked/regression paths (including the
+§7.3 invalid_submission, wall_clock_regression, provider_calls_regression,
+and missing-trace failed_replay triggers), proposal schema validity,
+monotonic IDs, and pure-function metric comparison.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -4121,7 +4127,7 @@ This unblocks PR7 (Real Codex/Claude + close-the-loop), which composes the three
 
 | Spec section | Task |
 |---|---|
-| §3.1 `arena review` | Task 2 (packet builder + CLI + 7 regression tests) |
+| §3.1 `arena review` | Task 2 (packet builder + CLI + 8 regression tests) |
 | §3.2 `arena memory propose` (controller-only, no row, no-op fallback) | Task 4 (CLI) + Task 3 (synthesizer with no-op branch) |
 | §3.3 `arena self-improve scan` (controller-only, content-hash idempotency, sentinel) | Task 5 (scan + proposal + champion_challenger) + Task 6 (freeze + CLI) |
 | §3.3 freeze sentinel format (Markdown + fenced JSON) | Task 6 Step 4 (`apply_freeze` body construction) + test_self_improvement_freeze.py |
