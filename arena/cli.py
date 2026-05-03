@@ -29,7 +29,7 @@ from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
 from arena.observability.version_baseline import record_fixture_hash, record_provider_version
-from arena.providers.base import ProviderAdapter, ProviderResult, UsageProxy
+from arena.providers.base import ProviderAdapter, ProviderResult, ProviderUnavailable, UsageProxy
 from arena.providers.health import HealthCode
 from arena.providers.health import check as health_check
 from arena.providers.stub_claude import StubClaudeProvider
@@ -137,6 +137,40 @@ def _get_provider(
         return StubCodexProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     if name == "stub_claude":
         return StubClaudeProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
+    if name in ("codex", "claude"):
+        # Local imports avoid pulling the real-adapter modules at CLI
+        # startup. They are only needed when a real provider is actually
+        # resolved, and keeping them lazy mirrors the import pattern used
+        # for arena.research_proxy.* elsewhere in this module.
+        from arena.providers.claude import RealClaudeProvider
+        from arena.providers.codex import RealCodexProvider
+
+        cls = RealCodexProvider if name == "codex" else RealClaudeProvider
+        h = health_check(name)
+        if h.code != HealthCode.OK:
+            raise ProviderUnavailable(
+                provider=name,
+                code=h.code.value,
+                detail=h.detail,
+                runbook=h.runbook,
+            )
+        if h.version is None:
+            # HealthCode.OK + version=None is a degenerate case: the
+            # health probe succeeded but no parseable version was
+            # extracted. Per spec §5, treat as ERROR so the
+            # provider-version baseline file is never written with a
+            # null version (which would silently break drift detection).
+            raise ProviderUnavailable(
+                provider=name,
+                code="error",
+                detail="--version probe returned no parseable version",
+                runbook=None,
+            )
+        return cls(
+            executable=name,
+            version=h.version,
+            event_emitter=event_emitter,
+        )
     raise typer.BadParameter(f"unknown provider: {name}")
 
 
@@ -144,7 +178,23 @@ def _get_provider(
 def doctor() -> None:
     """Run lightweight local readiness checks."""
     validate_fixture_manifest("fixtures/tabular_binary_v1")
-    console.print("[green]arena doctor passed[/green]")
+    console.print("[green]✅[/green] fixture manifest")
+
+    # Provider CLIs — non-fatal status lines. Doctor is a readiness
+    # inventory; `arena provider health <name>` is the fail-fast check.
+    for name in ("codex", "claude"):
+        h = health_check(name)
+        if h.code == HealthCode.OK:
+            console.print(f"[green]✅[/green] {h.provider} CLI: {h.version} ({h.detail})")
+        elif h.code == HealthCode.NOT_FOUND:
+            console.print(
+                f"[yellow]⚠[/yellow]  {h.provider} CLI: not installed (stub-only is fine for CI)"
+            )
+        else:
+            label = h.code.value.upper().replace("_", " ")
+            console.print(f"[red]❌[/red] {h.provider} CLI: {label} ({h.detail})")
+
+    console.print("arena doctor complete")
 
 
 @app.command("fixture-smoke")

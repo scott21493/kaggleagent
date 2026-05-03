@@ -10,9 +10,13 @@ from arena.cli import app
 
 
 def test_doctor_command() -> None:
+    # Doctor is a readiness inventory (Task 8): exits 0 even when real
+    # provider CLIs are missing, and the summary is "complete" (not
+    # "passed") because the inventory may include red lines while still
+    # finishing successfully.
     result = CliRunner().invoke(app, ["doctor"])
     assert result.exit_code == 0
-    assert "arena doctor passed" in result.output
+    assert "arena doctor complete" in result.output
 
 
 def test_fixture_smoke_command() -> None:
