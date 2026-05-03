@@ -1871,10 +1871,16 @@ class StubCodexProvider(ProviderAdapter):
             if not p.exists():
                 return None
             try:
-                payload = json.loads(p.read_text(encoding="utf-8"))
+                payload: dict[str, object] = json.loads(p.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 return None
-            return payload.get("fusion_id")
+            # json.loads returns Any; narrow explicitly so mypy's
+            # warn_return_any does not fire, and so a non-string fusion_id
+            # (malformed JSON, schema regression) cannot leak into
+            # artifact_paths as a token like "<fusion_id:None>" or
+            # "<fusion_id:42>".
+            fusion_id = payload.get("fusion_id")
+            return fusion_id if isinstance(fusion_id, str) else None
         return None
 ```
 
