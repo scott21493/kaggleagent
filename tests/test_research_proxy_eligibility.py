@@ -123,10 +123,15 @@ def test_stub_proposal_has_no_forbidden_network_dependency(
 def test_stub_proposal_has_no_untrusted_code_import(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The stub_claude proposal must pass is_eligible's untrusted-code
+    check. After Task 3's polish (commit 9e57ef8), is_eligible uses
+    scoped detection — exact-match on normalized dependency names plus
+    explicit-pattern matching on algorithm_steps — so this test invokes
+    the real gate rather than reproducing a naive substring search.
+    The reason format `forbidden untrusted-code use: ...` is the contract."""
     proposal = _emit_proposal_via_cli(fixture_workspace, monkeypatch)
-    blob = " ".join(proposal["implementation_plan"]["algorithm_steps"])
-    forbidden = {"subprocess", "os.system", "eval(", "exec("}
-    assert not any(f in blob.lower() for f in forbidden)
+    _passes, reasons = is_eligible(proposal)
+    assert not any("untrusted-code" in r.lower() for r in reasons), reasons
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -194,7 +199,9 @@ def test_is_eligible_rejects_missing_resource_estimate_key() -> None:
     del proposal["resource_estimate"]["max_runtime_minutes"]
     passes, reasons = is_eligible(proposal)
     assert passes is False
-    assert any("resource_estimate missing max_runtime_minutes" in r for r in reasons)
+    # Loose match on the field name (symmetric with the other 4 negative
+    # tests) — robust against future reason-string rewordings.
+    assert any("max_runtime_minutes" in r for r in reasons)
 
 
 def test_is_eligible_rejects_short_stop_condition() -> None:
