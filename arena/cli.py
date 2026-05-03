@@ -40,6 +40,7 @@ from arena.research_proxy.method_digest import (
 from arena.research_proxy.question_generator import make_research_question_packet
 from arena.sandbox.policy import SandboxPolicy
 from arena.sandbox.runner import SandboxRunner, SandboxViolation
+from arena.schemas.validate import validate as validate_schema
 from arena.scoreboard.store import ScoreboardStore
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
@@ -825,11 +826,14 @@ def research_proxy(
             source_refs=[method_note_path],
         )
         rq_result = _guarded_invoke(research_adapter, rq_packet)
-        rq_artifact = next(a for a in rq_result.artifacts if a.endswith("research_question.json"))
+        rq_artifact = _require_artifact(
+            rq_result.artifacts,
+            suffix="research_question.json",
+            step_label="step 1-3",
+            provider_name=research_adapter.name,
+        )
         rq_payload = json.loads(Path(rq_artifact).read_text(encoding="utf-8"))
-        from arena.schemas.validate import validate as _validate_schema
-
-        _validate_schema("research_question", rq_payload)
+        validate_schema("research_question", rq_payload)
         _persist_row(
             experiment_id=rq_exp,
             task_id=rq_task,
@@ -860,8 +864,11 @@ def research_proxy(
             method_note_path=method_note_path,
         )
         digest_result = _guarded_invoke(research_adapter, digest_packet)
-        digest_artifact = next(
-            a for a in digest_result.artifacts if a.endswith("paper_digest.json")
+        digest_artifact = _require_artifact(
+            digest_result.artifacts,
+            suffix="paper_digest.json",
+            step_label="step 4",
+            provider_name=research_adapter.name,
         )
         digest_payload = json.loads(Path(digest_artifact).read_text(encoding="utf-8"))
         validate_paper_digest(digest_payload)
@@ -895,7 +902,12 @@ def research_proxy(
             digest_path=digest_artifact,
         )
         fp_result = _guarded_invoke(research_adapter, fp_packet)
-        fp_artifact = next(a for a in fp_result.artifacts if a.endswith("fusion_proposal.json"))
+        fp_artifact = _require_artifact(
+            fp_result.artifacts,
+            suffix="fusion_proposal.json",
+            step_label="step 5",
+            provider_name=research_adapter.name,
+        )
         fp_payload = json.loads(Path(fp_artifact).read_text(encoding="utf-8"))
         validate_fusion_proposal(fp_payload)
         fusion_id_known = fp_payload["fusion_id"]
@@ -984,7 +996,12 @@ def research_proxy(
             "success_criteria": ["valid"],
         }
         proxy_result = _guarded_invoke(impl_adapter, proxy_packet)
-        submission_path = next(a for a in proxy_result.artifacts if a.endswith("submission.csv"))
+        submission_path = _require_artifact(
+            proxy_result.artifacts,
+            suffix="submission.csv",
+            step_label="step 7",
+            provider_name=impl_adapter.name,
+        )
         # stub_codex appends <fusion_id:fusion_NNNN> on FUSION_PROXY_IMPLEMENTED.
         # Use the existing token if present, otherwise fall through to fusion_token.
         fusion_id_token = next(
@@ -1084,6 +1101,30 @@ def research_proxy(
             )
         console.print(f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]")
         raise typer.Exit(code=2) from exc
+
+
+def _require_artifact(
+    artifacts: list[str], *, suffix: str, step_label: str, provider_name: str
+) -> str:
+    """Find the first artifact whose path ends with `suffix`. Raise a clear
+    BadParameter if no match is found.
+
+    The bare `next(...)` form would raise StopIteration on a regression
+    where a provider drops the expected artifact (e.g., stub_claude
+    silently fails to write research_question.json). StopIteration
+    propagates as `RuntimeError: generator raised StopIteration` which
+    isn't caught by the chain's outer except handlers and gives the
+    operator no actionable message. This helper turns that into a
+    typer.BadParameter naming the step + provider so the failure is
+    self-describing.
+    """
+    match = next((a for a in artifacts if a.endswith(suffix)), None)
+    if match is None:
+        raise typer.BadParameter(
+            f"{step_label}: provider {provider_name!r} did not emit a "
+            f"{suffix!r} artifact (got {artifacts!r})"
+        )
+    return match
 
 
 def _persist_inflight_blocked(
