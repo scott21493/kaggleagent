@@ -1083,8 +1083,10 @@ def _packet(task_id: str = "task_0001", *, role: str = "implementation",
       schema_version, task_id, competition_slug, provider, role, phase,
       objective, inputs, allowed_paths, blocked_paths, budgets,
       required_outputs, success_criteria.
-    Note: it's `required_outputs` (NOT `expected_outputs`) and
-    `budgets.max_shell_commands` is in the budgets `required` set.
+    `objective` has minLength=10. Budgets `required` is exactly 5
+    fields: max_wall_minutes, max_shell_commands, max_failed_commands,
+    max_input_chars, max_output_chars (additionalProperties: false on
+    budgets too, so don't add extras).
     """
     return {
         "schema_version": "task_packet.v1",
@@ -1093,13 +1095,16 @@ def _packet(task_id: str = "task_0001", *, role: str = "implementation",
         "provider": provider,
         "role": role,
         "phase": phase,
-        "objective": "test",
+        "objective": "real-adapter test packet",  # minLength=10
         "inputs": [],
         "allowed_paths": [],
         "blocked_paths": [],
         "budgets": {
             "max_wall_minutes": 5,
             "max_shell_commands": 100,
+            "max_failed_commands": 10,
+            "max_input_chars": 100_000,
+            "max_output_chars": 100_000,
         },
         "required_outputs": ["submission.csv"],
         "success_criteria": [],
@@ -1669,10 +1674,19 @@ def test_invoke_schema_violation_returns_failure_with_token(
     assert "<failure:schema_violation>" in result.artifacts
 
 
-def test_invoke_unknown_role_phase_combo_returns_failure(
+def test_invoke_unmapped_role_phase_combo_returns_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unknown (role, phase) → no schema to validate against → failure."""
+    """Schema-valid packet whose (role, phase) is intentionally NOT in
+    the adapter dispatch table → no schema to validate output against
+    → <failure:schema_violation>.
+
+    role="review" + phase="CALIBRATION_REVIEWED" is the canonical
+    unmapped pair: both values pass task_packet.schema.json's enums,
+    but the (role, phase) tuple is not in _ROLE_PHASE_TO_SCHEMA. Using
+    truly-unknown enum values (e.g., role="unknown_role") would fail
+    adapter-level packet validation BEFORE the dispatch runs and never
+    reach _parse_claude_response."""
     def fake_run(*a, **kw):
         return MagicMock(returncode=0, stdout='{"foo": "bar"}', stderr="")
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1680,7 +1694,7 @@ def test_invoke_unknown_role_phase_combo_returns_failure(
     p = RealClaudeProvider(
         executable="claude", version="0.3.1", cwd=tmp_path, event_emitter=ts,
     )
-    result = p.invoke(_packet(role="unknown_role", phase="UNKNOWN_PHASE"))
+    result = p.invoke(_packet(role="review", phase="CALIBRATION_REVIEWED"))
     assert result.status == "failure"
     assert "<failure:schema_violation>" in result.artifacts
 ```
