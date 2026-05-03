@@ -39,6 +39,7 @@ from arena.providers.base import (
     ProviderUnavailable,
     UsageProxy,
 )
+from arena.schemas.validate import validate as validate_schema
 
 _RUNBOOK_AUTH = "docs/phase0/runbooks/auth_expiry.md"
 
@@ -77,12 +78,11 @@ class RealCodexProvider(ProviderAdapter):
                 "route stdout/stderr persistence without a TraceStore. "
                 "Pass event_emitter= at construction time."
             )
+        # Validate BEFORE any side effect (mkdir, file write, subprocess).
         # Per ProviderAdapter.invoke contract: validate the incoming
         # packet. Mirrors stub_codex/stub_claude (double-validation is
         # cheap; CLI also pre-validates).
-        from arena.schemas.validate import validate as _validate_schema
-
-        _validate_schema("task_packet", task_packet)
+        validate_schema("task_packet", task_packet)
         task_id = task_packet["task_id"]
         prompt_dir = self._cwd / ".arena_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
@@ -160,6 +160,14 @@ class RealCodexProvider(ProviderAdapter):
             else:
                 status = "success"
                 artifacts.extend(parsed.get("artifacts", []))
+            # Surface NDJSON drift even on the success path. If the
+            # terminal event was valid but earlier lines were malformed,
+            # the operator needs a signal to update the parser
+            # (mirrors the auth-pattern maintenance loop in
+            # docs/phase0/runbooks/auth_expiry.md).
+            n_malformed = int(parsed.get("_n_malformed_lines", 0))
+            if n_malformed > 0:
+                artifacts.append(f"<warn:n_malformed_ndjson_lines:{n_malformed}>")
         elif exit_code >= 64:
             status = "blocked"
             artifacts.extend(
@@ -212,8 +220,16 @@ def _parse_codex_ndjson(scrubbed_stdout: str) -> dict[str, Any]:
 
     The final event SHOULD summarize artifacts + usage. If absent,
     returns {"_missing_terminal_event": True}. Per ADR-0004 open
-    question #3, resolved at PR7."""
+    question #3, resolved at PR7.
+
+    Malformed JSONL lines are skipped but COUNTED. If any are dropped,
+    the count is surfaced to the caller via `_n_malformed_lines` so the
+    adapter can append a `<warn:n_malformed_ndjson_lines:N>` artifact
+    token. Without this, parser drift in real codex output (e.g., a
+    future CLI version emitting partial JSON on stderr-mixed paths)
+    would silently classify down with no operator signal."""
     events: list[dict] = []
+    n_malformed = 0
     for line in scrubbed_stdout.splitlines():
         line = line.strip()
         if not line:
@@ -221,13 +237,15 @@ def _parse_codex_ndjson(scrubbed_stdout: str) -> dict[str, Any]:
         try:
             events.append(json.loads(line))
         except json.JSONDecodeError:
+            n_malformed += 1
             continue
     if not events:
-        return {"_missing_terminal_event": True}
+        return {"_missing_terminal_event": True, "_n_malformed_lines": n_malformed}
     terminal = events[-1]
     if "artifacts" not in terminal and "usage" not in terminal:
-        return {"_missing_terminal_event": True}
+        return {"_missing_terminal_event": True, "_n_malformed_lines": n_malformed}
     return {
         "artifacts": terminal.get("artifacts", []),
         "usage": terminal.get("usage", {}),
+        "_n_malformed_lines": n_malformed,
     }

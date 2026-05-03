@@ -95,7 +95,14 @@ def test_invoke_timeout_returns_killed_with_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_run(*a, **kw):
-        raise subprocess.TimeoutExpired(cmd="codex", timeout=600)
+        # Include partial output to exercise the (e.stdout or "") path —
+        # text=True on subprocess.run guarantees str on TimeoutExpired.
+        raise subprocess.TimeoutExpired(
+            cmd="codex",
+            timeout=600,
+            output="partial-out",
+            stderr="partial-err",
+        )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     ts = TraceStore(run_id="run_test", root=tmp_path)
@@ -108,6 +115,61 @@ def test_invoke_timeout_returns_killed_with_token(
     result = p.invoke(_packet())
     assert result.status == "killed"
     assert "<killed:wall_clock_timeout>" in result.artifacts
+    # Partial output flowed through scrubber into output_chars
+    assert result.usage_proxy["output_chars"] >= len("partial-out") + len("partial-err")
+
+
+def test_invoke_rejects_invalid_packet(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adapter-level packet validation per ProviderAdapter contract.
+    Schema-invalid packet must raise BEFORE any subprocess invocation
+    or filesystem side effect."""
+    from jsonschema import ValidationError
+
+    invocations: list = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: invocations.append(a) or None)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    with pytest.raises(ValidationError):
+        p.invoke({"schema_version": "task_packet.v1"})  # missing required fields
+    # Subprocess.run must NOT have been called
+    assert invocations == []
+    # .arena_prompts/ must NOT have been created (validate-before-side-effect)
+    assert not (tmp_path / ".arena_prompts").exists()
+
+
+def test_parse_codex_ndjson_emits_drift_warning_for_malformed_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If earlier NDJSON lines are malformed but the terminal event is
+    valid, the parser surfaces n_malformed_lines so the adapter can
+    append a <warn:n_malformed_ndjson_lines:N> token. Operator signal
+    for parser drift; mirrors the auth-pattern maintenance loop."""
+    stdout = '{not json\n{also bad\n{"event":"done","artifacts":["x.csv"],"usage":{}}\n'
+
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    result = p.invoke(_packet())
+    assert result.status == "success"  # terminal event was valid
+    assert "x.csv" in result.artifacts
+    assert "<warn:n_malformed_ndjson_lines:2>" in result.artifacts
 
 
 def test_invoke_exit_64_returns_blocked_with_auth_tokens(
