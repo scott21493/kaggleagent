@@ -30,6 +30,8 @@ from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
 from arena.observability.version_baseline import record_fixture_hash, record_provider_version
 from arena.providers.base import ProviderAdapter, ProviderResult, UsageProxy
+from arena.providers.health import HealthCode
+from arena.providers.health import check as health_check
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
 from arena.research_proxy.fusion_proposal import (
@@ -64,6 +66,8 @@ memory_app = typer.Typer(help="Memory proposal commands.")
 app.add_typer(memory_app, name="memory")
 self_improve_app = typer.Typer(help="Self-improvement scan + freeze commands.")
 app.add_typer(self_improve_app, name="self-improve")
+provider_app = typer.Typer(help="Provider commands.")
+app.add_typer(provider_app, name="provider")
 console = Console()
 
 DB_PATH = Path("scoreboard.sqlite")
@@ -1861,3 +1865,27 @@ def _finding_content_hash(problem: str, evidence_refs: list[str]) -> str:
         h.update(b"\x00")
         h.update(ref.encode("utf-8"))
     return h.hexdigest()
+
+
+@provider_app.command("health")
+def provider_health(name: str) -> None:
+    """Run a cheap, non-mutating health check for `<name>`.
+
+    Stubs (stub_codex, stub_claude) short-circuit. Real providers
+    (codex, claude) probe --version + --help. Output is a single line
+    plus an optional runbook reference. Exits 0 on OK, 1 on any other
+    HealthCode."""
+    h = health_check(name)
+    if h.code == HealthCode.OK:
+        line = f"[green]✅[/green] {h.provider}: {h.version}"
+        if h.sandbox_mode:
+            line += f" ({h.sandbox_mode}; {h.detail})"
+        else:
+            line += f" ({h.detail})"
+        console.print(line)
+        raise typer.Exit(0)
+    label = h.code.value.upper().replace("_", " ")
+    console.print(f"[red]❌[/red] {h.provider}: {label} ({h.detail})")
+    if h.runbook:
+        console.print(f"Runbook: {h.runbook}")
+    raise typer.Exit(1)
