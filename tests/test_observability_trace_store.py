@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from arena.observability.trace_store import TraceStore
+from arena.observability.trace_store import ProviderStreamPaths, TraceStore
 
 
 def test_emit_writes_one_jsonl_line_per_event_for_a_task(tmp_path: Path) -> None:
@@ -284,3 +284,60 @@ def test_emit_scrubs_strings_inside_nested_payload_dict(tmp_path: Path) -> None:
     log = (tmp_path / "run_x" / "task_0001" / "events.jsonl").read_text(encoding="utf-8")
     line = json.loads(log.strip())
     assert line["payload"]["message"] == "outer"
+
+
+def test_write_provider_streams_writes_four_files(tmp_path):
+    """Raw + scrubbed pairs land at the canonical traces layout."""
+    store = TraceStore(run_id="run_test", root=tmp_path)
+    paths = store.write_provider_streams(
+        task_id="task_0001",
+        raw_stdout="raw out",
+        raw_stderr="raw err",
+        scrubbed_stdout="scrub out",
+        scrubbed_stderr="scrub err",
+    )
+    assert isinstance(paths, ProviderStreamPaths)
+    base = tmp_path / "run_test" / "task_0001"
+    assert (base / "stdout.raw").read_text(encoding="utf-8") == "raw out"
+    assert (base / "stderr.raw").read_text(encoding="utf-8") == "raw err"
+    assert (base / "stdout.scrubbed").read_text(encoding="utf-8") == "scrub out"
+    assert (base / "stderr.scrubbed").read_text(encoding="utf-8") == "scrub err"
+    assert paths.stdout_scrubbed == base / "stdout.scrubbed"
+    assert paths.stderr_scrubbed == base / "stderr.scrubbed"
+
+
+def test_write_provider_streams_creates_parent_dirs(tmp_path):
+    """Path layout works when traces/<run_id>/<task_id>/ doesn't exist yet."""
+    store = TraceStore(run_id="run_test", root=tmp_path)
+    store.write_provider_streams(
+        task_id="task_fresh",
+        raw_stdout="x",
+        raw_stderr="y",
+        scrubbed_stdout="x",
+        scrubbed_stderr="y",
+    )
+    assert (tmp_path / "run_test" / "task_fresh" / "stdout.raw").exists()
+
+
+def test_write_provider_streams_writes_raw_before_scrubbed(tmp_path, monkeypatch):
+    """Forensic recovery: raw paths must be written first."""
+    write_order: list[str] = []
+    real_write_text = type(tmp_path).write_text
+
+    def tracking_write_text(self, data, **kwargs):
+        write_order.append(self.name)
+        return real_write_text(self, data, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.write_text", tracking_write_text)
+    store = TraceStore(run_id="run_test", root=tmp_path)
+    store.write_provider_streams(
+        task_id="task_0001",
+        raw_stdout="r1",
+        raw_stderr="r2",
+        scrubbed_stdout="s1",
+        scrubbed_stderr="s2",
+    )
+    raw_idxs = [i for i, n in enumerate(write_order) if n.endswith(".raw")]
+    scrubbed_idxs = [i for i, n in enumerate(write_order) if n.endswith(".scrubbed")]
+    assert raw_idxs and scrubbed_idxs, write_order
+    assert max(raw_idxs) < min(scrubbed_idxs), f"raw must precede scrubbed: {write_order}"

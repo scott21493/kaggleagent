@@ -3,11 +3,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from arena.observability.events import make_event, validate_event
 from arena.observability.scrubber import scrub_text
+
+
+@dataclass(frozen=True)
+class ProviderStreamPaths:
+    """Frozen result of TraceStore.write_provider_streams. The four
+    paths point at the four artifacts written. Raw paths are forensic-
+    only; never include them in ProviderResult.artifacts, never pass
+    them back into provider context, never emit them in trace events."""
+
+    stdout_raw: Path
+    stderr_raw: Path
+    stdout_scrubbed: Path
+    stderr_scrubbed: Path
 
 
 def _scrub_value(value: Any) -> Any:
@@ -171,3 +185,45 @@ class TraceStore:
         if self._on_event is not None:
             self._on_event(event)
         return event
+
+    def write_provider_streams(
+        self,
+        *,
+        task_id: str,
+        raw_stdout: str,
+        raw_stderr: str,
+        scrubbed_stdout: str,
+        scrubbed_stderr: str,
+    ) -> ProviderStreamPaths:
+        """Write four artifacts at:
+            <root>/<run_id>/<task_id>/{stdout.raw, stderr.raw,
+                                       stdout.scrubbed, stderr.scrubbed}
+
+        Raw paths are written FIRST (forensic recovery if scrubber has
+        a bug). Scrubbed paths are what consumers reference. Per
+        ADR-0004 §scrubber-attachment-point.
+
+        Returns a frozen ProviderStreamPaths with the four absolute
+        paths. The scrubbed paths are appropriate for
+        ProviderResult.stdout_path / stderr_path; the raw paths must
+        never cross any artifact / event / report boundary."""
+        # self._root is already <root>/<run_id> per TraceStore.__init__,
+        # so DO NOT prepend self._run_id again — that would yield
+        # traces/<run_id>/<run_id>/<task_id>/.
+        base = self._root / task_id
+        base.mkdir(parents=True, exist_ok=True)
+        stdout_raw = base / "stdout.raw"
+        stderr_raw = base / "stderr.raw"
+        stdout_scrubbed = base / "stdout.scrubbed"
+        stderr_scrubbed = base / "stderr.scrubbed"
+        # Raw first — forensic boundary per ADR-0004.
+        stdout_raw.write_text(raw_stdout, encoding="utf-8")
+        stderr_raw.write_text(raw_stderr, encoding="utf-8")
+        stdout_scrubbed.write_text(scrubbed_stdout, encoding="utf-8")
+        stderr_scrubbed.write_text(scrubbed_stderr, encoding="utf-8")
+        return ProviderStreamPaths(
+            stdout_raw=stdout_raw,
+            stderr_raw=stderr_raw,
+            stdout_scrubbed=stdout_scrubbed,
+            stderr_scrubbed=stderr_scrubbed,
+        )
