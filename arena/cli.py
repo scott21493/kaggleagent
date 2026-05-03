@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import typer
 from jsonschema import ValidationError
@@ -49,10 +50,19 @@ from arena.sandbox.policy import SandboxPolicy
 from arena.sandbox.runner import SandboxRunner, SandboxViolation
 from arena.schemas.validate import validate as validate_schema
 from arena.scoreboard.store import ScoreboardStore
+from arena.self_improvement.freeze import apply_freeze, evaluate_freeze
+from arena.self_improvement.proposal import (
+    get_next_sip_id,
+    make_self_improvement_proposal,
+    validate_self_improvement_proposal,
+)
+from arena.self_improvement.scan import scan_runs
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
 memory_app = typer.Typer(help="Memory proposal commands.")
 app.add_typer(memory_app, name="memory")
+self_improve_app = typer.Typer(help="Self-improvement scan + freeze commands.")
+app.add_typer(self_improve_app, name="self-improve")
 console = Console()
 
 DB_PATH = Path("scoreboard.sqlite")
@@ -1724,3 +1734,114 @@ def memory_propose(
         f"({proposal['operation']} in {proposal['namespace']}) "
         f"written to {proposal_path}"
     )
+
+
+@self_improve_app.command("scan")
+def self_improve_scan(competition_slug: str) -> None:
+    """Scan all scoreboard rows + traces + baselines for `<slug>` and
+    emit self_improvement_proposal.json artifacts for each finding.
+
+    Deterministic-controller action: NO provider invocation, NO
+    scoreboard row, provider_calls unchanged. If any finding fires,
+    writes SELF_IMPROVEMENT_FROZEN.md sentinel at the repo root.
+
+    Idempotent: re-running against unchanged scoreboard state does not
+    duplicate proposals (content-hash dedup via (kind, sorted
+    evidence_refs)).
+    """
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(
+            f"no run for {competition_slug}; run `arena init-fixture {competition_slug}` first"
+        )
+    store = _store()
+    findings = scan_runs(
+        competition_slug,
+        store=store,
+        runs_root=RUNS_ROOT,
+        baselines_root=RUNS_ROOT / ".baselines",
+        traces_root=TRACES_ROOT,
+    )
+
+    proposals_dir = Path("self_improvement/proposals")
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+
+    # Idempotency: hash existing proposals' (problem, sorted
+    # evidence_refs) and skip new findings that match.
+    existing_hashes: set[str] = set()
+    for existing in proposals_dir.iterdir():
+        if not existing.name.startswith("sip_"):
+            continue
+        try:
+            data = json.loads(existing.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        h = _finding_content_hash(data.get("problem", ""), sorted(data.get("evidence_refs") or []))
+        existing_hashes.add(h)
+
+    new_proposal_paths: list[str] = []
+    for finding in findings:
+        h = _finding_content_hash(finding.problem, sorted(finding.evidence_refs))
+        if h in existing_hashes:
+            continue
+        sip_id = get_next_sip_id(proposals_dir)
+        proposal = make_self_improvement_proposal(finding, proposal_id=sip_id)
+        validate_self_improvement_proposal(proposal)
+        sip_path = proposals_dir / f"{sip_id}.json"
+        sip_path.write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+        new_proposal_paths.append(str(sip_path))
+        existing_hashes.add(h)  # avoid duplicate within this scan
+
+    decision = evaluate_freeze(findings)
+    sentinel_path = Path("SELF_IMPROVEMENT_FROZEN.md")
+    apply_freeze(
+        decision,
+        sentinel_path=sentinel_path,
+        competition_slug=competition_slug,
+    )
+
+    status = "frozen" if decision.frozen else ("findings" if findings else "clean")
+    evidence_strs: list[str] = []
+    for f in findings:
+        evidence_strs.extend(f.evidence_refs)
+
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    payload: dict[str, Any] = {
+        "message": (
+            f"self-improvement scan completed for {competition_slug}: {len(findings)} finding(s)"
+        ),
+        "phase": Phase.SELF_IMPROVEMENT_SCAN_COMPLETED.value,
+        "status": status,
+        "reason": (
+            f"findings_count={len(findings)}; "
+            f"freeze_triggered={'true' if decision.frozen else 'false'}"
+        ),
+        "paths": new_proposal_paths,
+        "evidence": evidence_strs,
+    }
+    if decision.frozen:
+        payload["path"] = str(sentinel_path)
+    trace_store.emit(
+        event_type="self_improvement_scan_completed",
+        severity="warning" if decision.frozen else "info",
+        payload=payload,
+        task_id="self_improvement_scan",
+    )
+
+    console.print(
+        f"[bold]self-improve scan[/bold] {competition_slug}: "
+        f"{len(findings)} finding(s); status={status}"
+    )
+
+
+def _finding_content_hash(problem: str, evidence_refs: list[str]) -> str:
+    """Stable content hash for idempotency: same problem + same
+    evidence refs → same hash → no duplicate proposal."""
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(problem.encode("utf-8"))
+    for ref in evidence_refs:
+        h.update(b"\x00")
+        h.update(ref.encode("utf-8"))
+    return h.hexdigest()
