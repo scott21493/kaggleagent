@@ -96,14 +96,15 @@ def test_memory_propose_inserts_no_scoreboard_row(
     assert after == before
 
 
-def test_memory_propose_no_op_for_review_with_no_required_fixes(
+def test_memory_propose_falls_through_to_follow_up_recommendations_when_required_fixes_empty(
     fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default stub review has decision=accept and required_fixes=[];
-    memory propose falls through to the first follow_up_recommendation
-    (per Task 3's synthesizer fall-through contract,
-    test_synthesize_falls_through_to_follow_up_recommendations_when_required_fixes_empty).
-    The proposal must still be schema-valid and review_status=proposed."""
+    """The default stub review has required_fixes=[] but a NON-EMPTY
+    follow_up_recommendations list. memory propose's synthesizer
+    treats that as actionable (per Task 3's
+    test_synthesize_falls_through_to_follow_up_recommendations_when_required_fixes_empty
+    contract) and lifts recs[0] into the claim. The proposal must
+    still be schema-valid and review_status=proposed."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
     runner = CliRunner()
@@ -118,6 +119,41 @@ def test_memory_propose_no_op_for_review_with_no_required_fixes(
     # text verbatim into payload["claim"].
     assert "pr7" in payload["claim"].lower()
     assert payload["review_status"] == "proposed"
+
+
+def test_memory_propose_emits_no_op_when_review_has_neither_fixes_nor_recommendations(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When BOTH required_fixes AND follow_up_recommendations are
+    empty, the synthesizer's no-op-observation branch fires:
+    claim="No actionable findings from review {review_id}.", confidence
+    and risk both "low". The default stub review has non-empty
+    follow_up_recommendations, so we overwrite the artifact on disk to
+    truly empty both lists before running memory propose. Pins the no-op
+    CLI path that's separate from the actionable fall-through branch.
+    """
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _bootstrap_review(runner)
+
+    # Overwrite the review artifact: empty BOTH actionable lists.
+    rr_path = (
+        fixture_workspace / "worktrees" / "tabular_binary_v1" / "exp_0005" / "research_review.json"
+    )
+    review_payload = json.loads(rr_path.read_text(encoding="utf-8"))
+    review_payload["required_fixes"] = []
+    review_payload["follow_up_recommendations"] = []
+    rr_path.write_text(json.dumps(review_payload), encoding="utf-8")
+
+    result = runner.invoke(app, ["memory", "propose", "tabular_binary_v1", "--review", "exp_0005"])
+    assert result.exit_code == 0, result.output
+    proposal = json.loads(
+        (fixture_workspace / "memory" / "proposals" / "mem_0001.json").read_text(encoding="utf-8")
+    )
+    assert "no actionable findings" in proposal["claim"].lower()
+    assert proposal["confidence"] == "low"
+    assert proposal["risk"] == "low"
 
 
 def test_memory_propose_missing_review_experiment(
