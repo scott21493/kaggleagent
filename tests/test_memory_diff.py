@@ -59,3 +59,41 @@ def test_render_diff_does_not_mutate_wiki(tmp_path: Path) -> None:
     after_hash = hashlib.sha256(wiki.read_bytes()).hexdigest()
     assert before_hash == after_hash
     assert wiki.read_text(encoding="utf-8") == original
+
+
+def test_render_diff_appends_fresh_namespace_when_section_absent(
+    tmp_path: Path,
+) -> None:
+    """If the wiki lacks the proposal's namespace section, render_diff
+    appends a fresh `<namespace>/` section at the end (instead of
+    silently dropping the change). Pins the no-section branch in
+    arena/memory/diff.py."""
+    wiki = tmp_path / "wiki.md"
+    wiki.write_text(
+        "# Memory Wiki\n\ninvariants/\n  Some invariant.\n",
+        encoding="utf-8",
+    )
+    out = render_diff(_proposal(), wiki_path=wiki)
+    # The diff must include a new `research/` section header AND the claim.
+    assert "research/" in out
+    assert "Stack diverse base learners" in out
+
+
+def test_render_diff_modify_replaces_prior_claim_line(tmp_path: Path) -> None:
+    """For operation=modify, render_diff locates the prior_claim
+    substring and replaces that line with the new claim. Pins the
+    modify branch (otherwise dead code in PR6 since the synthesizer
+    only emits add)."""
+    wiki = tmp_path / "wiki.md"
+    wiki.write_text(
+        "# Memory Wiki\n\nresearch/\n  [mem_0001] Old claim.\n",
+        encoding="utf-8",
+    )
+    proposal = _proposal()
+    proposal["operation"] = "modify"
+    proposal["claim"] = "New claim text."
+    proposal["prior_claim"] = "Old claim."
+    out = render_diff(proposal, wiki_path=wiki)
+    assert "New claim text" in out
+    # The diff must SHOW the old line being removed (with `-` prefix in unified diff).
+    assert "-  [mem_0001] Old claim." in out

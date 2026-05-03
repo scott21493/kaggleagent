@@ -62,6 +62,20 @@ def test_synthesize_evidence_points_to_review() -> None:
     assert proposal["evidence"][0]["ref"] == "rr_0001"
 
 
+def test_synthesize_falls_through_to_follow_up_recommendations_when_required_fixes_empty() -> None:
+    """A review with empty required_fixes but non-empty
+    follow_up_recommendations is still actionable — the synthesizer
+    falls through to recs[0] as the claim. Pins the OR-branch in the
+    actionable predicate."""
+    review = _review_payload(required_fixes=[])
+    review["follow_up_recommendations"] = ["Re-run with PR7's real Codex once available."]
+    proposal = synthesize_memory_proposal(review, proposal_id="mem_0001")
+    validate_memory_update(proposal)
+    assert "Re-run with PR7" in proposal["claim"]
+    # Not the empty-review no-op observation — the actionable path is taken.
+    assert "no actionable findings" not in proposal["claim"].lower()
+
+
 def test_synthesize_namespace_defaults_to_research() -> None:
     review = _review_payload()
     proposal = synthesize_memory_proposal(review, proposal_id="mem_0001")
@@ -85,3 +99,18 @@ def test_get_next_proposal_id_monotonic(tmp_path: Path) -> None:
     (proposals_dir / "mem_0002.json").write_text("{}", encoding="utf-8")
     (proposals_dir / "mem_0009.json").write_text("{}", encoding="utf-8")
     assert get_next_proposal_id(proposals_dir) == "mem_0010"
+
+
+def test_get_next_proposal_id_ignores_non_matching_files(tmp_path: Path) -> None:
+    """The regex `^mem_<digits>.json$` rejects stray files (README.md,
+    .gitkeep, mem_0007.json.bak, etc.) so the proposals directory can
+    safely contain unrelated artifacts without skewing the counter."""
+    proposals_dir = tmp_path / "memory" / "proposals"
+    proposals_dir.mkdir(parents=True)
+    (proposals_dir / "README.md").write_text("noise", encoding="utf-8")
+    (proposals_dir / ".gitkeep").write_text("", encoding="utf-8")
+    (proposals_dir / "mem_0007.json.bak").write_text("{}", encoding="utf-8")
+    (proposals_dir / "memo_0042.json").write_text("{}", encoding="utf-8")
+    assert get_next_proposal_id(proposals_dir) == "mem_0001"
+    (proposals_dir / "mem_0001.json").write_text("{}", encoding="utf-8")
+    assert get_next_proposal_id(proposals_dir) == "mem_0002"

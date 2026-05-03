@@ -8,6 +8,9 @@ from typing import Any
 from arena.schemas.validate import validate
 
 _PROPOSAL_ID_RE = re.compile(r"^mem_(\d+)\.json$")
+# Indirection so PR7+ can decouple confidence from risk if needed
+# (e.g., risk=high → confidence=low because we're less certain about
+# high-risk claims). For Phase 0 this is the identity mapping.
 _CONFIDENCE_BY_RISK = {"low": "low", "medium": "medium", "high": "high"}
 
 
@@ -22,7 +25,14 @@ def synthesize_memory_proposal(
 
     If the review has actionable content (required_fixes non-empty or
     follow_up_recommendations non-empty), build an `add` op claiming
-    the first actionable item. Otherwise emit a no-op observation.
+    the first actionable item — `required_fixes[0]` if non-empty,
+    otherwise `follow_up_recommendations[0]`. Otherwise emit a no-op
+    observation that's still schema-valid (audit trail).
+
+    Phase 0 always emits `operation="add"` — the synthesizer never
+    produces modify/deprecate/remove. Those operations are reserved
+    for human-authored proposals (or PR7+ flows) and would round-trip
+    through the same schema + check_evidence semantic checks.
 
     Phase 0: namespace is always "research" (PR6 reviews are
     research-proxy outputs). PR7+ may derive from review subject type.

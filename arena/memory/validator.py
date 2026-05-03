@@ -12,6 +12,12 @@ def check_evidence(proposal: dict[str, Any]) -> list[str]:
 
     Returns a list of issue strings; empty list means valid.
 
+    NOTE: this is a SEMANTIC check only; structural/schema validation
+    lives in arena.memory.proposal.validate_memory_update. Callers must
+    run BOTH (schema first, then semantic) to fully validate a proposal
+    — a proposal can be schema-valid but semantically a no-op (e.g., a
+    modify with claim == prior_claim).
+
     Checks:
     - operation in {modify, deprecate, remove} requires non-empty
       prior_claim.
