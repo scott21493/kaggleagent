@@ -40,12 +40,8 @@ def compare_metrics(champion: Metrics, challenger: Metrics) -> ComparisonResult:
     - challenger.provider_calls > 1.20 * champion.provider_calls without score gain
     - challenger.waste_events > champion.waste_events
     """
-    # Round float deltas to 10 decimal places to avoid IEEE-754 artifacts
-    # surfacing in stored/serialized comparisons (e.g. 0.6 - 0.5 ==
-    # 0.09999999999999998). 1e-10 is far below any real signal we care
-    # about for ROC-AUC / wall_seconds.
-    score_delta = round(challenger.score - champion.score, 10)
-    wall_delta = round(challenger.wall_seconds - champion.wall_seconds, 10)
+    score_delta = challenger.score - champion.score
+    wall_delta = challenger.wall_seconds - champion.wall_seconds
     pc_delta = challenger.provider_calls - champion.provider_calls
     waste_delta = challenger.waste_events - champion.waste_events
 
