@@ -12,6 +12,12 @@ from arena.schemas.validate import validate
 
 _VERSION = "stub_claude.v1"
 
+# PR6 stub review defaults — monkey-patchable by tests for rejection
+# paths. Not exposed in the schema; just stub knobs.
+_RESEARCH_REVIEW_DEFAULT_DECISION = "accept"
+_RESEARCH_REVIEW_DEFAULT_RISK_LEVEL = "low"
+_RESEARCH_REVIEW_DEFAULT_REQUIRED_FIXES: list[str] = []
+
 
 class StubClaudeProvider(ProviderAdapter):
     """Deterministic stand-in for Claude during Phase 0 CI and local stub runs.
@@ -20,7 +26,11 @@ class StubClaudeProvider(ProviderAdapter):
     to dispatch on (role, phase): research_proxy + (RESEARCH_QUESTION_CREATED,
     METHOD_DIGEST_CREATED, FUSION_PROPOSAL_CREATED) phases write a
     schema-valid JSON artifact. PR6 extends with role=review +
-    MEMORY_PROPOSAL_CREATED.
+    FUSION_PROXY_REVIEWED, which emits research_review.json. (The
+    MEMORY_PROPOSAL_CREATED phase exists in the Phase enum, but PR6's
+    arena memory propose is a controller-only action — no provider
+    invocation, no stub_claude dispatch — so this provider does NOT
+    handle that phase.)
 
     Optional fields exercise observability: failed_commands is a list of
     (command_str, exit_code) pairs that the stub emits as
@@ -73,17 +83,21 @@ class StubClaudeProvider(ProviderAdapter):
         stdout_path.write_text("", encoding="utf-8")
         stderr_path.write_text("", encoding="utf-8")
 
-        # PR5 dispatch: research_proxy role + creation phases write a
+        # PR5+PR6 dispatch: research_proxy + review roles emit a
         # schema-valid artifact under the workspace.
         artifacts: list[str] = []
         role = task_packet["role"]
         phase = task_packet["phase"]
+        payload: dict[str, Any] | None = None
+        artifact_name: str | None = None
         if role == "research_proxy":
             payload, artifact_name = self._research_proxy_payload(slug, phase)
-            if payload is not None and artifact_name is not None:
-                artifact_path = workspace / artifact_name
-                artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                artifacts.append(str(artifact_path))
+        elif role == "review":
+            payload, artifact_name = self._review_payload(slug, phase, task_packet["inputs"])
+        if payload is not None and artifact_name is not None:
+            artifact_path = workspace / artifact_name
+            artifact_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            artifacts.append(str(artifact_path))
 
         now = datetime.now(UTC).isoformat(timespec="seconds")
         return build_result(
@@ -325,4 +339,76 @@ class StubClaudeProvider(ProviderAdapter):
                 "fixtures/tabular_binary_v1/paper_bundle/method_note_001.md",
                 "fixtures/tabular_binary_v1/paper_bundle/method_note_002.md",
             ],
+        }
+
+    def _review_payload(
+        self, slug: str, phase: str, inputs: list[str]
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Return (payload, artifact_name) for the review phase, or
+        (None, None) if the phase doesn't require artifact emission.
+
+        The CLI passes the implementation row's submission.csv path as
+        inputs[0]; we extract subject_id from its worktree path segment
+        (`worktrees/<slug>/<exp>/submission.csv` → `<exp>`) the same way
+        stub_codex extracts fusion_id from inputs[0] in PR5 Task 4.
+        """
+        if phase != "FUSION_PROXY_REVIEWED":
+            return None, None
+        subject_id = self._read_subject_id_from_inputs(inputs)
+        if subject_id is None:
+            return None, None
+        return self._research_review_payload(slug, subject_id), "research_review.json"
+
+    def _read_subject_id_from_inputs(self, inputs: list[str]) -> str | None:
+        """Find the first input whose path matches
+        `worktrees/<slug>/<exp_id>/submission.csv` and return <exp_id>.
+        Returns None if no matching input exists or the path shape is
+        unexpected.
+
+        Assumes the Phase-0 CLI contract: input is a RELATIVE path of
+        the form `worktrees/<slug>/<exp>/submission.csv` (Path.parts
+        normalizes both forward- and back-slashes, so this works on
+        Windows). Absolute paths and paths with `..` traversal segments
+        produce parts whose [-4] element is not literally `"worktrees"`,
+        and silently yield None. The CLI in PR6 Task 2 always passes
+        relative paths from the scoreboard's artifact_paths column, so
+        the silent-None branch is unreachable in practice.
+        """
+        for input_path in inputs:
+            if not input_path.endswith("submission.csv"):
+                continue
+            parts = Path(input_path).parts
+            # Expect ("worktrees", slug, exp_id, "submission.csv")
+            if len(parts) >= 4 and parts[-4] == "worktrees":
+                exp_id = parts[-2]
+                if exp_id.startswith("exp_"):
+                    return exp_id
+        return None
+
+    def _research_review_payload(self, slug: str, subject_id: str) -> dict[str, Any]:
+        return {
+            "schema_version": "research_review.v1",
+            "review_id": "rr_0001",
+            "competition_slug": slug,
+            "subject_id": subject_id,
+            "decision": _RESEARCH_REVIEW_DEFAULT_DECISION,
+            "summary": (
+                f"Reviewed proxy implementation {subject_id} against the "
+                "monotonic-GBDT + stacked-LR fusion. Submission.csv is "
+                "schema-valid; pipeline integrity confirmed."
+            ),
+            "strengths": [
+                "Submission shape matches sample_submission.csv columns.",
+                "Proxy implementation completed within budget caps.",
+            ],
+            "weaknesses": [
+                "Phase-0 stub produces a constant 0.5 baseline; "
+                "no signal extracted from the fusion proposal.",
+            ],
+            "required_fixes": list(_RESEARCH_REVIEW_DEFAULT_REQUIRED_FIXES),
+            "follow_up_recommendations": [
+                "After PR7's real Codex lands, re-run with the same fusion "
+                "and compare ROC-AUC against the calibration baseline.",
+            ],
+            "risk_level": _RESEARCH_REVIEW_DEFAULT_RISK_LEVEL,
         }

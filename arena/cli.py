@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import typer
+from jsonschema import ValidationError
 from rich.console import Console
 
 from arena.budget.governor import BudgetExceeded, BudgetGovernor, RunAccumulators
@@ -17,6 +20,11 @@ from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import compute_fixture_set_digest, validate_fixture_manifest
+from arena.memory.proposal import (
+    get_next_proposal_id,
+    synthesize_memory_proposal,
+    validate_memory_update,
+)
 from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
@@ -38,12 +46,24 @@ from arena.research_proxy.method_digest import (
     validate_paper_digest,
 )
 from arena.research_proxy.question_generator import make_research_question_packet
+from arena.review.packet import make_review_packet, validate_research_review
 from arena.sandbox.policy import SandboxPolicy
 from arena.sandbox.runner import SandboxRunner, SandboxViolation
 from arena.schemas.validate import validate as validate_schema
 from arena.scoreboard.store import ScoreboardStore
+from arena.self_improvement.freeze import apply_freeze, evaluate_freeze
+from arena.self_improvement.proposal import (
+    get_next_sip_id,
+    make_self_improvement_proposal,
+    validate_self_improvement_proposal,
+)
+from arena.self_improvement.scan import scan_runs
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
+memory_app = typer.Typer(help="Memory proposal commands.")
+app.add_typer(memory_app, name="memory")
+self_improve_app = typer.Typer(help="Self-improvement scan + freeze commands.")
+app.add_typer(self_improve_app, name="self-improve")
 console = Console()
 
 DB_PATH = Path("scoreboard.sqlite")
@@ -73,7 +93,21 @@ def _store() -> ScoreboardStore:
 
 
 def _new_run_id() -> str:
-    return "run_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    """Mint a fresh run_id with microsecond precision.
+
+    Two consecutive `arena init-fixture` calls in the same wall-second
+    used to produce identical run_ids, causing the second `insert_run`
+    to fail on the runs.run_id PRIMARY KEY constraint. Tests that
+    exercise multi-run scenarios (e.g., the cross-run linkage regression
+    in tests/test_cli_review.py) had to sleep ≥1s between init-fixtures
+    to dodge the collision.
+
+    Microsecond precision (%f → 6-digit microseconds) makes the run_id
+    monotonically unique under any reasonable invocation rate. Lex sort
+    over `runs/run_*` directories still works because microseconds
+    preserve ordering within the same second.
+    """
+    return "run_" + datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
 
 
 def _latest_run_id() -> str | None:
@@ -1194,6 +1228,349 @@ def research_proxy(
         raise typer.Exit(code=2) from exc
 
 
+@app.command("review")
+def review(
+    competition_slug: str,
+    provider: str = typer.Option(
+        "stub_claude",
+        "--provider",
+        help="Provider to use for the review step. PR6 supports only stub_claude.",
+    ),
+    experiment: str = typer.Option(
+        ...,
+        "--experiment",
+        help="experiment_id of the research-proxy implementation row to review.",
+    ),
+) -> None:
+    """Run §6.2 step 9 (Claude review) against a previously-completed
+    research-proxy implementation row.
+
+    Resolves the impl row from the scoreboard, extracts its
+    <fusion_id:...> token + submission.csv artifact, locates the
+    originating fusion_proposal.json, and invokes stub_claude with
+    role="review" + phase="FUSION_PROXY_REVIEWED" to emit a
+    research_review.json artifact.
+
+    Persists ONE scoreboard row (experiment_type="research_proxy",
+    <step:review> token in artifact_paths). Mirrors arena run-next /
+    arena research-proxy's pre-invoke vs post-invoke discipline:
+    KillSwitchActive / pre-invoke ProviderCallBreaker / fixture-digest
+    drift = no row; post-invoke BudgetExceeded with usage_proxy =
+    blocked row WITH consumed usage threaded through.
+    """
+    if provider not in {"stub_claude"}:
+        raise typer.BadParameter(
+            f"unknown review provider {provider!r}; PR6 supports only stub_claude"
+        )
+
+    store = _store()
+
+    # Resolve the impl row + its run_id FIRST. The review row must be
+    # attached to the SAME run as the impl row (not _latest_run_id()),
+    # otherwise a second `arena init-fixture` followed by `arena review
+    # --experiment exp_0004` would attach the review to the new run
+    # while reading impl artifacts from the old one. The fusion_token
+    # is also deterministic (fusion_0001) across runs, so the fusion
+    # lookup MUST also filter by run_id to avoid cross-run linkage.
+    impl_row = (
+        store._require_conn()
+        .execute(
+            "SELECT experiment_id, run_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND experiment_id = ?",
+            (competition_slug, experiment),
+        )
+        .fetchone()
+    )
+    if impl_row is None:
+        raise typer.BadParameter(f"experiment {experiment} not found for {competition_slug}")
+    run_id = impl_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(f"experiment {experiment} has no run_id (corrupt scoreboard?)")
+    impl_paths: list[str] = json.loads(impl_row["artifact_paths"])
+
+    fusion_token = next(
+        (p for p in impl_paths if p.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
+        None,
+    )
+    if fusion_token is None:
+        raise typer.BadParameter(
+            f"experiment {experiment} is not a research-proxy implementation "
+            f"row (no <{FUSION_ID_TAG_PREFIX}:...> token in artifact_paths)"
+        )
+    fusion_id = fusion_token[len(f"<{FUSION_ID_TAG_PREFIX}:") : -1]
+
+    submission_path = next(
+        (p for p in impl_paths if p.endswith("submission.csv")),
+        None,
+    )
+    if submission_path is None:
+        raise typer.BadParameter(f"experiment {experiment} has no submission.csv in artifact_paths")
+
+    # Find the fusion row whose artifact_paths contains the same fusion_token
+    # AND has the <step:fusion> marker AND lives in the SAME run as the
+    # impl row. fusion_token is deterministic across runs (fusion_0001),
+    # so without the run_id filter we could match a different run's row.
+    fusion_row = (
+        store._require_conn()
+        .execute(
+            "SELECT experiment_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND run_id = ? "
+            "AND artifact_paths LIKE ? AND artifact_paths LIKE ?",
+            # Anchor LIKE to the JSON-list quoting (`"<token>"`) so a
+            # future debug/blocked artifact_paths value that happens to
+            # embed `<step:fusion>` as a substring (e.g., inside a
+            # message token) cannot false-positive. artifact_paths is
+            # JSON-encoded by ScoreboardStore.insert_experiment, so the
+            # token always appears with surrounding double-quotes.
+            (
+                competition_slug,
+                run_id,
+                f'%"{fusion_token}"%',
+                '%"<step:fusion>"%',
+            ),
+        )
+        .fetchone()
+    )
+    if fusion_row is None:
+        raise typer.BadParameter(
+            f"could not locate originating fusion_proposal.json for "
+            f"{fusion_id} (corrupt scoreboard?)"
+        )
+    fusion_paths: list[str] = json.loads(fusion_row["artifact_paths"])
+    fusion_proposal_path = next(
+        (p for p in fusion_paths if p.endswith("fusion_proposal.json")),
+        None,
+    )
+    if fusion_proposal_path is None:
+        raise typer.BadParameter(
+            f"fusion row {fusion_row['experiment_id']} has no "
+            "fusion_proposal.json in artifact_paths (corrupt scoreboard?)"
+        )
+
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    review_adapter = _get_provider(provider, event_emitter=trace_store)
+
+    # PR4 reproducibility precheck — same shape as arena research-proxy.
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / competition_slug)
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=competition_slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {competition_slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {competition_slug}: {exc}"
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    if drifted_from_fixture:
+        message = (
+            f"fixture digest drift for {competition_slug}: "
+            f"was {drifted_from_fixture}, now {fixture_hash}"
+        )
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    trace_store.emit(
+        event_type="run_started",
+        severity="info",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value,
+        },
+    )
+
+    try:
+        _is_new_review, drifted_from_review = record_provider_version(
+            competition_slug=competition_slug,
+            provider=review_adapter.name,
+            version=review_adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        message = f"provider version baseline corrupt for {competition_slug}: {exc}"
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_review else "info",
+        payload={
+            "provider": review_adapter.name,
+            "provider_version": review_adapter.version,
+            "previous_hash": drifted_from_review or "",
+        },
+    )
+
+    review_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_review}>"
+        if drifted_from_review
+        else None
+    )
+    review_drift_extras = [review_drift_tag] if review_drift_tag else []
+
+    # Seed governor accumulators from prior usage on this run.
+    totals = store.get_run_usage_totals(competition_slug, run_id)
+    accumulators = RunAccumulators(
+        provider_calls=int(totals["provider_calls"]),
+        codex_calls=int(totals["codex_calls"]),
+        claude_calls=int(totals["claude_calls"]),
+        wall_seconds=float(totals["wall_seconds"]),
+        input_chars=int(totals["input_chars"]),
+        output_chars=int(totals["output_chars"]),
+        waste_events=int(totals["waste_events"]),
+    )
+    governor = BudgetGovernor(Phase0HardCeilings.from_env(), accumulators=accumulators)
+    watchdog = Watchdog(governor=governor)
+
+    rev_exp = store.get_next_experiment_id(competition_slug)
+    rev_task = rev_exp.replace("exp_", "task_")
+    create_workspace(WORKTREE_ROOT, competition_slug, rev_exp)
+
+    rev_packet = make_review_packet(
+        competition_slug=competition_slug,
+        run_id=run_id,
+        experiment_id=rev_exp,
+        task_id=rev_task,
+        review_id="rr_0001",
+        subject_experiment_id=experiment,
+        fusion_proposal_path=fusion_proposal_path,
+        submission_path=submission_path,
+    )
+
+    in_flight: dict[str, str | bool | None] = {
+        "experiment_id": rev_exp,
+        "task_id": rev_task,
+        "step": "review",
+        "adapter_name": review_adapter.name,
+        "adapter_version": review_adapter.version,
+        "invocation_started": False,
+    }
+
+    def _persist_review_row(
+        *,
+        experiment_id: str,
+        task_id: str,
+        experiment_type: str,
+        adapter_name: str,
+        adapter_version: str,
+        status: str,
+        artifact_paths: list[str],
+        usage_proxy: UsageProxy | None,
+        score: float | None = None,
+        valid_submission: bool | None = None,
+    ) -> None:
+        store.insert_experiment(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            competition_slug=competition_slug,
+            task_id=task_id,
+            experiment_type=experiment_type,
+            provider=adapter_name,
+            provider_version=adapter_version,
+            status=status,
+            metric_name="roc_auc",
+            valid_submission=valid_submission,
+            artifact_paths=artifact_paths,
+            trace_path=None,
+            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            input_chars=int(usage_proxy["input_chars"]) if usage_proxy else 0,
+            output_chars=int(usage_proxy["output_chars"]) if usage_proxy else 0,
+            wall_seconds=float(usage_proxy["wall_seconds"]) if usage_proxy else 0.0,
+            shell_commands=int(usage_proxy["shell_commands"]) if usage_proxy else 0,
+            failed_commands=int(usage_proxy["failed_commands"]) if usage_proxy else 0,
+            waste_events=int(usage_proxy["waste_events"]) if usage_proxy else 0,
+        )
+        if score is not None:
+            store.update_experiment_score(experiment_id, score=score)
+
+    try:
+        per_step_sandbox = SandboxRunner(
+            SandboxPolicy.from_packet(rev_packet, workspace_root=Path.cwd())
+        )
+        watchdog.check_can_invoke(review_adapter.name)
+        in_flight["invocation_started"] = True
+        rev_result = watchdog.wrap_invoke(
+            review_adapter,
+            rev_packet,
+            sandbox=per_step_sandbox,
+            event_emitter=trace_store,
+        )
+        rev_artifact = _require_artifact(
+            rev_result.artifacts,
+            suffix="research_review.json",
+            step_label="review",
+            provider_name=review_adapter.name,
+        )
+        rev_payload = json.loads(Path(rev_artifact).read_text(encoding="utf-8"))
+        validate_research_review(rev_payload)
+
+        _persist_review_row(
+            experiment_id=rev_exp,
+            task_id=rev_task,
+            experiment_type="research_proxy",
+            adapter_name=review_adapter.name,
+            adapter_version=review_adapter.version,
+            status="completed",
+            artifact_paths=["<step:review>", rev_artifact, *review_drift_extras],
+            usage_proxy=rev_result.usage_proxy,
+        )
+        trace_store.emit(
+            event_type="review_recorded",
+            severity="info",
+            task_id=rev_task,
+            payload={
+                "review_id": rev_payload["review_id"],
+                "experiment_id": rev_exp,
+                # status is the row state ("completed"), consistent with
+                # how score_recorded uses status for valid/invalid. The
+                # review's decision (accept/revise/...) goes in `reason`
+                # so a single observability consumer reading payload.status
+                # sees one vocabulary across event types.
+                "status": "completed",
+                "reason": f"decision={rev_payload['decision']}",
+                "path": rev_artifact,
+            },
+        )
+        console.print(
+            f"[bold green]review complete[/bold green] — review_id="
+            f"{rev_payload['review_id']} decision={rev_payload['decision']}"
+        )
+    except KillSwitchActive as exc:
+        console.print(f"[red]kill switch active: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except BudgetExceeded as exc:
+        if in_flight["invocation_started"]:
+            _persist_inflight_blocked(
+                _persist_review_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=exc.usage_proxy,
+            )
+        console.print(f"[red]budget exceeded ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except SandboxViolation as exc:
+        if in_flight["invocation_started"]:
+            _persist_inflight_blocked(
+                _persist_review_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=None,
+            )
+        console.print(f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
 def _require_artifact(
     artifacts: list[str], *, suffix: str, step_label: str, provider_name: str
 ) -> str:
@@ -1256,3 +1633,231 @@ def _persist_inflight_blocked(
         ],
         usage_proxy=usage_proxy,
     )
+
+
+@memory_app.command("propose")
+def memory_propose(
+    competition_slug: str,
+    review: str = typer.Option(
+        ...,
+        "--review",
+        help="experiment_id of the review row whose research_review.json "
+        "drives the synthesized memory proposal.",
+    ),
+) -> None:
+    """Synthesize a memory_update.json proposal from a review row.
+
+    Deterministic-controller action: NO provider invocation, NO
+    scoreboard row, provider_calls unchanged. Output is a durable
+    artifact at memory/proposals/mem_NNNN.json plus a
+    memory_proposal_created trace event whose payload uses ONLY keys
+    permitted by schemas/event.schema.json.
+    """
+    store = _store()
+
+    # Resolve the review row + its run_id FIRST. The trace event's
+    # run_id MUST be the review row's own run, not _latest_run_id().
+    # Memory proposals don't create scoreboard rows, so the
+    # memory_proposal_created trace event is the durable linkage between
+    # the proposal artifact and the review experiment that drove it.
+    # Mirrors the same fix applied to `arena review` for cross-run
+    # linkage.
+    review_row = (
+        store._require_conn()
+        .execute(
+            "SELECT run_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND experiment_id = ?",
+            (competition_slug, review),
+        )
+        .fetchone()
+    )
+    if review_row is None:
+        raise typer.BadParameter(f"experiment {review} not found for {competition_slug}")
+    run_id = review_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(f"experiment {review} has no run_id (corrupt scoreboard?)")
+    review_paths: list[str] = json.loads(review_row["artifact_paths"])
+    if "<step:review>" not in review_paths:
+        raise typer.BadParameter(
+            f"experiment {review} is not a review row (no <step:review> token in artifact_paths)"
+        )
+    research_review_path = next(
+        (p for p in review_paths if p.endswith("research_review.json")),
+        None,
+    )
+    if research_review_path is None:
+        raise typer.BadParameter(
+            f"review row {review} has no research_review.json in "
+            "artifact_paths (corrupt scoreboard?)"
+        )
+
+    try:
+        review_payload = json.loads(Path(research_review_path).read_text(encoding="utf-8"))
+        validate_schema("research_review", review_payload)
+    except (json.JSONDecodeError, FileNotFoundError) as exc:
+        raise typer.BadParameter(
+            f"failed to read research_review.json at {research_review_path}: {exc}"
+        ) from exc
+    except ValidationError as exc:
+        # Schema-invalid research_review.json: surface as a clean
+        # BadParameter rather than letting the ValidationError escape
+        # as an unhandled exception.
+        raise typer.BadParameter(
+            f"research_review.json at {research_review_path} is schema-invalid: {exc.message}"
+        ) from exc
+
+    proposals_dir = Path("memory/proposals")
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+    proposal_id = get_next_proposal_id(proposals_dir)
+    proposal = synthesize_memory_proposal(review_payload, proposal_id=proposal_id)
+    validate_memory_update(proposal)
+    proposal_path = proposals_dir / f"{proposal_id}.json"
+    proposal_path.write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+
+    # Emit trace event with ONLY event.schema.json-permitted keys.
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    trace_store.emit(
+        event_type="memory_proposal_created",
+        severity="info",
+        payload={
+            "message": f"memory proposal {proposal_id} synthesized from review {review}",
+            "phase": Phase.MEMORY_PROPOSAL_CREATED.value,
+            "proposal_id": proposal_id,
+            "memory_update_id": proposal_id,
+            "experiment_id": review,
+            "review_id": review_payload["review_id"],
+            "path": str(proposal_path),
+            "paths": [research_review_path],
+        },
+    )
+    console.print(
+        f"[green]memory proposal[/green] {proposal_id} "
+        f"({proposal['operation']} in {proposal['namespace']}) "
+        f"written to {proposal_path}"
+    )
+
+
+@self_improve_app.command("scan")
+def self_improve_scan(competition_slug: str) -> None:
+    """Scan all scoreboard rows + traces + baselines for `<slug>` and
+    emit self_improvement_proposal.json artifacts for each finding.
+
+    Deterministic-controller action: NO provider invocation, NO
+    scoreboard row, provider_calls unchanged. If any finding fires,
+    writes SELF_IMPROVEMENT_FROZEN.md sentinel at the repo root.
+
+    Idempotent: re-running against unchanged scoreboard state does not
+    duplicate proposals (content-hash dedup via (problem, sorted
+    evidence_refs); the same key the helper builds at the bottom of
+    this module).
+    """
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(
+            f"no run for {competition_slug}; run `arena init-fixture {competition_slug}` first"
+        )
+    store = _store()
+    findings = scan_runs(
+        competition_slug,
+        store=store,
+        runs_root=RUNS_ROOT,
+        baselines_root=RUNS_ROOT / ".baselines",
+        traces_root=TRACES_ROOT,
+    )
+
+    proposals_dir = Path("self_improvement/proposals")
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+
+    # Idempotency: hash existing proposals' (problem, sorted
+    # evidence_refs) and skip new findings that match.
+    existing_hashes: set[str] = set()
+    for existing in proposals_dir.iterdir():
+        if not existing.name.startswith("sip_"):
+            continue
+        try:
+            data = json.loads(existing.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        h = _finding_content_hash(data.get("problem", ""), sorted(data.get("evidence_refs") or []))
+        existing_hashes.add(h)
+
+    new_proposal_paths: list[str] = []
+    for finding in findings:
+        # Mirror make_self_improvement_proposal's empty-evidence fallback
+        # (proposal.py: list(finding.evidence_refs) or [f"finding:{kind}"])
+        # so the dedup hash matches what's persisted on disk. Without
+        # this, a Finding with empty evidence_refs would hash to
+        # sorted([]) on first scan but the persisted proposal stores
+        # ["finding:<kind>"], making the second-scan hash differ and
+        # producing a duplicate sip_NNNN.json. No current Finding kind
+        # produces empty evidence_refs, but pin the invariant here.
+        refs = sorted(finding.evidence_refs) or [f"finding:{finding.kind}"]
+        h = _finding_content_hash(finding.problem, refs)
+        if h in existing_hashes:
+            continue
+        sip_id = get_next_sip_id(proposals_dir)
+        proposal = make_self_improvement_proposal(finding, proposal_id=sip_id)
+        validate_self_improvement_proposal(proposal)
+        sip_path = proposals_dir / f"{sip_id}.json"
+        sip_path.write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+        new_proposal_paths.append(str(sip_path))
+        existing_hashes.add(h)  # avoid duplicate within this scan
+
+    decision = evaluate_freeze(findings)
+    sentinel_path = Path("SELF_IMPROVEMENT_FROZEN.md")
+    apply_freeze(
+        decision,
+        sentinel_path=sentinel_path,
+        competition_slug=competition_slug,
+    )
+
+    status = "frozen" if decision.frozen else ("findings" if findings else "clean")
+    evidence_strs: list[str] = []
+    for f in findings:
+        evidence_strs.extend(f.evidence_refs)
+
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    payload: dict[str, Any] = {
+        "message": (
+            f"self-improvement scan completed for {competition_slug}: {len(findings)} finding(s)"
+        ),
+        "phase": Phase.SELF_IMPROVEMENT_SCAN_COMPLETED.value,
+        "status": status,
+        "reason": (
+            f"findings_count={len(findings)}; "
+            f"freeze_triggered={'true' if decision.frozen else 'false'}"
+        ),
+        "paths": new_proposal_paths,
+        "evidence": evidence_strs,
+    }
+    if decision.frozen:
+        payload["path"] = str(sentinel_path)
+    # task_id="self_improvement_scan" routes the event to
+    # traces/<run_id>/self_improvement_scan/events.jsonl rather than
+    # the run-level traces/<run_id>/run.jsonl. Replay tooling that
+    # rglob's events.jsonl picks it up; grouping the controller-action
+    # event under a pseudo-task name keeps the per-scan history
+    # together for ops review. (memory propose still routes to
+    # run.jsonl by design — that command can fire many times per run.)
+    trace_store.emit(
+        event_type="self_improvement_scan_completed",
+        severity="warning" if decision.frozen else "info",
+        payload=payload,
+        task_id="self_improvement_scan",
+    )
+
+    console.print(
+        f"[bold]self-improve scan[/bold] {competition_slug}: "
+        f"{len(findings)} finding(s); status={status}"
+    )
+
+
+def _finding_content_hash(problem: str, evidence_refs: list[str]) -> str:
+    """Stable content hash for idempotency: same problem + same
+    evidence refs → same hash → no duplicate proposal."""
+    h = hashlib.sha256()
+    h.update(problem.encode("utf-8"))
+    for ref in evidence_refs:
+        h.update(b"\x00")
+        h.update(ref.encode("utf-8"))
+    return h.hexdigest()

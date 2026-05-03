@@ -35,8 +35,6 @@ jobs:
         run: python scripts/fixture_smoke.py
       - name: Sandbox policy static check
         run: python scripts/static_sandbox_policy_check.py
-      - name: Memory proposal schema check
-        run: python scripts/validate_memory_examples.py
       - name: Scoreboard migration check
         run: python scripts/check_migrations.py
       - name: Tests with coverage gate

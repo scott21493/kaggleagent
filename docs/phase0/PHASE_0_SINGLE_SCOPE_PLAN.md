@@ -137,16 +137,17 @@ A clean clone must support:
 arena doctor
 arena init-fixture tabular_binary_v1
 arena plan tabular_binary_v1
-arena run-next tabular_binary_v1 --provider stub_codex
-arena review tabular_binary_v1 --provider stub_claude --experiment exp_0001
-arena research-proxy tabular_binary_v1 --provider stub_claude
-arena run-next tabular_binary_v1 --provider stub_codex
+arena run-next tabular_binary_v1 --provider stub_codex                          # creates calibration row exp_0001
+arena research-proxy tabular_binary_v1 --provider stub_claude                   # creates research-proxy rows exp_0002..exp_0005 (impl = exp_0005)
 arena evaluate tabular_binary_v1 --latest
-arena memory propose tabular_binary_v1
+arena review tabular_binary_v1 --provider stub_claude --experiment exp_0005     # reviews the research-proxy impl row; creates review row exp_0006
+arena memory propose tabular_binary_v1 --review exp_0006                        # synthesizes a memory_update.json from the review row
 arena self-improve scan tabular_binary_v1
 arena report tabular_binary_v1
 arena eval-harness tabular_binary_v1 --providers stub
 ```
+
+`arena review` requires `--experiment <impl_exp_id>` (the research-proxy implementation row to review), so it MUST run after `arena research-proxy`. `arena memory propose` requires `--review <review_exp_id>` (the row that `arena review` produced), so it runs after `arena review`. The exact exp_NNNN values depend on row ordering inside the run; use `arena report <slug>` to look up the ids on a real run.
 
 The real-provider version is optional for Phase 0 acceptance but should work on a configured local machine:
 
@@ -154,8 +155,8 @@ The real-provider version is optional for Phase 0 acceptance but should work on 
 arena provider health codex
 arena provider health claude
 arena run-next tabular_binary_v1 --provider codex
-arena review tabular_binary_v1 --provider claude --experiment exp_0001
 arena research-proxy tabular_binary_v1 --provider claude
+arena review tabular_binary_v1 --provider claude --experiment <impl_exp_id>
 ```
 
 ### 2.3 Quality target
@@ -476,7 +477,7 @@ arena run-next <competition_slug> [--provider <provider>]
 arena review <competition_slug> --experiment <experiment_id> [--provider <provider>]
 arena research-proxy <competition_slug> [--provider <provider>]
 arena evaluate <competition_slug> --latest
-arena memory propose <competition_slug>
+arena memory propose <competition_slug> --review <review_experiment_id>
 arena self-improve scan <competition_slug>
 arena report <competition_slug>
 arena eval-harness <competition_slug> --providers stub|real
