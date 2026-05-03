@@ -79,6 +79,74 @@ def test_render_diff_appends_fresh_namespace_when_section_absent(
     assert "Stack diverse base learners" in out
 
 
+def test_render_diff_modify_only_edits_within_namespace_section(
+    tmp_path: Path,
+) -> None:
+    """A research/ modify proposal whose prior_claim text ALSO appears
+    in the invariants/ section earlier in the wiki must edit ONLY the
+    research section's line. A naive substring-on-the-whole-wiki
+    search would silently edit the invariants line because it appears
+    first. P2 regression — caught by reviewer.
+    """
+    wiki = tmp_path / "wiki.md"
+    wiki.write_text(
+        "# Memory Wiki\n\ninvariants/\n  Shared claim text.\nresearch/\n  Shared claim text.\n",
+        encoding="utf-8",
+    )
+    proposal = _proposal()
+    proposal["operation"] = "modify"
+    proposal["claim"] = "New claim text."
+    proposal["prior_claim"] = "Shared claim text."
+    out = render_diff(proposal, wiki_path=wiki)
+
+    # Locate the unified-diff "-" line (the one being removed). The
+    # context line IMMEDIATELY ABOVE the change in the diff must be
+    # `research/`, NOT `invariants/`.
+    diff_lines = out.splitlines()
+    minus_idx = next(
+        i
+        for i, line in enumerate(diff_lines)
+        if line.startswith("-") and not line.startswith("---") and "Shared claim text" in line
+    )
+    # Walk backwards through context lines (prefix " ") to find the most
+    # recent namespace heading.
+    last_namespace = None
+    for line in reversed(diff_lines[:minus_idx]):
+        if line.startswith(" "):
+            value = line[1:].rstrip()
+            if value.endswith("/") and "/" not in value[:-1]:
+                last_namespace = value
+                break
+    assert last_namespace == "research/", (
+        f"modify edited the wrong namespace section "
+        f"(found context heading {last_namespace!r}, expected 'research/'); "
+        f"full diff:\n{out}"
+    )
+
+
+def test_render_diff_modify_with_prior_claim_only_in_other_namespace_is_noop(
+    tmp_path: Path,
+) -> None:
+    """If prior_claim appears ONLY in a different namespace, the
+    proposal's target namespace has nothing to edit, so render_diff
+    must produce an empty diff (no false-positive cross-namespace
+    edit). Same P2 class.
+    """
+    wiki = tmp_path / "wiki.md"
+    wiki.write_text(
+        "invariants/\n  Inv-only claim.\nresearch/\n  Different.\n",
+        encoding="utf-8",
+    )
+    proposal = _proposal()
+    proposal["operation"] = "modify"
+    proposal["claim"] = "Should not appear."
+    proposal["prior_claim"] = "Inv-only claim."  # only in invariants/
+    out = render_diff(proposal, wiki_path=wiki)
+    # Empty diff: the research/ section has no line containing the
+    # prior_claim, so after_lines == before_lines.
+    assert out == "", f"Expected empty diff; got:\n{out}"
+
+
 def test_render_diff_modify_replaces_prior_claim_line(tmp_path: Path) -> None:
     """For operation=modify, render_diff locates the prior_claim
     substring and replaces that line with the new claim. Pins the
