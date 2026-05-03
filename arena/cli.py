@@ -38,6 +38,7 @@ from arena.research_proxy.method_digest import (
     validate_paper_digest,
 )
 from arena.research_proxy.question_generator import make_research_question_packet
+from arena.review.packet import make_review_packet, validate_research_review
 from arena.sandbox.policy import SandboxPolicy
 from arena.sandbox.runner import SandboxRunner, SandboxViolation
 from arena.schemas.validate import validate as validate_schema
@@ -1185,6 +1186,332 @@ def research_proxy(
         if in_flight["invocation_started"]:
             _persist_inflight_blocked(
                 _persist_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=None,
+            )
+        console.print(f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+@app.command("review")
+def review(
+    competition_slug: str,
+    provider: str = typer.Option(
+        "stub_claude",
+        "--provider",
+        help="Provider to use for the review step. PR6 supports only stub_claude.",
+    ),
+    experiment: str = typer.Option(
+        ...,
+        "--experiment",
+        help="experiment_id of the research-proxy implementation row to review.",
+    ),
+) -> None:
+    """Run §6.2 step 9 (Claude review) against a previously-completed
+    research-proxy implementation row.
+
+    Resolves the impl row from the scoreboard, extracts its
+    <fusion_id:...> token + submission.csv artifact, locates the
+    originating fusion_proposal.json, and invokes stub_claude with
+    role="review" + phase="FUSION_PROXY_REVIEWED" to emit a
+    research_review.json artifact.
+
+    Persists ONE scoreboard row (experiment_type="research_proxy",
+    <step:review> token in artifact_paths). Mirrors arena run-next /
+    arena research-proxy's pre-invoke vs post-invoke discipline:
+    KillSwitchActive / pre-invoke ProviderCallBreaker / fixture-digest
+    drift = no row; post-invoke BudgetExceeded with usage_proxy =
+    blocked row WITH consumed usage threaded through.
+    """
+    if provider not in {"stub_claude"}:
+        raise typer.BadParameter(
+            f"unknown review provider {provider!r}; PR6 supports only stub_claude"
+        )
+
+    store = _store()
+
+    # Resolve the impl row + its run_id FIRST. The review row must be
+    # attached to the SAME run as the impl row (not _latest_run_id()),
+    # otherwise a second `arena init-fixture` followed by `arena review
+    # --experiment exp_0004` would attach the review to the new run
+    # while reading impl artifacts from the old one. The fusion_token
+    # is also deterministic (fusion_0001) across runs, so the fusion
+    # lookup MUST also filter by run_id to avoid cross-run linkage.
+    impl_row = (
+        store._require_conn()
+        .execute(
+            "SELECT experiment_id, run_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND experiment_id = ?",
+            (competition_slug, experiment),
+        )
+        .fetchone()
+    )
+    if impl_row is None:
+        raise typer.BadParameter(f"experiment {experiment} not found for {competition_slug}")
+    run_id = impl_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(f"experiment {experiment} has no run_id (corrupt scoreboard?)")
+    impl_paths: list[str] = json.loads(impl_row["artifact_paths"])
+
+    fusion_token = next(
+        (p for p in impl_paths if p.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
+        None,
+    )
+    if fusion_token is None:
+        raise typer.BadParameter(
+            f"experiment {experiment} is not a research-proxy implementation "
+            f"row (no <{FUSION_ID_TAG_PREFIX}:...> token in artifact_paths)"
+        )
+    fusion_id = fusion_token[len(f"<{FUSION_ID_TAG_PREFIX}:") : -1]
+
+    submission_path = next(
+        (p for p in impl_paths if p.endswith("submission.csv")),
+        None,
+    )
+    if submission_path is None:
+        raise typer.BadParameter(f"experiment {experiment} has no submission.csv in artifact_paths")
+
+    # Find the fusion row whose artifact_paths contains the same fusion_token
+    # AND has the <step:fusion> marker AND lives in the SAME run as the
+    # impl row. fusion_token is deterministic across runs (fusion_0001),
+    # so without the run_id filter we could match a different run's row.
+    fusion_row = (
+        store._require_conn()
+        .execute(
+            "SELECT experiment_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND run_id = ? "
+            "AND artifact_paths LIKE ? AND artifact_paths LIKE ?",
+            (competition_slug, run_id, f"%{fusion_token}%", "%<step:fusion>%"),
+        )
+        .fetchone()
+    )
+    if fusion_row is None:
+        raise typer.BadParameter(
+            f"could not locate originating fusion_proposal.json for "
+            f"{fusion_id} (corrupt scoreboard?)"
+        )
+    fusion_paths: list[str] = json.loads(fusion_row["artifact_paths"])
+    fusion_proposal_path = next(
+        (p for p in fusion_paths if p.endswith("fusion_proposal.json")),
+        None,
+    )
+    if fusion_proposal_path is None:
+        raise typer.BadParameter(
+            f"fusion row {fusion_row['experiment_id']} has no "
+            "fusion_proposal.json in artifact_paths (corrupt scoreboard?)"
+        )
+
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    review_adapter = _get_provider(provider, event_emitter=trace_store)
+
+    # PR4 reproducibility precheck — same shape as arena research-proxy.
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / competition_slug)
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=competition_slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {competition_slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {competition_slug}: {exc}"
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    if drifted_from_fixture:
+        message = (
+            f"fixture digest drift for {competition_slug}: "
+            f"was {drifted_from_fixture}, now {fixture_hash}"
+        )
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    trace_store.emit(
+        event_type="run_started",
+        severity="info",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value,
+        },
+    )
+
+    try:
+        _is_new_review, drifted_from_review = record_provider_version(
+            competition_slug=competition_slug,
+            provider=review_adapter.name,
+            version=review_adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        message = f"provider version baseline corrupt for {competition_slug}: {exc}"
+        console.print(
+            f"[red]review blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_review else "info",
+        payload={
+            "provider": review_adapter.name,
+            "provider_version": review_adapter.version,
+            "previous_hash": drifted_from_review or "",
+        },
+    )
+
+    review_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_review}>"
+        if drifted_from_review
+        else None
+    )
+    review_drift_extras = [review_drift_tag] if review_drift_tag else []
+
+    # Seed governor accumulators from prior usage on this run.
+    totals = store.get_run_usage_totals(competition_slug, run_id)
+    accumulators = RunAccumulators(
+        provider_calls=int(totals["provider_calls"]),
+        codex_calls=int(totals["codex_calls"]),
+        claude_calls=int(totals["claude_calls"]),
+        wall_seconds=float(totals["wall_seconds"]),
+        input_chars=int(totals["input_chars"]),
+        output_chars=int(totals["output_chars"]),
+        waste_events=int(totals["waste_events"]),
+    )
+    governor = BudgetGovernor(Phase0HardCeilings.from_env(), accumulators=accumulators)
+    watchdog = Watchdog(governor=governor)
+
+    rev_exp = store.get_next_experiment_id(competition_slug)
+    rev_task = rev_exp.replace("exp_", "task_")
+    create_workspace(WORKTREE_ROOT, competition_slug, rev_exp)
+
+    rev_packet = make_review_packet(
+        competition_slug=competition_slug,
+        run_id=run_id,
+        experiment_id=rev_exp,
+        task_id=rev_task,
+        review_id="rr_0001",
+        subject_experiment_id=experiment,
+        fusion_proposal_path=fusion_proposal_path,
+        submission_path=submission_path,
+    )
+
+    in_flight: dict[str, str | bool | None] = {
+        "experiment_id": rev_exp,
+        "task_id": rev_task,
+        "step": "review",
+        "adapter_name": review_adapter.name,
+        "adapter_version": review_adapter.version,
+        "invocation_started": False,
+    }
+
+    def _persist_review_row(
+        *,
+        experiment_id: str,
+        task_id: str,
+        experiment_type: str,
+        adapter_name: str,
+        adapter_version: str,
+        status: str,
+        artifact_paths: list[str],
+        usage_proxy: UsageProxy | None,
+        score: float | None = None,
+        valid_submission: bool | None = None,
+    ) -> None:
+        store.insert_experiment(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            competition_slug=competition_slug,
+            task_id=task_id,
+            experiment_type=experiment_type,
+            provider=adapter_name,
+            provider_version=adapter_version,
+            status=status,
+            metric_name="roc_auc",
+            valid_submission=valid_submission,
+            artifact_paths=artifact_paths,
+            trace_path=None,
+            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            input_chars=int(usage_proxy["input_chars"]) if usage_proxy else 0,
+            output_chars=int(usage_proxy["output_chars"]) if usage_proxy else 0,
+            wall_seconds=float(usage_proxy["wall_seconds"]) if usage_proxy else 0.0,
+            shell_commands=int(usage_proxy["shell_commands"]) if usage_proxy else 0,
+            failed_commands=int(usage_proxy["failed_commands"]) if usage_proxy else 0,
+            waste_events=int(usage_proxy["waste_events"]) if usage_proxy else 0,
+        )
+        if score is not None:
+            store.update_experiment_score(experiment_id, score=score)
+
+    try:
+        per_step_sandbox = SandboxRunner(
+            SandboxPolicy.from_packet(rev_packet, workspace_root=Path.cwd())
+        )
+        watchdog.check_can_invoke(review_adapter.name)
+        in_flight["invocation_started"] = True
+        rev_result = watchdog.wrap_invoke(
+            review_adapter,
+            rev_packet,
+            sandbox=per_step_sandbox,
+            event_emitter=trace_store,
+        )
+        rev_artifact = _require_artifact(
+            rev_result.artifacts,
+            suffix="research_review.json",
+            step_label="review",
+            provider_name=review_adapter.name,
+        )
+        rev_payload = json.loads(Path(rev_artifact).read_text(encoding="utf-8"))
+        validate_research_review(rev_payload)
+
+        _persist_review_row(
+            experiment_id=rev_exp,
+            task_id=rev_task,
+            experiment_type="research_proxy",
+            adapter_name=review_adapter.name,
+            adapter_version=review_adapter.version,
+            status="completed",
+            artifact_paths=["<step:review>", rev_artifact, *review_drift_extras],
+            usage_proxy=rev_result.usage_proxy,
+        )
+        trace_store.emit(
+            event_type="review_recorded",
+            severity="info",
+            task_id=rev_task,
+            payload={
+                "review_id": rev_payload["review_id"],
+                "experiment_id": rev_exp,
+                "status": rev_payload["decision"],
+                "path": rev_artifact,
+            },
+        )
+        console.print(
+            f"[bold green]review complete[/bold green] — review_id="
+            f"{rev_payload['review_id']} decision={rev_payload['decision']}"
+        )
+    except KillSwitchActive as exc:
+        console.print(f"[red]kill switch active: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except BudgetExceeded as exc:
+        if in_flight["invocation_started"]:
+            _persist_inflight_blocked(
+                _persist_review_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=exc.usage_proxy,
+            )
+        console.print(f"[red]budget exceeded ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except SandboxViolation as exc:
+        if in_flight["invocation_started"]:
+            _persist_inflight_blocked(
+                _persist_review_row,
                 in_flight,
                 exc.breaker.value,
                 str(exc),
