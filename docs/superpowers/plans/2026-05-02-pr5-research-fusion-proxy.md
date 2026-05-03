@@ -2684,7 +2684,7 @@ def test_research_proxy_blocks_on_pre_invoke_budget_cap(
     cap to 0 should halt research-proxy before step 2's first invoke."""
     monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
     monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
-    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "0")
+    monkeypatch.setenv("ARENA_PHASE0_PROVIDER_CALL_CAP", "0")
 
     runner = CliRunner()
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
@@ -2793,7 +2793,7 @@ def test_research_proxy_respects_run_level_provider_call_cap_after_calibration(
 
     # Calibration consumed 1 provider call. Cap research-proxy at 1 so its
     # very first invoke fails check_can_invoke (would-be call count = 2).
-    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "1")
+    monkeypatch.setenv("ARENA_PHASE0_PROVIDER_CALL_CAP", "1")
     result = runner.invoke(
         app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
     )
@@ -2819,7 +2819,7 @@ def test_research_proxy_does_not_persist_row_on_pre_invoke_provider_call_cap(
 
     # Cap at 2 provider calls. Steps 2 (question) + 4 (digest) succeed;
     # step 5 (fusion) fails check_can_invoke (third call would-be).
-    monkeypatch.setenv("ARENA_PROVIDER_CALLS_TOTAL", "2")
+    monkeypatch.setenv("ARENA_PHASE0_PROVIDER_CALL_CAP", "2")
     result = runner.invoke(
         app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
     )
@@ -2902,12 +2902,20 @@ def test_research_proxy_does_not_persist_row_on_fusion_gate_block(
     runner = CliRunner()
     runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
 
-    # Force the gate to fail by setting the threshold above what the
+    # Force the gate to fail by raising MIN_FUSION_SCORE above what the
     # stub_claude payload can score. The default stub fusion proposal
-    # produces a known deterministic score; ARENA_MIN_FUSION_SCORE=1.0
-    # guarantees the gate fails (score is in [0, 1] and 1.0 is the
-    # strict ceiling).
-    monkeypatch.setenv("ARENA_MIN_FUSION_SCORE", "1.0")
+    # produces a known deterministic score; setting the threshold to
+    # 0.99 guarantees the gate fails (score is in [0, 1] by construction
+    # in fusion_scorer). MIN_FUSION_SCORE is a module-level constant
+    # (not an env var); patch BOTH import sites — the source in
+    # fusion_scorer.py AND the cli.py re-import — because cli.py imports
+    # the symbol directly (`from arena.research_proxy.fusion_scorer
+    # import MIN_FUSION_SCORE`) and pytest's setattr only affects the
+    # bound name in each module's namespace.
+    monkeypatch.setattr(
+        "arena.research_proxy.fusion_scorer.MIN_FUSION_SCORE", 0.99
+    )
+    monkeypatch.setattr("arena.cli.MIN_FUSION_SCORE", 0.99)
     result = runner.invoke(
         app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
     )
