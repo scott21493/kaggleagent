@@ -11,10 +11,15 @@ def _resolve(p: Path) -> Path:
 
 
 def _default_blocked_paths(workspace_root: Path | None = None) -> frozenset[Path]:
-    """Canonical secret/credential paths that providers must never read."""
+    """Canonical secret/credential/forensic paths providers must never read."""
     home = Path("~").expanduser().resolve()
     env_path = (
         _resolve(workspace_root / ".env") if workspace_root is not None else _resolve(Path(".env"))
+    )
+    traces_path = (
+        _resolve(workspace_root / "traces")
+        if workspace_root is not None
+        else _resolve(Path("traces"))
     )
     return frozenset(
         {
@@ -22,6 +27,7 @@ def _default_blocked_paths(workspace_root: Path | None = None) -> frozenset[Path
             home / ".codex",
             home / ".claude",
             env_path,
+            traces_path,
         }
     )
 

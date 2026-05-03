@@ -117,3 +117,46 @@ def test_from_packet_admits_tilde_blocked_paths_outside_workspace(
     from arena.sandbox.secrets import is_secret_read
 
     assert is_secret_read(target, p) is True
+
+
+def test_default_blocked_paths_includes_traces(tmp_path):
+    """traces/ is in the default blocked-read set, scoped to workspace_root."""
+    from arena.sandbox.policy import _default_blocked_paths
+
+    blocked = _default_blocked_paths(workspace_root=tmp_path)
+    assert (tmp_path / "traces").resolve() in blocked
+
+
+def test_provider_packet_cannot_read_traces_even_if_in_allowed_paths(tmp_path):
+    """blocked_paths wins over allowed_paths for SECRET_READ (raw stream protection).
+
+    Note: is_secret_read / is_protected_write are MODULE FUNCTIONS in
+    arena.sandbox.secrets, not methods on SandboxPolicy."""
+    from arena.sandbox.policy import SandboxPolicy
+    from arena.sandbox.secrets import is_secret_read
+
+    packet = {
+        "task_id": "task_0001",
+        "allowed_paths": ["traces/"],  # try to allow traces — must still be denied
+        "blocked_paths": [],
+    }
+    policy = SandboxPolicy.from_packet(packet, workspace_root=tmp_path)
+    target = (tmp_path / "traces" / "run_x" / "task_y" / "stdout.raw").resolve()
+    assert is_secret_read(target, policy) is True, (
+        "blocked_paths must win over allowed_paths for raw-trace reads"
+    )
+
+
+def test_provider_packet_cannot_write_to_traces_even_if_in_allowed_paths(tmp_path):
+    """blocked_paths wins over allowed_paths for PROTECTED_WRITE."""
+    from arena.sandbox.policy import SandboxPolicy
+    from arena.sandbox.secrets import is_protected_write
+
+    packet = {
+        "task_id": "task_0001",
+        "allowed_paths": ["traces/"],
+        "blocked_paths": [],
+    }
+    policy = SandboxPolicy.from_packet(packet, workspace_root=tmp_path)
+    target = (tmp_path / "traces" / "fake_write.txt").resolve()
+    assert is_protected_write(target, policy) is True
