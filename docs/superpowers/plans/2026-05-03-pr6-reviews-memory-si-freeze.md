@@ -58,7 +58,7 @@
 | `tests/test_memory_proposal.py` | 6 tests: synthesizes valid memory_update for actionable review; no-op observation for empty review; deterministic proposal_id minting; namespace="research"; review_status="proposed"; evidence array points to review_id. |
 | `tests/test_memory_validator.py` | 4 tests: contradiction detection on modify; operation-specific prior_claim; valid proposals pass; rejects empty evidence. |
 | `tests/test_memory_diff.py` | 3 tests: renders diff against wiki; namespace-scoped output; pure function (no file mutation). |
-| `tests/test_cli_memory_propose.py` | 5 tests: happy path; no-op fallback; missing review experiment; corrupt research_review.json; deterministic proposal_id + no scoreboard row. |
+| `tests/test_cli_memory_propose.py` | 7 tests: happy path; no-op fallback; missing review experiment; deterministic proposal_id + no scoreboard row; schema-invalid research_review.json caught cleanly; trace event lands under the review row's run (cross-run linkage regression). |
 | `tests/test_self_improvement_scan.py` | 6 tests: detects blocked rows; detects score regression; detects waste threshold; idempotent (no duplicate proposals); proposal IDs monotonic; clean scoreboard produces zero findings. |
 | `tests/test_self_improvement_freeze.py` | 5 tests: each §7.3 trigger fires; apply_freeze writes sentinel; sentinel JSON metadata block parses; is_frozen reads sentinel; unfreeze deletes sentinel. |
 | `tests/test_self_improvement_champion_challenger.py` | 3 tests: returns ComparisonResult; flags regression; pure function. |
@@ -71,7 +71,7 @@
 |---|---|
 | `arena/providers/stub_claude.py` | Extend `_research_proxy_payload` to dispatch on role="review" + phase="FUSION_PROXY_REVIEWED" → `_research_review_payload(slug, subject_id)`. Add module-level `_RESEARCH_REVIEW_DEFAULT_DECISION = "accept"` etc. for monkey-patch override. |
 | `arena/cli.py` | Add three subcommands: `review`, `memory propose`, `self-improve scan`. Reuse existing helpers (`_store`, `_latest_run_id`, `_get_provider`, `_persist_inflight_blocked`, `_require_artifact`). |
-| `CLAUDE.md` (and similar docs) | Replace "6 CI scripts" / "all 6 CI scripts" with "5 external acceptance scripts + memory-examples test suite" or list them explicitly. Done in Task 7. |
+| `README.md` (and any other root-level `*.md` that contains the phrase) | If "6 CI scripts" / "all 6 CI scripts" appears in any root-level live doc, replace with "5 external acceptance scripts + memory-examples test suite" or list them explicitly. This repo has `README.md` at root and NO `CLAUDE.md`; if `README.md` contains no such phrase, no doc edit is needed. Historical plan files under `docs/superpowers/plans/` are write-once and MUST NOT be edited. Done in Task 7. |
 
 **Delete:**
 
@@ -955,7 +955,7 @@ def test_arena_review_persists_post_invoke_budget_blocked_row_with_usage(
 .venv/Scripts/python.exe -m pytest tests/test_cli_review.py -v
 ```
 
-Expected: 7 failures — `arena review` subcommand doesn't exist yet.
+Expected: 8 failures — `arena review` subcommand doesn't exist yet.
 
 - [ ] **Step 7: Add the `review` subcommand to `arena/cli.py`**
 
@@ -1298,7 +1298,7 @@ def review(
 .venv/Scripts/python.exe -m pytest tests/test_cli_review.py -v
 ```
 
-Expected: 7 passed.
+Expected: 8 passed.
 
 - [ ] **Step 9: Run full suite + lint + mypy**
 
@@ -2111,6 +2111,75 @@ def test_memory_propose_id_is_monotonic(
     proposals_dir = fixture_workspace / "memory" / "proposals"
     files = sorted(p.name for p in proposals_dir.iterdir())
     assert files == ["mem_0001.json", "mem_0002.json"]
+
+
+def test_memory_propose_trace_event_attaches_to_review_run_not_latest(
+    fixture_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for cross-run linkage: arena memory propose has no
+    scoreboard row, so the memory_proposal_created trace event is the
+    only durable linkage to the review row. The event's run_id MUST be
+    the review row's run, not _latest_run_id().
+
+    Bootstrap a review under run_A. Start a second `arena init-fixture`
+    + research-proxy under run_B. Run `arena memory propose
+    --review <exp from run_A>` — the trace event MUST land under
+    traces/run_A/, not traces/run_B/.
+    """
+    monkeypatch.delenv("ARENA_KILL_SWITCH", raising=False)
+    monkeypatch.delenv("ARENA_NETWORK_DOMAINS_ALLOWED", raising=False)
+    runner = CliRunner()
+    _bootstrap_review(runner)
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        run_a = store._require_conn().execute(
+            "SELECT run_id FROM experiments WHERE experiment_id = ?",
+            ("exp_0005",),
+        ).fetchone()["run_id"]
+    finally:
+        store.close()
+
+    # Second run.
+    runner.invoke(app, ["init-fixture", "tabular_binary_v1"])
+    runner.invoke(
+        app, ["research-proxy", "tabular_binary_v1", "--provider", "stub_claude"]
+    )
+    store = ScoreboardStore(fixture_workspace / "scoreboard.sqlite")
+    store.connect()
+    try:
+        run_b = store._require_conn().execute(
+            "SELECT run_id FROM experiments WHERE experiment_id = ?",
+            ("exp_0006",),
+        ).fetchone()["run_id"]
+    finally:
+        store.close()
+    assert run_a != run_b
+
+    # Memory propose against the run_A review — event must land under run_A.
+    result = runner.invoke(
+        app, ["memory", "propose", "tabular_binary_v1", "--review", "exp_0005"]
+    )
+    assert result.exit_code == 0, result.output
+
+    found_in_a = False
+    found_in_b = False
+    traces_root = fixture_workspace / "traces"
+    for jsonl in traces_root.rglob("events.jsonl"):
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            evt = json.loads(line)
+            if evt.get("event_type") != "memory_proposal_created":
+                continue
+            if evt["run_id"] == run_a:
+                found_in_a = True
+            elif evt["run_id"] == run_b:
+                found_in_b = True
+    assert found_in_a, "memory_proposal_created not found under review's run"
+    assert not found_in_b, (
+        "memory_proposal_created leaked into latest run's trace"
+    )
 ```
 
 - [ ] **Step 2: Run failing tests**
@@ -2119,7 +2188,7 @@ def test_memory_propose_id_is_monotonic(
 .venv/Scripts/python.exe -m pytest tests/test_cli_memory_propose.py -v
 ```
 
-Expected: 5 failures — `arena memory propose` doesn't exist yet.
+Expected: 7 failures — `arena memory propose` doesn't exist yet.
 
 - [ ] **Step 3: Add `memory` Typer subapp + `propose` subcommand to `arena/cli.py`**
 
@@ -2165,22 +2234,28 @@ def memory_propose(
     memory_proposal_created trace event whose payload uses ONLY keys
     permitted by schemas/event.schema.json.
     """
-    run_id = _latest_run_id()
-    if run_id is None:
-        raise typer.BadParameter(
-            f"no run for {competition_slug}; "
-            f"run `arena init-fixture {competition_slug}` first"
-        )
     store = _store()
 
+    # Resolve the review row + its run_id FIRST. The trace event's
+    # run_id MUST be the review row's own run, not _latest_run_id().
+    # Memory proposals don't create scoreboard rows, so the
+    # memory_proposal_created trace event is the durable linkage between
+    # the proposal artifact and the review experiment that drove it.
+    # Mirrors the same fix applied to `arena review` for cross-run
+    # linkage.
     review_row = store._require_conn().execute(
-        "SELECT artifact_paths FROM experiments "
+        "SELECT run_id, artifact_paths FROM experiments "
         "WHERE competition_slug = ? AND experiment_id = ?",
         (competition_slug, review),
     ).fetchone()
     if review_row is None:
         raise typer.BadParameter(
             f"experiment {review} not found for {competition_slug}"
+        )
+    run_id = review_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(
+            f"experiment {review} has no run_id (corrupt scoreboard?)"
         )
     review_paths: list[str] = json.loads(review_row["artifact_paths"])
     if "<step:review>" not in review_paths:
@@ -2256,7 +2331,7 @@ def memory_propose(
 .venv/Scripts/python.exe -m pytest tests/test_cli_memory_propose.py -v
 ```
 
-Expected: 5 passed.
+Expected: 7 passed.
 
 - [ ] **Step 5: Run full suite + lint + mypy**
 
@@ -2267,7 +2342,7 @@ Expected: 5 passed.
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 329 passed (was 323, +6 = 5 happy-path/no-row/etc. + 1 schema-invalid review regression). All checks clean.
+Expected: 330 passed (was 323, +7 = 5 happy-path/no-row/etc. + 1 schema-invalid review regression + 1 cross-run trace-event regression). All checks clean.
 
 - [ ] **Step 6: Commit**
 
@@ -2701,7 +2776,7 @@ def test_compare_metrics_is_pure() -> None:
 .venv/Scripts/python.exe -m pytest tests/test_self_improvement_scan.py tests/test_self_improvement_proposal.py tests/test_self_improvement_champion_challenger.py -v
 ```
 
-Expected: 9 ImportError.
+Expected: 13 ImportError (7 scan + 3 proposal + 3 champion_challenger).
 
 - [ ] **Step 5: Implement `arena/self_improvement/__init__.py` + `scan.py`**
 
@@ -3152,7 +3227,7 @@ def compare_metrics(champion: Metrics, challenger: Metrics) -> ComparisonResult:
 .venv/Scripts/python.exe -m pytest tests/test_self_improvement_scan.py tests/test_self_improvement_proposal.py tests/test_self_improvement_champion_challenger.py -v
 ```
 
-Expected: 9 passed (3 scan + 3 proposal + 3 champion_challenger).
+Expected: 13 passed (7 scan + 3 proposal + 3 champion_challenger).
 
 - [ ] **Step 9: Run full suite + lint + mypy**
 
@@ -3163,7 +3238,7 @@ Expected: 9 passed (3 scan + 3 proposal + 3 champion_challenger).
 .venv/Scripts/python.exe -m mypy arena
 ```
 
-Expected: 342 passed (was 329, +13 = 7 scan + 3 proposal + 3 champion_challenger). All checks clean.
+Expected: 343 passed (was 330, +13 = 7 scan + 3 proposal + 3 champion_challenger). All checks clean.
 
 - [ ] **Step 10: Commit**
 
@@ -3741,7 +3816,7 @@ Expected: 10 passed (5 freeze + 5 CLI).
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 352 passed (was 342, +10). All checks clean. All 6 acceptance scripts green (still 6 in this commit; Task 7 removes one).
+Expected: 353 passed (was 343, +10). All checks clean. All 6 acceptance scripts green (still 6 in this commit; Task 7 removes one).
 
 - [ ] **Step 8: Commit**
 
@@ -3792,7 +3867,7 @@ EOF
 **Files:**
 - Delete: `scripts/validate_memory_examples.py`
 - Create: `tests/test_memory_proposal_examples.py`
-- Modify: `CLAUDE.md` (and any other docs that reference "6 CI scripts")
+- Modify: `README.md` (and any other root-level `*.md` that contains "6 CI scripts"; this repo has no `CLAUDE.md`). Skip if grep finds no match. Historical plans under `docs/superpowers/plans/` are write-once and MUST NOT be edited.
 
 - [ ] **Step 1: Write the test file that replaces the script**
 
@@ -3948,7 +4023,7 @@ Track which root-level docs you actually changed; the Step 6 commit should `git 
 .venv/Scripts/python.exe scripts/check_migrations.py
 ```
 
-Expected: 359 passed (was 352, +7). All 5 remaining acceptance scripts green. ruff/format/mypy clean.
+Expected: 360 passed (was 353, +7). All 5 remaining acceptance scripts green. ruff/format/mypy clean.
 
 (Note: `scripts/validate_memory_examples.py` no longer exists.)
 
@@ -4032,8 +4107,8 @@ PR6 acceptance is met when:
 1. `arena review tabular_binary_v1 --provider stub_claude --experiment exp_0004` succeeds against a research-proxy implementation row; persists 1 scoreboard row with `<step:review>` token + valid research_review.json artifact.
 2. `arena memory propose tabular_binary_v1 --review exp_0005` succeeds; writes `memory/proposals/mem_0001.json` (schema-valid); emits `memory_proposal_created` trace event with payload using only `event.schema.json`-permitted keys; creates NO scoreboard row.
 3. `arena self-improve scan tabular_binary_v1` against a clean scoreboard exits 0 with zero proposals + no sentinel. Same command against a scoreboard with a blocked row produces ≥1 `self_improvement/proposals/sip_NNNN.json` + writes `SELF_IMPROVEMENT_FROZEN.md`. NO scoreboard row.
-4. `tests/test_memory_proposal_examples.py` covers all 4 `operation` paths + contradiction detection. `scripts/validate_memory_examples.py` is gone; CLAUDE.md (and any other docs) no longer say "6 CI scripts".
-5. Full suite green (359+ tests); ruff/format/mypy clean; 5 external acceptance scripts green.
+4. `tests/test_memory_proposal_examples.py` covers all 4 `operation` paths + contradiction detection. `scripts/validate_memory_examples.py` is gone; any root-level live docs (`README.md`, etc.) that referenced "6 CI scripts" have been updated. Historical plan files under `docs/superpowers/plans/` are intentionally left as-is.
+5. Full suite green (360+ tests); ruff/format/mypy clean; 5 external acceptance scripts green.
 6. PR5 invariants still hold: re-running `arena research-proxy` against a clean fixture still produces 4 rows; `provider_calls == COUNT(*)`; PR4 reproducibility checks fire.
 
 This unblocks PR7 (Real Codex/Claude + close-the-loop), which composes the three PR6 commands into the full 10-step §6.2 acceptance test.
