@@ -21,11 +21,26 @@ from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
 from arena.observability.version_baseline import record_fixture_hash, record_provider_version
-from arena.providers.base import ProviderAdapter, UsageProxy
+from arena.providers.base import ProviderAdapter, ProviderResult, UsageProxy
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
+from arena.research_proxy.fusion_proposal import (
+    make_fusion_proposal_packet,
+    validate_fusion_proposal,
+)
+from arena.research_proxy.fusion_scorer import (
+    MIN_FUSION_SCORE,
+    is_eligible,
+    score_fusion_proposal,
+)
+from arena.research_proxy.method_digest import (
+    make_method_digest_packet,
+    validate_paper_digest,
+)
+from arena.research_proxy.question_generator import make_research_question_packet
 from arena.sandbox.policy import SandboxPolicy
 from arena.sandbox.runner import SandboxRunner, SandboxViolation
+from arena.schemas.validate import validate as validate_schema
 from arena.scoreboard.store import ScoreboardStore
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
@@ -44,6 +59,11 @@ TRACES_ROOT = Path("traces")
 # tests/test_controller_state.py); adding a value without updating the
 # schema would break the drift guard.
 PROVIDER_VERSION_CHANGED_TAG = "PROVIDER_VERSION_CHANGED"
+
+# Token prefix used in artifact_paths to link a research-proxy experiment
+# row to its fusion proposal. Mirrors PROVIDER_VERSION_CHANGED_TAG: not a
+# Phase enum value, just metadata in artifact_paths.
+FUSION_ID_TAG_PREFIX = "fusion_id"
 
 
 def _store() -> ScoreboardStore:
@@ -595,3 +615,644 @@ def report(competition_slug: str) -> None:
     # (#, |, etc.) as Rich markup and break the output for downstream
     # tools that expect plain markdown.
     print(render_run_report(view))
+
+
+@app.command("research-proxy")
+def research_proxy(
+    competition_slug: str,
+    provider: str = typer.Option(
+        "stub_claude",
+        "--provider",
+        help="Provider to use for the research/digest/fusion steps. The "
+        "implementation step (step 7) always uses stub_codex in PR5.",
+    ),
+) -> None:
+    """Run the §6.2 research-fusion proxy loop steps 1-8 against the
+    first method note in fixtures/<slug>/paper_bundle/.
+
+    Persists FOUR experiment rows under one run_id — one per provider
+    invocation. Every row uses experiment_type="research_proxy" (the
+    schema-allowed enum value) and the per-step distinction is encoded
+    in artifact_paths as a <step:NAME> token where NAME is "question",
+    "digest", "fusion", or "implementation" (mirrors PR4's
+    <PROVIDER_VERSION_CHANGED:...> pattern; no schema migration). Each
+    row carries its own usage_proxy from the corresponding ProviderResult,
+    so `arena budget status` and pre-invoke caps see all four calls. The
+    fusion_id token appears in artifact_paths starting from row 3 (when
+    fusion_id is first known). The implementation row (row 4) gets the
+    score via `arena evaluate`'s flow.
+
+    On step-6 gate failure, rows 1-3 are completed and NO row 4 is
+    inserted — stub_codex was never invoked, so provider_calls (derived
+    from COUNT(*) by get_run_usage_totals) must not increment. On
+    POST-invoke exception (BudgetExceeded from record_post_invoke,
+    SandboxViolation inside wrap_invoke), the in-flight step's row is
+    inserted as status=blocked with the partial state captured AND
+    usage_proxy threaded through from the exception. Pre-invoke
+    exceptions (KillSwitchActive, ProviderCallBreaker tripped in
+    check_can_invoke) leave the scoreboard untouched. Mirrors
+    arena run-next in arena/cli.py:185-377.
+    """
+    if provider not in {"stub_claude"}:
+        raise typer.BadParameter(
+            f"unknown research provider {provider!r}; PR5 supports only stub_claude"
+        )
+
+    method_note_path = f"fixtures/{competition_slug}/paper_bundle/method_note_001.md"
+    if not Path(method_note_path).exists():
+        raise typer.BadParameter(f"method note missing: {method_note_path}")
+
+    run_id = _latest_run_id()
+    if run_id is None:
+        raise typer.BadParameter(
+            f"no run for {competition_slug}; run `arena init-fixture {competition_slug}` first"
+        )
+    store = _store()
+
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+
+    research_adapter = _get_provider(provider, event_emitter=trace_store)
+    impl_adapter = _get_provider("stub_codex", event_emitter=trace_store)
+
+    # PR4 reproducibility precheck — mirrors arena run-next at
+    # arena/cli.py:235-340. Fixture-digest drift OR corrupt baseline halts
+    # the chain before any provider invocation. Provider-version drift
+    # (per adapter) tags the rows that adapter actually drove. Pre-invoke
+    # failures here do NOT persist scoreboard rows — same discipline as
+    # KillSwitchActive: no provider call happened.
+    try:
+        fixture_hash = compute_fixture_set_digest(FIXTURES_ROOT / competition_slug)
+        _is_new_fixture, drifted_from_fixture = record_fixture_hash(
+            competition_slug=competition_slug,
+            fixture_hash=fixture_hash,
+        )
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        if isinstance(exc, FileNotFoundError):
+            message = f"fixture manifest missing for {competition_slug}: {exc}"
+        else:
+            message = f"fixture state read failed for {competition_slug}: {exc}"
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    if drifted_from_fixture:
+        message = (
+            f"fixture digest drift for {competition_slug}: "
+            f"was {drifted_from_fixture}, now {fixture_hash}"
+        )
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    trace_store.emit(
+        event_type="run_started",
+        severity="info",
+        payload={
+            "sha256": fixture_hash,
+            "previous_hash": drifted_from_fixture or "",
+            "phase": Phase.NEW.value,
+        },
+    )
+
+    # Provider-version baselines: research_adapter (steps 2/4/5) +
+    # impl_adapter (step 7). Drift tags propagate into artifact_paths on
+    # the rows that adapter drove.
+    try:
+        _is_new_research, drifted_from_research = record_provider_version(
+            competition_slug=competition_slug,
+            provider=research_adapter.name,
+            version=research_adapter.version,
+        )
+        _is_new_impl, drifted_from_impl = record_provider_version(
+            competition_slug=competition_slug,
+            provider=impl_adapter.name,
+            version=impl_adapter.version,
+        )
+    except json.JSONDecodeError as exc:
+        message = f"provider version baseline corrupt for {competition_slug}: {exc}"
+        console.print(
+            f"[red]research-proxy blocked: {Phase.BLOCKED_REPRODUCIBILITY.value} ({message})[/red]"
+        )
+        raise typer.Exit(code=2) from exc
+
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_research else "info",
+        payload={
+            "provider": research_adapter.name,
+            "provider_version": research_adapter.version,
+            "previous_hash": drifted_from_research or "",
+        },
+    )
+    trace_store.emit(
+        event_type="provider_version_recorded",
+        severity="warning" if drifted_from_impl else "info",
+        payload={
+            "provider": impl_adapter.name,
+            "provider_version": impl_adapter.version,
+            "previous_hash": drifted_from_impl or "",
+        },
+    )
+
+    research_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_research}>"
+        if drifted_from_research
+        else None
+    )
+    impl_drift_tag = (
+        f"<{PROVIDER_VERSION_CHANGED_TAG}:from={drifted_from_impl}>" if drifted_from_impl else None
+    )
+    research_drift_extras = [research_drift_tag] if research_drift_tag else []
+    impl_drift_extras = [impl_drift_tag] if impl_drift_tag else []
+
+    # Seed governor accumulators from prior usage on this run so PR5
+    # respects run-level provider-call caps already consumed by
+    # calibration or earlier research-proxy invocations.
+    totals = store.get_run_usage_totals(competition_slug, run_id)
+    accumulators = RunAccumulators(
+        provider_calls=int(totals["provider_calls"]),
+        codex_calls=int(totals["codex_calls"]),
+        claude_calls=int(totals["claude_calls"]),
+        wall_seconds=float(totals["wall_seconds"]),
+        input_chars=int(totals["input_chars"]),
+        output_chars=int(totals["output_chars"]),
+        waste_events=int(totals["waste_events"]),
+    )
+    governor = BudgetGovernor(Phase0HardCeilings.from_env(), accumulators=accumulators)
+    watchdog = Watchdog(governor=governor)
+
+    def _step_ids() -> tuple[str, str]:
+        """Mint matched (experiment_id, task_id) for the next step.
+
+        Each invocation gets its own row in the experiments table so
+        provider_calls (derived from COUNT(*) by get_run_usage_totals) is
+        accurate. task_id matches the numeric suffix so trace events
+        cluster by step in arena replay output.
+        """
+        exp_id = store.get_next_experiment_id(competition_slug)
+        task_id = exp_id.replace("exp_", "task_")
+        return exp_id, task_id
+
+    def _guarded_invoke(adapter: ProviderAdapter, packet: dict) -> ProviderResult:
+        """Run check_can_invoke + wrap_invoke with the same sandbox.
+
+        check_can_invoke catches kill-switch + pre-invoke provider-call cap
+        BEFORE any invoke work runs. wrap_invoke catches SandboxViolation,
+        mid-invoke BudgetExceeded (live waste detector), and post-invoke
+        BudgetExceeded.
+
+        Sets in_flight["invocation_started"] = True ONLY after
+        check_can_invoke succeeds, so the outer except handlers can tell
+        whether the failure was pre-invoke (no row) vs post-invoke (row
+        with usage_proxy). Mirrors arena/cli.py:185-194 (run-next).
+        """
+        # Build a packet-scoped sandbox: each step's allowed_paths is its
+        # own experiment worktree.
+        per_step_sandbox = SandboxRunner(
+            SandboxPolicy.from_packet(packet, workspace_root=Path.cwd())
+        )
+        # Pre-invoke: kill switch + run-level provider-call cap.
+        # Failures here mean NO invocation happened, so the outer except
+        # must NOT persist a blocked row. invocation_started stays False.
+        watchdog.check_can_invoke(adapter.name)
+        # Past this point, we are about to invoke. From here on, an
+        # exception (BudgetExceeded post-invoke, SandboxViolation, etc.)
+        # reflects work that actually started, and a blocked row is
+        # appropriate.
+        in_flight["invocation_started"] = True
+        return watchdog.wrap_invoke(
+            adapter, packet, sandbox=per_step_sandbox, event_emitter=trace_store
+        )
+
+    def _persist_row(
+        *,
+        experiment_id: str,
+        task_id: str,
+        experiment_type: str,
+        adapter_name: str,
+        adapter_version: str,
+        status: str,
+        artifact_paths: list[str],
+        usage_proxy: UsageProxy | None,
+        score: float | None = None,
+        valid_submission: bool | None = None,
+    ) -> None:
+        """Insert one research-proxy experiment row with consistent shape.
+
+        usage_proxy=None means no usage was reported (e.g. SandboxViolation
+        with no usage attached); the row records zeros. For post-invoke
+        BudgetExceeded the caller MUST pass usage_proxy=exc.usage_proxy
+        so the consumed usage is durable for the next run's seeded
+        accumulators.
+        """
+        store.insert_experiment(
+            experiment_id=experiment_id,
+            run_id=run_id,
+            competition_slug=competition_slug,
+            task_id=task_id,
+            experiment_type=experiment_type,
+            provider=adapter_name,
+            provider_version=adapter_version,
+            status=status,
+            metric_name="roc_auc",
+            valid_submission=valid_submission,
+            artifact_paths=artifact_paths,
+            trace_path=None,
+            created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+            input_chars=int(usage_proxy["input_chars"]) if usage_proxy else 0,
+            output_chars=int(usage_proxy["output_chars"]) if usage_proxy else 0,
+            wall_seconds=float(usage_proxy["wall_seconds"]) if usage_proxy else 0.0,
+            shell_commands=int(usage_proxy["shell_commands"]) if usage_proxy else 0,
+            failed_commands=int(usage_proxy["failed_commands"]) if usage_proxy else 0,
+            waste_events=int(usage_proxy["waste_events"]) if usage_proxy else 0,
+        )
+        if score is not None:
+            store.update_experiment_score(experiment_id, score=score)
+
+    # Track the in-flight step so a POST-invoke exception can persist a
+    # blocked row for the failing step. invocation_started is set to True
+    # ONLY after check_can_invoke succeeds in _guarded_invoke; pre-invoke
+    # failures (KillSwitchActive, ProviderCallBreaker in check_can_invoke)
+    # leave it False so no row is inserted — keeps COUNT(*)-derived
+    # provider_calls accurate. Mirrors arena run-next in arena/cli.py.
+    in_flight: dict[str, str | bool | None] = {
+        "experiment_id": None,
+        "task_id": None,
+        "step": None,  # "question" / "digest" / "fusion" / "implementation"
+        "adapter_name": None,
+        "adapter_version": None,
+        "invocation_started": False,
+    }
+
+    fusion_id_known: str | None = None  # populated after step 5
+
+    try:
+        # Step 1+2+3: research_question task → stub_claude → validate.
+        rq_exp, rq_task = _step_ids()
+        in_flight.update(
+            experiment_id=rq_exp,
+            task_id=rq_task,
+            step="question",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            # Reset for each new step; _guarded_invoke flips this to True
+            # only after check_can_invoke succeeds.
+            invocation_started=False,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, rq_exp)
+        rq_packet = make_research_question_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=rq_exp,
+            task_id=rq_task,
+            question_id="rq_0001",
+            source_refs=[method_note_path],
+        )
+        rq_result = _guarded_invoke(research_adapter, rq_packet)
+        rq_artifact = _require_artifact(
+            rq_result.artifacts,
+            suffix="research_question.json",
+            step_label="step 1-3",
+            provider_name=research_adapter.name,
+        )
+        rq_payload = json.loads(Path(rq_artifact).read_text(encoding="utf-8"))
+        validate_schema("research_question", rq_payload)
+        _persist_row(
+            experiment_id=rq_exp,
+            task_id=rq_task,
+            experiment_type="research_proxy",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=["<step:question>", rq_artifact, *research_drift_extras],
+            usage_proxy=rq_result.usage_proxy,
+        )
+        console.print(f"[green]step 1-3 ok[/green]: research_question {rq_payload['question_id']}")
+
+        # Step 4: digest → paper_digest.json.
+        digest_exp, digest_task = _step_ids()
+        in_flight.update(
+            experiment_id=digest_exp,
+            task_id=digest_task,
+            step="digest",
+            invocation_started=False,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, digest_exp)
+        digest_packet = make_method_digest_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=digest_exp,
+            task_id=digest_task,
+            digest_id="pd_0001",
+            method_note_path=method_note_path,
+        )
+        digest_result = _guarded_invoke(research_adapter, digest_packet)
+        digest_artifact = _require_artifact(
+            digest_result.artifacts,
+            suffix="paper_digest.json",
+            step_label="step 4",
+            provider_name=research_adapter.name,
+        )
+        digest_payload = json.loads(Path(digest_artifact).read_text(encoding="utf-8"))
+        validate_paper_digest(digest_payload)
+        _persist_row(
+            experiment_id=digest_exp,
+            task_id=digest_task,
+            experiment_type="research_proxy",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=["<step:digest>", digest_artifact, *research_drift_extras],
+            usage_proxy=digest_result.usage_proxy,
+        )
+        console.print(f"[green]step 4 ok[/green]: paper_digest {digest_payload['digest_id']}")
+
+        # Step 5: fusion proposal → fusion_proposal.json.
+        fp_exp, fp_task = _step_ids()
+        in_flight.update(
+            experiment_id=fp_exp,
+            task_id=fp_task,
+            step="fusion",
+            invocation_started=False,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, fp_exp)
+        fp_packet = make_fusion_proposal_packet(
+            competition_slug=competition_slug,
+            run_id=run_id,
+            experiment_id=fp_exp,
+            task_id=fp_task,
+            fusion_id="fusion_0001",
+            digest_path=digest_artifact,
+        )
+        fp_result = _guarded_invoke(research_adapter, fp_packet)
+        fp_artifact = _require_artifact(
+            fp_result.artifacts,
+            suffix="fusion_proposal.json",
+            step_label="step 5",
+            provider_name=research_adapter.name,
+        )
+        fp_payload = json.loads(Path(fp_artifact).read_text(encoding="utf-8"))
+        validate_fusion_proposal(fp_payload)
+        fusion_id_known = fp_payload["fusion_id"]
+        fusion_token = f"<{FUSION_ID_TAG_PREFIX}:{fusion_id_known}>"
+        _persist_row(
+            experiment_id=fp_exp,
+            task_id=fp_task,
+            experiment_type="research_proxy",
+            adapter_name=research_adapter.name,
+            adapter_version=research_adapter.version,
+            status="completed",
+            artifact_paths=["<step:fusion>", fp_artifact, fusion_token, *research_drift_extras],
+            usage_proxy=fp_result.usage_proxy,
+        )
+        console.print(f"[green]step 5 ok[/green]: fusion_proposal {fusion_id_known}")
+
+        # Step 6: deterministic gate. Halt before stub_codex if score is
+        # too low OR is_eligible returns False. NO row is inserted because
+        # stub_codex was never invoked — provider_calls (derived from
+        # COUNT(*) by get_run_usage_totals) must not increment for a
+        # would-be call that never happened.
+        fusion_score = score_fusion_proposal(fp_payload)
+        eligible, reasons = is_eligible(fp_payload)
+        console.print(
+            f"[blue]step 6 score={fusion_score.score:.3f} "
+            f"(cost={fusion_score.cost:.2f} risk={fusion_score.risk:.2f} "
+            f"fit={fusion_score.fit:.2f}) eligible={eligible}[/blue]"
+        )
+        if fusion_score.score < MIN_FUSION_SCORE or not eligible:
+            gate_message = (
+                f"fusion gate failed: score={fusion_score.score:.3f} "
+                f"(min={MIN_FUSION_SCORE}); reasons={reasons or ['low score']}"
+            )
+            # NO row inserted: stub_codex was never invoked, so
+            # provider_calls must not increment. The 3 successful rows
+            # (question, digest, fusion) already in scoreboard tell the
+            # operator exactly how far the chain got. The fusion row's
+            # artifact_paths carries the fusion_proposal JSON path; the
+            # gate decision is reproducible from that payload via
+            # arena replay or score_fusion_proposal.
+            console.print(f"[red]{gate_message}[/red]")
+            raise typer.Exit(code=2)
+
+        # Step 7: stub_codex implements the proxy.
+        proxy_exp, proxy_task = _step_ids()
+        in_flight.update(
+            experiment_id=proxy_exp,
+            task_id=proxy_task,
+            step="implementation",
+            adapter_name=impl_adapter.name,
+            adapter_version=impl_adapter.version,
+            invocation_started=False,
+        )
+        create_workspace(WORKTREE_ROOT, competition_slug, proxy_exp)
+        proxy_packet = {
+            "schema_version": "task_packet.v1",
+            "task_id": proxy_task,
+            "competition_slug": competition_slug,
+            "experiment_id": proxy_exp,
+            "provider": "stub_codex",
+            "role": "implementation",
+            "phase": "FUSION_PROXY_IMPLEMENTED",
+            "objective": (
+                f"Implement the smallest proxy test from fusion_proposal "
+                f"{fusion_id_known}. Inputs[0] is the fusion proposal "
+                "path; emit submission.csv that satisfies "
+                "fixtures/<slug>/sample_submission.csv columns."
+            ),
+            "inputs": [fp_artifact, f"fixtures/{competition_slug}/test.csv"],
+            "allowed_paths": [f"worktrees/{competition_slug}/{proxy_exp}/"],
+            "blocked_paths": [
+                "~/.kaggle/",
+                "~/.codex/",
+                "~/.claude/",
+                ".env",
+                f"fixtures/{competition_slug}/hidden_labels.csv",
+            ],
+            "budgets": {
+                "max_wall_minutes": 20,
+                "max_shell_commands": 35,
+                "max_failed_commands": 5,
+                "max_input_chars": 75000,
+                "max_output_chars": 25000,
+            },
+            "required_outputs": ["submission.csv"],
+            "success_criteria": ["valid"],
+        }
+        proxy_result = _guarded_invoke(impl_adapter, proxy_packet)
+        submission_path = _require_artifact(
+            proxy_result.artifacts,
+            suffix="submission.csv",
+            step_label="step 7",
+            provider_name=impl_adapter.name,
+        )
+        # stub_codex appends <fusion_id:fusion_NNNN> on FUSION_PROXY_IMPLEMENTED.
+        # Use the existing token if present, otherwise fall through to fusion_token.
+        fusion_id_token = next(
+            (a for a in proxy_result.artifacts if a.startswith(f"<{FUSION_ID_TAG_PREFIX}:")),
+            fusion_token,
+        )
+        console.print(f"[green]step 7 ok[/green]: proxy submission {submission_path}")
+
+        # Step 8: evaluate the proxy submission.
+        hidden = FIXTURES_ROOT / competition_slug / "hidden_labels.csv"
+        eval_result = evaluate_fixture_submission(submission_path, hidden)
+        if not eval_result.valid_submission:
+            _persist_row(
+                experiment_id=proxy_exp,
+                task_id=proxy_task,
+                experiment_type="research_proxy",
+                adapter_name=impl_adapter.name,
+                adapter_version=impl_adapter.version,
+                status="blocked",
+                artifact_paths=[
+                    "<step:implementation>",
+                    submission_path,
+                    fusion_id_token,
+                    "<blocked:InvalidSubmission>",
+                    f"<message:{(eval_result.error or 'invalid')[:200]}>",
+                    *impl_drift_extras,
+                ],
+                usage_proxy=proxy_result.usage_proxy,
+            )
+            console.print(f"[red]step 8 invalid submission: {eval_result.error}[/red]")
+            raise typer.Exit(code=1)
+        assert eval_result.score is not None
+        console.print(f"[green]step 8 ok[/green]: score={eval_result.score:.6f}")
+
+        _persist_row(
+            experiment_id=proxy_exp,
+            task_id=proxy_task,
+            experiment_type="research_proxy",
+            adapter_name=impl_adapter.name,
+            adapter_version=impl_adapter.version,
+            status="completed",
+            artifact_paths=[
+                "<step:implementation>",
+                submission_path,
+                fusion_id_token,
+                *impl_drift_extras,
+            ],
+            usage_proxy=proxy_result.usage_proxy,
+            score=eval_result.score,
+            valid_submission=True,
+        )
+
+        # Emit score_recorded for replay (mirrors the evaluate command).
+        trace_store.emit(
+            event_type="score_recorded",
+            severity="info",
+            task_id=proxy_task,
+            payload={
+                "score": eval_result.score,
+                "metric_name": "roc_auc",
+                "experiment_id": proxy_exp,
+                "status": "valid",
+            },
+        )
+
+        console.print(
+            f"[bold green]research-proxy complete[/bold green] — "
+            f"fusion_id={fusion_id_known} score={eval_result.score:.6f}"
+        )
+    except KillSwitchActive as exc:
+        # Always pre-invoke (check_can_invoke is the only place that
+        # raises this). No provider call happened → no row.
+        console.print(f"[red]kill switch active: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except BudgetExceeded as exc:
+        if in_flight["invocation_started"]:
+            # Post-invoke: provider returned, then per-task cap or
+            # post-invoke run-level cap tripped in record_post_invoke.
+            # Persist with usage_proxy from the exception so consumed
+            # usage is durable for the next run's seeded accumulators.
+            _persist_inflight_blocked(
+                _persist_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=exc.usage_proxy,
+            )
+        # Pre-invoke (ProviderCallBreaker tripped in check_can_invoke):
+        # no row — that would inflate COUNT(*) into a fake provider call.
+        console.print(f"[red]budget exceeded ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    except SandboxViolation as exc:
+        # SandboxViolation only fires from inside wrap_invoke (sandbox is
+        # active during adapter.invoke), so invocation_started is always
+        # True here. Defensive guard kept for symmetry.
+        if in_flight["invocation_started"]:
+            _persist_inflight_blocked(
+                _persist_row,
+                in_flight,
+                exc.breaker.value,
+                str(exc),
+                usage_proxy=None,
+            )
+        console.print(f"[red]sandbox violation ({exc.breaker.value}): {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+
+def _require_artifact(
+    artifacts: list[str], *, suffix: str, step_label: str, provider_name: str
+) -> str:
+    """Find the first artifact whose path ends with `suffix`. Raise a clear
+    BadParameter if no match is found.
+
+    The bare `next(...)` form would raise StopIteration on a regression
+    where a provider drops the expected artifact (e.g., stub_claude
+    silently fails to write research_question.json). StopIteration
+    propagates as `RuntimeError: generator raised StopIteration` which
+    isn't caught by the chain's outer except handlers and gives the
+    operator no actionable message. This helper turns that into a
+    typer.BadParameter naming the step + provider so the failure is
+    self-describing.
+    """
+    match = next((a for a in artifacts if a.endswith(suffix)), None)
+    if match is None:
+        raise typer.BadParameter(
+            f"{step_label}: provider {provider_name!r} did not emit a "
+            f"{suffix!r} artifact (got {artifacts!r})"
+        )
+    return match
+
+
+def _persist_inflight_blocked(
+    persist_row,
+    in_flight: dict,
+    breaker_or_reason: str,
+    message: str,
+    *,
+    usage_proxy: UsageProxy | None = None,
+) -> None:
+    """Insert a status=blocked row for the in-flight step on mid-chain
+    exception. Skips if no step has started yet OR if invocation never
+    began (check_can_invoke raised pre-invoke). When usage_proxy is
+    provided (post-invoke BudgetExceeded), the row records the consumed
+    usage so arena budget status reflects what the failing call cost.
+
+    All research-proxy rows use experiment_type='research_proxy' (the
+    schema enum value); the step name lives in artifact_paths as a
+    <step:NAME> token, mirroring PR4's <PROVIDER_VERSION_CHANGED:...>
+    pattern."""
+    if in_flight["experiment_id"] is None:
+        return
+    if not in_flight.get("invocation_started"):
+        # Defense-in-depth: if the caller forgot to gate on this flag,
+        # we still skip the row insertion to avoid inflating provider_calls.
+        return
+    persist_row(
+        experiment_id=in_flight["experiment_id"],
+        task_id=in_flight["task_id"],
+        experiment_type="research_proxy",
+        adapter_name=in_flight["adapter_name"] or "unknown",
+        adapter_version=in_flight["adapter_version"] or "unknown",
+        status="blocked",
+        artifact_paths=[
+            f"<step:{in_flight['step']}>",
+            f"<blocked:{breaker_or_reason}>",
+            f"<message:{message[:200]}>",
+        ],
+        usage_proxy=usage_proxy,
+    )

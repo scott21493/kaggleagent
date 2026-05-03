@@ -1,5 +1,7 @@
+# arena/providers/stub_codex.py
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,20 +23,28 @@ class StubCodexProvider(ProviderAdapter):
     against hidden_labels will be ~0.5 (random); the goal is to prove the
     pipeline, not to win the fixture.
 
+    For role=implementation + phase=FUSION_PROXY_IMPLEMENTED (PR5), reads
+    the fusion_id from the inputs[0] (a path ending in fusion_proposal.json)
+    and appends a <fusion_id:{fusion_id}> token to the ProviderResult.artifacts
+    list.
+
+    The token is the link between the scoreboard row and the originating
+    fusion proposal. The CLI in Task 5 surfaces it through artifact_paths
+    so `arena replay` can reconstruct the chain.
+
+    The submission.csv shape is identical to calibration (constant 0.5);
+    PR7 with real Codex will produce non-trivial implementations grounded
+    in the fusion proposal. Backward compat: calibration packets (phase=
+    CALIBRATION_TASK_CREATED) continue to emit only submission.csv.
+
     Path assumption: invoke() reads `fixtures/<slug>/test.csv` relative to
-    the current working directory. The Phase 0 CLI invokes from repo root
-    (see Task 10's `arena init-fixture`), so this is consistent with the
-    rest of the harness. If a future caller needs to invoke from elsewhere,
-    add a `fixture_root` constructor argument and thread it through the
-    `inputs` resolution.
+    the current working directory. The Phase 0 CLI invokes from repo root,
+    so this is consistent with the rest of the harness.
 
     Optional fields exercise observability: failed_commands is a list of
     (command_str, exit_code) pairs that the stub emits as
     shell_command_observed events through `event_emitter` before producing
-    its normal result. Enables PR4's live waste-detector path tests
-    (security acceptance test 5: 4 identical failed commands → REPEATED_FAILURE
-    because Phase0HardCeilings.repeated_same_failure_per_task = 2 with
-    strict `>` check).
+    its normal result.
     """
 
     def __init__(
@@ -58,9 +68,6 @@ class StubCodexProvider(ProviderAdapter):
 
     def invoke(self, task_packet: dict) -> ProviderResult:
         validate("task_packet", task_packet)
-        # PR4 live waste path: emit shell_command_observed events for any
-        # injected failed_commands. These are picked up by the watchdog's
-        # WasteDetector observer (PR4 Task 6).
         if self._event_emitter is not None:
             for command, exit_code in self._failed_commands:
                 self._event_emitter.emit(
@@ -85,6 +92,14 @@ class StubCodexProvider(ProviderAdapter):
         submission_path = workspace / "submission.csv"
         submission.to_csv(submission_path, index=False)
 
+        artifacts: list[str] = [str(submission_path)]
+        # PR5: link the proxy submission back to its fusion_id so the
+        # scoreboard row carries the connection.
+        if task_packet["phase"] == "FUSION_PROXY_IMPLEMENTED":
+            fusion_id = self._read_fusion_id_from_inputs(task_packet["inputs"])
+            if fusion_id is not None:
+                artifacts.append(f"<fusion_id:{fusion_id}>")
+
         finished = datetime.now(UTC).isoformat(timespec="seconds")
         return build_result(
             task_id=task_id,
@@ -93,7 +108,7 @@ class StubCodexProvider(ProviderAdapter):
             status="success",
             stdout_path=str(workspace / "stdout.scrubbed"),
             stderr_path=str(workspace / "stderr.scrubbed"),
-            artifacts=[str(submission_path)],
+            artifacts=artifacts,
             input_chars=0,
             output_chars=submission_path.stat().st_size,
             wall_seconds=0.0,
@@ -103,3 +118,28 @@ class StubCodexProvider(ProviderAdapter):
             started_at=started,
             finished_at=finished,
         )
+
+    def _read_fusion_id_from_inputs(self, inputs: list[str]) -> str | None:
+        """Find the first input ending in `fusion_proposal.json` and read
+        its `fusion_id` field. Returns None if no such input exists or
+        the file is missing/malformed (the caller treats absence as
+        skipping the token; missing fusion_id on a FUSION_PROXY_IMPLEMENTED
+        packet is a programming error caught upstream by the CLI)."""
+        for input_path in inputs:
+            if not input_path.endswith("fusion_proposal.json"):
+                continue
+            p = Path(input_path)
+            if not p.exists():
+                return None
+            try:
+                payload: dict[str, object] = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return None
+            # json.loads returns Any; narrow explicitly so mypy's
+            # warn_return_any does not fire, and so a non-string fusion_id
+            # (malformed JSON, schema regression) cannot leak into
+            # artifact_paths as a token like "<fusion_id:None>" or
+            # "<fusion_id:42>".
+            fusion_id = payload.get("fusion_id")
+            return fusion_id if isinstance(fusion_id, str) else None
+        return None
