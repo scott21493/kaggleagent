@@ -53,27 +53,40 @@ Thin orchestration wrapper. Runs the full Phase-0 sequence per `docs/phase0/PHAS
 - `--providers stub` → (`stub_codex`, `stub_claude`)
 - `--providers real` → (`codex`, `claude`); `ProviderUnavailable` from any step is recorded as a step failure, not special-cased.
 
-**Step ordering (continue-collect with prerequisite skips):**
+**Run scoping** — `init-fixture` mints a fresh `run_id` (microsecond precision since PR6); the harness captures it after the init-fixture step succeeds and **filters every subsequent scoreboard lookup by that `run_id`**. This avoids the same cross-run bug class PR6 Task 2 fixed for `arena review`: if research-proxy fails inside *this* harness invocation but an older impl row from a prior run still exists for the same slug, we MUST NOT review/memory-propose against the stale row.
+
+Helper signatures take `run_id` explicitly:
+
+```python
+def _lookup_latest_impl_row(slug: str, *, run_id: str) -> str | None: ...
+def _lookup_latest_review_row(slug: str, *, run_id: str) -> str | None: ...
+```
+
+Both filter `WHERE competition_slug = ? AND run_id = ?` in addition to the artifact-token match. If the current harness run hasn't produced the prerequisite row, the dependent step is skipped with `reason="prerequisite missing in this run"`.
+
+**Step ordering (continue-collect with run-scoped prerequisite skips):**
 
 ```
-init-fixture
+init-fixture                    # captures run_id from the row it inserted
 plan
-run-next (calibration)         # uses codex_provider
-research-proxy                 # uses claude_provider
-if impl_exp_id (looked up from scoreboard):
+run-next (calibration)          # uses codex_provider
+research-proxy                  # uses claude_provider
+impl_exp_id = _lookup_latest_impl_row(slug, run_id=harness_run_id)
+if impl_exp_id:
     evaluate --latest
     review --experiment <impl>  # uses claude_provider
+    review_exp_id = _lookup_latest_review_row(slug, run_id=harness_run_id)
     if review_exp_id:
         memory propose --review <review>
     else:
-        skip ("review row not found")
+        skip ("review row not found in this run")
 else:
-    skip evaluate, review, memory propose ("impl row not found")
+    skip evaluate, review, memory propose ("impl row not found in this run")
 self-improve scan
 report
 ```
 
-Skipping `evaluate --latest` when no impl row exists is a semantic correction: evaluate's purpose in the loop is the proxy implementation, not the calibration row.
+Skipping `evaluate --latest` when no impl row exists in *this run* is a semantic correction: evaluate's purpose in the loop is the proxy implementation, not the calibration row, and "latest" must mean "latest within the run the harness just created."
 
 **Exception → step status mapping:**
 - `typer.Exit(0)` → `ok`
@@ -123,6 +136,22 @@ class RealCodexProvider(ProviderAdapter):
 
 `version=` is required (not defaulted); the CLI's `_get_provider` resolution path runs `provider_health.check(name)` first and passes the parsed version forward. If `health.code == OK` but `health.version is None`, treat as `ProviderUnavailable(code=ERROR)` before adapter construction (protects baseline file from null version writes).
 
+**`event_emitter` is required for `invoke()`.** Although the constructor accepts `event_emitter: TraceStore | None = None` to mirror the stub adapters' signature, real adapters MUST have a non-None `TraceStore` before `invoke()` runs — task packets do not carry `run_id`, and the wrapper cannot synthesize the correct `traces/<run_id>/<task_id>/` path without the emitter. `invoke()` raises a clear error at the top of the method body if `self._event_emitter is None`:
+
+```python
+def invoke(self, packet: dict[str, Any]) -> ProviderResult:
+    if self._event_emitter is None:
+        raise RuntimeError(
+            f"{type(self).__name__}.invoke requires event_emitter; "
+            "task packets do not carry run_id, so the wrapper cannot "
+            "route stdout/stderr persistence without a TraceStore. "
+            "Pass event_emitter= at construction time."
+        )
+    ...
+```
+
+Tests pass a real `TraceStore` (or a tmp_path-rooted instance) to every shim integration test. Constructor-level `event_emitter` keeps the abstract base signature uniform across stub + real adapters; runtime-level requirement fails fast on misuse.
+
 ### 4.1 `invoke()` flow (both adapters)
 
 1. Write `task_packet` JSON to `cwd / ".arena_prompts" / f"prompt_{task_id}.json"` (per ADR-0004 stdin contract; avoids inline stdin which mishandles on Windows + WSL2).
@@ -131,7 +160,7 @@ class RealCodexProvider(ProviderAdapter):
    - Claude: `[executable, "-p", "--input", str(tmp_file), "--workspace", str(cwd)]`
 3. `subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=timeout_seconds, env=effective_env, cwd=str(cwd))` where `effective_env = {**os.environ, **(env or {})}`.
    - `FileNotFoundError` → `ProviderUnavailable(code=NOT_FOUND, ...)` raised — controller-level error, NO scoreboard row, NO trace event.
-   - `subprocess.TimeoutExpired` → `ProviderResult(status="killed", reason="wall_clock_timeout")` plus partial scrubbed output if any.
+   - `subprocess.TimeoutExpired` → `ProviderResult(status="killed")` with `<killed:wall_clock_timeout>` token in `artifacts`, plus partial scrubbed output if any. (`ProviderResult` has no `reason` field — schema is closed; all sub-status detail flows through artifact tokens.)
 4. `wall_seconds = time.monotonic() - start` (independent of any provider-reported usage).
 5. Persist raw `stdout` / `stderr` via `TraceStore.write_provider_streams(...)` BEFORE any parsing (forensic recovery if scrubber has a bug). Apply scrubber; persist scrubbed via the same API. Raw paths NEVER appear in `ProviderResult.artifacts`, are NEVER passed back into provider context, are NEVER emitted to the trace event stream, are NEVER rendered in `arena report`.
 6. Map exit code:
@@ -142,7 +171,7 @@ class RealCodexProvider(ProviderAdapter):
 | `1` | `failure` → upgrade to `blocked` + `<blocked:AuthFailureBreaker>` + `<runbook:docs/phase0/runbooks/auth_expiry.md>` artifact tokens if `matches_auth_expiry(stderr)` matches | yes (fallback) |
 | `2` | `blocked` (reason from packet hint or generic) | no |
 | `≥ 64` | `blocked` + AuthFailureBreaker + runbook tokens (exit code dispositive) | no |
-| signal-induced (`TimeoutExpired`) | `killed`, `reason="wall_clock_timeout"` | no |
+| signal-induced (`TimeoutExpired`) | `killed` + `<killed:wall_clock_timeout>` token | no |
 | `FileNotFoundError` | `ProviderUnavailable` raised; no row, no event | n/a |
 
 `ProviderResult.status` stays inside the schema enum (`success | failure | blocked | killed | interrupted`). `BLOCKED_AUTH` lives only in `HealthCode` and CLI display labels — never as a result status.
@@ -166,7 +195,7 @@ On parser failure, the four `parsed.*` fields default to 0; wall_seconds and cha
 
 ### 4.3 Parser split
 
-`arena/providers/codex.py::_parse_codex_ndjson(scrubbed_stdout) -> dict`: NDJSON event stream. The final event SHOULD summarize artifacts + usage; if absent, returns sentinel mapping to `ProviderResult(status="failure", reason="missing_terminal_event")` (resolves ADR-0004 open question #3).
+`arena/providers/codex.py::_parse_codex_ndjson(scrubbed_stdout) -> dict`: NDJSON event stream. The final event SHOULD summarize artifacts + usage; if absent, returns a sentinel that the wrapper maps to `ProviderResult(status="failure")` with a `<failure:missing_terminal_event>` token in `artifacts` (resolves ADR-0004 open question #3). Same pattern for Claude: parse failure → `ProviderResult(status="failure")` + `<failure:json_decode_error>` or `<failure:schema_violation>` token. The schema's closed-`additionalProperties` design means all sub-status reasons flow through artifact tokens, never as a `reason` field.
 
 `arena/providers/claude.py::_parse_claude_response(scrubbed_stdout, *, role, phase) -> dict`: single-JSON stdout. Validates against the role+phase-appropriate schema. Dispatch table (mirrors stub_claude 1:1):
 
@@ -215,10 +244,26 @@ class ProviderUnavailable(RuntimeError):
     def __init__(
         self,
         provider: str,
-        code: HealthCode | str,
+        code: str,                      # str at runtime to avoid circular import
         detail: str,
         runbook: str | None = None,
     ) -> None: ...
+```
+
+**Circular-import note:** `ProviderUnavailable` lives in `arena/providers/base.py`; `HealthCode` lives in `arena/providers/health.py`. If we typed `code` as `HealthCode | str` directly, `base.py` would import `health.py`, which itself imports stubs/base — a circular import path. Two options:
+
+1. **Type `code` as `str` at runtime** (chosen). Callers pass `health.code.value` (e.g., `"not_found"`, `"blocked_auth"`); the exception stores the string verbatim. Tests assert on string values, not on `HealthCode` instances.
+2. ~~`from __future__ import annotations` + `TYPE_CHECKING` guard~~ (rejected — postponed annotations only help static-checking imports; runtime `__init__` still needs the type).
+
+Option 1 keeps `base.py` dependency-free and lets `health.py` import freely from `base.py` (which is the natural direction). Caller idiom:
+
+```python
+raise ProviderUnavailable(
+    provider=name,
+    code=health.code.value,   # str: "not_found" | "blocked_auth" | ...
+    detail=health.detail,
+    runbook=health.runbook,
+)
 ```
 
 Caught explicitly at:
@@ -428,7 +473,7 @@ Four punch-list items from the ADR; each resolved in PR7 and the ADR updated inl
 |---|---|
 | #1 — Exact flag spelling | Pinned to the shim's accepted argv set: Codex `[exec, --json, --workspace-write, <ws>, --prompt-file, <path>]`; Claude `[-p, --input, <path>, --workspace, <ws>]`. Real CLI version drift surfaces via `BLOCKED_PROVIDER_CAPABILITY`. |
 | #2 — Auth-expiry stderr fingerprint | Conservative seed list at `arena/providers/auth.py::AUTH_EXPIRY_PATTERNS`. Marked "not real-provider-verified yet"; runbook documents the maintenance loop for first real-auth-failure observation. |
-| #3 — Codex terminal-event behaviour | If absent, parser returns sentinel mapping to `ProviderResult(status="failure", reason="missing_terminal_event")`. |
+| #3 — Codex terminal-event behaviour | If absent, parser returns sentinel mapping to `ProviderResult(status="failure")` with `<failure:missing_terminal_event>` token in `artifacts` (no `reason` field — schema is closed). |
 | #4 — Streaming vs buffering | PR7 buffers (per ADR's stated default). |
 
 ADR status header changes from `accepted (forward-looking; verified-on-implement at PR7)` to `accepted (verified)`.
