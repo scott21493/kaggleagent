@@ -161,6 +161,18 @@ def check(
             env=effective_env,
             cwd=cwd_str,
         )
+    except FileNotFoundError:
+        # Narrow race: the executable that succeeded for --version is
+        # gone before --help. The contract is cleaner if both probes
+        # map missing-binary to NOT_FOUND uniformly.
+        return ProviderHealth(
+            provider=name,
+            code=HealthCode.NOT_FOUND,
+            version=parsed_version,
+            sandbox_mode=None,
+            detail=f"{exe} disappeared between --version and --help",
+            runbook=_RUNBOOK_REGRESSION,
+        )
     except subprocess.TimeoutExpired:
         return ProviderHealth(
             provider=name,

@@ -50,6 +50,30 @@ def test_check_real_codex_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     assert h.runbook == "docs/phase0/runbooks/cli_regression.md"
 
 
+def test_check_real_codex_not_found_on_help_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Second-probe FileNotFoundError (binary disappeared between
+    --version and --help) → NOT_FOUND uniformly. Narrow race, but the
+    typed health core's contract maps missing-binary to NOT_FOUND on
+    BOTH probes."""
+
+    calls = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        calls["n"] += 1
+        if argv[1] == "--version":
+            return MagicMock(returncode=0, stdout="codex 0.4.2\n", stderr="")
+        # Second probe (--help): binary is now gone
+        raise FileNotFoundError("codex")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    h = check("codex")
+    assert calls["n"] == 2  # both probes ran
+    assert h.code == HealthCode.NOT_FOUND
+    assert h.version == "0.4.2"  # version was parsed before --help failed
+    assert h.runbook == "docs/phase0/runbooks/cli_regression.md"
+    assert "disappeared" in h.detail.lower()
+
+
 def test_check_real_codex_ok_via_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """--version returns 0 with parseable output; --help returns 0."""
     calls: list[list[str]] = []
