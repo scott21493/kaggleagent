@@ -273,6 +273,100 @@ def test_invoke_review_role_validates_against_research_review_schema(
     assert result.status == "success"
 
 
+def test_invoke_review_success_persists_research_review_json_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real Claude is advisory: it returns content, not files. The
+    adapter MUST materialise the validated JSON to <cwd>/<schema>.json
+    and append the path to ProviderResult.artifacts. Otherwise
+    arena review's _require_artifact(suffix='research_review.json')
+    will fail with 'did not emit artifact' on a successful Claude
+    invocation.
+
+    Mirrors the stub_claude convention: the artifact lives at
+    <workspace>/<schema_name>.json and ends up in result.artifacts."""
+    from arena.schemas.validate import validate as validate_schema
+
+    valid_review = json.dumps(
+        {
+            "schema_version": "research_review.v1",
+            "review_id": "rr_0001",
+            "competition_slug": "tabular_binary_v1",
+            "subject_id": "fusion_0001",
+            "decision": "accept",
+            "summary": "Proposal looks reasonable for the proxy slice.",
+            "strengths": ["clear mechanism"],
+            "weaknesses": [],
+            "required_fixes": [],
+            "follow_up_recommendations": [],
+            "risk_level": "low",
+        }
+    )
+
+    def fake_run(*a, **kw):
+        return MagicMock(returncode=0, stdout=valid_review, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealClaudeProvider(
+        executable="claude",
+        version="0.3.1",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet(role="review", phase="FUSION_PROXY_REVIEWED")
+    result = p.invoke(packet)
+    assert result.status == "success"
+    # Same suffix-match the CLI uses (arena/cli.py:_require_artifact).
+    rr_paths = [a for a in result.artifacts if a.endswith("research_review.json")]
+    assert len(rr_paths) == 1, (
+        f"expected exactly one research_review.json artifact, got {result.artifacts!r}"
+    )
+    rr_path = Path(rr_paths[0])
+    assert rr_path.exists(), f"materialised artifact not on disk: {rr_path}"
+    assert rr_path.parent == tmp_path, (
+        f"artifact must be persisted under cwd ({tmp_path}); got parent {rr_path.parent}"
+    )
+    # Round-trip the file through the schema to confirm what we wrote
+    # is actually valid (catches regressions where we write the wrong
+    # payload shape, e.g., write the request packet instead of the
+    # response).
+    payload = json.loads(rr_path.read_text(encoding="utf-8"))
+    validate_schema("research_review", payload)
+    assert payload["decision"] == "accept"
+    assert payload["review_id"] == "rr_0001"
+
+
+def test_invoke_review_failure_does_not_persist_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema-violation on the success path → no <schema>.json file
+    is written. Only the <failure:schema_violation> token appears in
+    artifacts. Pins the inverse of the persistence behaviour above."""
+
+    def fake_run(*a, **kw):
+        # Valid JSON shape but missing required fields → schema_violation
+        return MagicMock(returncode=0, stdout='{"foo": "bar"}', stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealClaudeProvider(
+        executable="claude",
+        version="0.3.1",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet(role="review", phase="FUSION_PROXY_REVIEWED")
+    result = p.invoke(packet)
+    assert result.status == "failure"
+    assert "<failure:schema_violation>" in result.artifacts
+    # No JSON artifact materialised on failure
+    assert not (tmp_path / "research_review.json").exists()
+    assert not any(a.endswith("research_review.json") for a in result.artifacts)
+
+
 def test_invoke_invalid_json_returns_failure_with_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -175,6 +175,21 @@ class RealClaudeProvider(ProviderAdapter):
             parse_outcome = _parse_claude_response(scrubbed_stdout, role=role, phase=phase)
             if parse_outcome["status"] == "success":
                 status = "success"
+                # Materialise the validated JSON so downstream CLI
+                # consumers can find it via _require_artifact(suffix=
+                # "<schema>.json"). Claude is advisory: the CLI invokes
+                # the subprocess but the adapter must persist the
+                # advisory artifact (codex executes shell and writes
+                # files itself; Claude returns content). Path mirrors
+                # stub_claude: <cwd>/<schema_name>.json.
+                schema_name = parse_outcome["schema_name"]
+                payload = parse_outcome["payload"]
+                artifact_path = self._cwd / f"{schema_name}.json"
+                artifact_path.write_text(
+                    json.dumps(payload, indent=2),
+                    encoding="utf-8",
+                )
+                artifacts.append(str(artifact_path))
             else:
                 status = "failure"
                 artifacts.append(f"<failure:{parse_outcome['reason']}>")
@@ -230,8 +245,19 @@ class RealClaudeProvider(ProviderAdapter):
 def _parse_claude_response(scrubbed_stdout: str, *, role: str, phase: str) -> dict[str, Any]:
     """Parse + role-phase-validate claude's single-JSON stdout.
 
-    Returns ``{"status": "success"}`` on parse + schema-valid; otherwise
-    ``{"status": "failure", "reason": "json_decode_error" | "schema_violation"}``.
+    On success, returns ``{"status": "success", "schema_name": <name>,
+    "payload": <parsed-dict>}`` so the adapter can persist the
+    validated JSON to ``<cwd>/<schema_name>.json`` (matching the
+    stub_claude convention) and append the path to
+    ``ProviderResult.artifacts``. Without this bridging, downstream CLI
+    consumers (``arena research-proxy``, ``arena review``) that look up
+    artifacts via ``_require_artifact(suffix="research_review.json")``
+    would fail with "did not emit artifact" even on a valid Claude
+    invocation — Claude is advisory and emits content, not files; the
+    adapter is responsible for materialising the file.
+
+    On failure, returns ``{"status": "failure", "reason":
+    "json_decode_error" | "schema_violation"}``.
 
     Unlike codex's NDJSON parser (which counts malformed lines for a
     drift signal), Claude's parser is single-JSON: a parse failure IS
@@ -248,4 +274,4 @@ def _parse_claude_response(scrubbed_stdout: str, *, role: str, phase: str) -> di
         validate_schema(schema_name, payload)
     except ValidationError:
         return {"status": "failure", "reason": "schema_violation"}
-    return {"status": "success"}
+    return {"status": "success", "schema_name": schema_name, "payload": payload}
