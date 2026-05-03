@@ -265,6 +265,62 @@ def test_invoke_uses_packet_allowed_paths_workspace(
     assert not (tmp_path / ".arena_prompts").exists()
 
 
+def test_invoke_resolves_relative_allowed_paths_against_adapter_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the codex test: relative allowed_paths must resolve
+    against self._cwd (adapter override), NOT the process cwd. Pinned
+    here for the artifact-materialisation path too — a relative path
+    must produce <adapter_cwd>/<workspace>/<schema>.json, not
+    <process_cwd>/<workspace>/<schema>.json. No chdir."""
+    valid_review = json.dumps(
+        {
+            "schema_version": "research_review.v1",
+            "review_id": "rr_0001",
+            "competition_slug": "tabular_binary_v1",
+            "subject_id": "fusion_0001",
+            "decision": "accept",
+            "summary": "Proposal looks reasonable for the proxy slice.",
+            "strengths": ["clear mechanism"],
+            "weaknesses": [],
+            "required_fixes": [],
+            "follow_up_recommendations": [],
+            "risk_level": "low",
+        }
+    )
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return MagicMock(returncode=0, stdout=valid_review, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealClaudeProvider(
+        executable="claude",
+        version="0.3.1",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet(role="review", phase="FUSION_PROXY_REVIEWED")
+    packet["allowed_paths"] = ["worktrees/tabular_binary_v1/exp_1234/"]
+    p.invoke(packet)
+
+    expected = (tmp_path / "worktrees" / "tabular_binary_v1" / "exp_1234").resolve()
+    assert captured["cwd"] == str(expected)
+    assert (expected / "research_review.json").exists()
+    # Process-cwd-relative location must NOT have been written
+    process_cwd_artifact = Path("worktrees/tabular_binary_v1/exp_1234/research_review.json")
+    if process_cwd_artifact.exists():
+        # Sanity guard — if for some reason this exists in the repo
+        # already, our test isn't useful. But it shouldn't.
+        raise AssertionError(
+            f"unexpected pre-existing artifact at {process_cwd_artifact!r} "
+            "would mask the regression"
+        )
+
+
 def test_invoke_writes_provider_streams_via_tracestore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

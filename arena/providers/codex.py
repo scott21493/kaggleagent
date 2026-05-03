@@ -97,8 +97,19 @@ class RealCodexProvider(ProviderAdapter):
         #     write resolves correctly relative to the per-experiment
         #     dir, not the repo root)
         #   - PR3's packet-scoped write boundary is honoured
+        #
+        # Relative allowed_paths entries (the normal case — packets
+        # carry "worktrees/<slug>/<exp_id>/") are resolved against
+        # self._cwd, NOT the process CWD. The DI contract says self._cwd
+        # is the adapter's repo-root anchor and is overridable for
+        # tests; resolving against the process CWD would silently
+        # ignore that override. Absolute paths are honoured as-is.
         if task_packet.get("allowed_paths"):
-            workspace = Path(task_packet["allowed_paths"][0]).resolve()
+            allowed = Path(task_packet["allowed_paths"][0])
+            if allowed.is_absolute():
+                workspace = allowed.resolve()
+            else:
+                workspace = (self._cwd / allowed).resolve()
         else:
             workspace = self._cwd
         workspace.mkdir(parents=True, exist_ok=True)

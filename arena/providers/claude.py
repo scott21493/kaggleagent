@@ -116,8 +116,16 @@ class RealClaudeProvider(ProviderAdapter):
         #     convention)
         #   - subprocess cwd is the packet workspace (so claude --workspace
         #     resolves correctly)
+        #
+        # Relative allowed_paths are resolved against self._cwd, NOT
+        # the process CWD — see the matching note in codex.py. Absolute
+        # paths are honoured as-is.
         if task_packet.get("allowed_paths"):
-            workspace = Path(task_packet["allowed_paths"][0]).resolve()
+            allowed = Path(task_packet["allowed_paths"][0])
+            if allowed.is_absolute():
+                workspace = allowed.resolve()
+            else:
+                workspace = (self._cwd / allowed).resolve()
         else:
             workspace = self._cwd
         workspace.mkdir(parents=True, exist_ok=True)

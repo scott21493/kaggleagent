@@ -344,6 +344,53 @@ def test_invoke_uses_packet_allowed_paths_workspace(
     )
 
 
+def test_invoke_resolves_relative_allowed_paths_against_adapter_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production packets carry RELATIVE allowed_paths like
+    'worktrees/<slug>/<exp_id>/'. The DI contract says self._cwd is
+    the adapter's repo-root anchor and is overridable for tests.
+    Path(...).resolve() on a bare relative path uses the PROCESS cwd,
+    silently ignoring the adapter cwd override. The fix: resolve
+    relative paths against self._cwd; absolute paths as-is.
+
+    This test deliberately does NOT monkeypatch.chdir(tmp_path) — it
+    proves the resolver works on the adapter's _cwd, not on whatever
+    the pytest process CWD happens to be."""
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return MagicMock(
+            returncode=0,
+            stdout='{"event":"done","artifacts":[],"usage":{}}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet()
+    # RELATIVE path — should resolve against adapter cwd (tmp_path),
+    # NOT against the pytest process CWD (the repo root).
+    packet["allowed_paths"] = ["worktrees/tabular_binary_v1/exp_1234/"]
+    p.invoke(packet)
+
+    expected = (tmp_path / "worktrees" / "tabular_binary_v1" / "exp_1234").resolve()
+    assert captured["cwd"] == str(expected), (
+        f"relative allowed_paths must resolve against adapter cwd, not process cwd; "
+        f"got {captured['cwd']!r}; expected {str(expected)!r}"
+    )
+    # Prompt file ALSO landed under the resolved workspace
+    assert (expected / ".arena_prompts" / "prompt_task_0001.json").exists()
+
+
 def test_invoke_writes_provider_streams_via_tracestore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
