@@ -194,6 +194,77 @@ def test_invoke_records_deterministic_usage_on_failure(
     assert result.usage_proxy["waste_events"] == 0
 
 
+def test_invoke_uses_packet_allowed_paths_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production callers populate packet.allowed_paths[0] with the
+    per-experiment worktree. The adapter MUST use that path for prompt
+    files, subprocess cwd, --workspace flag, AND advisory artifact
+    materialization. Without this, repeated invocations would
+    overwrite a shared root-level <schema>.json file across runs;
+    scoreboard rows from older runs would point at mutated artifacts.
+    """
+    valid_review = json.dumps(
+        {
+            "schema_version": "research_review.v1",
+            "review_id": "rr_0001",
+            "competition_slug": "tabular_binary_v1",
+            "subject_id": "fusion_0001",
+            "decision": "accept",
+            "summary": "Proposal looks reasonable for the proxy slice.",
+            "strengths": ["clear mechanism"],
+            "weaknesses": [],
+            "required_fixes": [],
+            "follow_up_recommendations": [],
+            "risk_level": "low",
+        }
+    )
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["cwd"] = kwargs.get("cwd")
+        return MagicMock(returncode=0, stdout=valid_review, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    workspace = tmp_path / "worktrees" / "tabular_binary_v1" / "exp_1234"
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    # Adapter's _cwd is tmp_path (NOT the workspace) — we're proving
+    # packet.allowed_paths overrides the constructor default.
+    p = RealClaudeProvider(
+        executable="claude",
+        version="0.3.1",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet(role="review", phase="FUSION_PROXY_REVIEWED")
+    packet["allowed_paths"] = [str(workspace)]
+    result = p.invoke(packet)
+
+    expected_workspace = workspace.resolve()
+    assert captured["cwd"] == str(expected_workspace), (
+        f"subprocess cwd must be packet workspace, got {captured['cwd']!r}"
+    )
+    # --workspace argument also points at the packet workspace
+    ws_idx = captured["argv"].index("--workspace")
+    assert captured["argv"][ws_idx + 1] == str(expected_workspace)
+    # Prompt file lands under the packet workspace
+    prompt_file = expected_workspace / ".arena_prompts" / "prompt_task_0001.json"
+    assert prompt_file.exists(), f"prompt file missing at {prompt_file}"
+    # Advisory artifact is materialized under the packet workspace
+    rr_path = expected_workspace / "research_review.json"
+    assert rr_path.exists(), f"research_review.json missing at {rr_path}"
+    assert any(a.endswith(str(rr_path)) or Path(a) == rr_path for a in result.artifacts), (
+        f"result.artifacts must reference the packet-workspace artifact path; "
+        f"got {result.artifacts!r}"
+    )
+    # AND adapter's _cwd should NOT have a stray research_review.json or
+    # .arena_prompts dir (proves the override took effect)
+    assert not (tmp_path / "research_review.json").exists()
+    assert not (tmp_path / ".arena_prompts").exists()
+
+
 def test_invoke_writes_provider_streams_via_tracestore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

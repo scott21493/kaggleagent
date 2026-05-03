@@ -105,7 +105,23 @@ class RealClaudeProvider(ProviderAdapter):
         role = task_packet.get("role", "")
         phase = task_packet.get("phase", "")
 
-        prompt_dir = self._cwd / ".arena_prompts"
+        # Per-packet workspace resolution. The packet's first allowed_paths
+        # entry is the per-experiment worktree per controller convention
+        # since PR1. Falling back to self._cwd preserves the test-only
+        # path where _packet() has empty allowed_paths. Production callers
+        # always populate allowed_paths, so:
+        #   - the advisory artifact lands at <packet_workspace>/<schema>.json
+        #     (avoids overwriting a shared root-level file across runs;
+        #     matches stub_claude's worktrees/<slug>/<exp_id>/<schema>.json
+        #     convention)
+        #   - subprocess cwd is the packet workspace (so claude --workspace
+        #     resolves correctly)
+        if task_packet.get("allowed_paths"):
+            workspace = Path(task_packet["allowed_paths"][0]).resolve()
+        else:
+            workspace = self._cwd
+        workspace.mkdir(parents=True, exist_ok=True)
+        prompt_dir = workspace / ".arena_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = prompt_dir / f"prompt_{task_id}.json"
         prompt_json = json.dumps(task_packet, ensure_ascii=False)
@@ -117,7 +133,7 @@ class RealClaudeProvider(ProviderAdapter):
             "--input",
             str(prompt_file),
             "--workspace",
-            str(self._cwd),
+            str(workspace),
         ]
         effective_env = {**os.environ, **self._env_overlay}
 
@@ -134,7 +150,7 @@ class RealClaudeProvider(ProviderAdapter):
                 check=False,
                 timeout=self._timeout_seconds,
                 env=effective_env,
-                cwd=str(self._cwd),
+                cwd=str(workspace),
             )
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
@@ -184,7 +200,7 @@ class RealClaudeProvider(ProviderAdapter):
                 # stub_claude: <cwd>/<schema_name>.json.
                 schema_name = parse_outcome["schema_name"]
                 payload = parse_outcome["payload"]
-                artifact_path = self._cwd / f"{schema_name}.json"
+                artifact_path = workspace / f"{schema_name}.json"
                 artifact_path.write_text(
                     json.dumps(payload, indent=2),
                     encoding="utf-8",

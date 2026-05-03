@@ -290,6 +290,60 @@ def test_invoke_exit_0_with_terminal_event_returns_success(
     assert result.usage_proxy["shell_commands"] == 3
 
 
+def test_invoke_uses_packet_allowed_paths_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production callers (run-next, research-proxy) populate
+    packet.allowed_paths[0] with the per-experiment worktree. The
+    adapter MUST use that path for prompt files, subprocess cwd, and
+    --workspace-write — NOT the static self._cwd. Otherwise codex runs
+    from the repo root and PR3's packet-scoped write boundary breaks.
+    """
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["cwd"] = kwargs.get("cwd")
+        return MagicMock(
+            returncode=0,
+            stdout='{"event":"done","artifacts":[],"usage":{}}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    workspace = tmp_path / "worktrees" / "tabular_binary_v1" / "exp_1234"
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    # Adapter's _cwd is intentionally tmp_path (NOT the workspace) —
+    # we're proving the packet's allowed_paths overrides the
+    # constructor default.
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    packet = _packet()
+    packet["allowed_paths"] = [str(workspace)]
+    p.invoke(packet)
+
+    expected_workspace = workspace.resolve()
+    assert captured["cwd"] == str(expected_workspace), (
+        f"subprocess cwd must be packet workspace, got {captured['cwd']!r}"
+    )
+    # --workspace-write argument also points at the packet workspace
+    ws_idx = captured["argv"].index("--workspace-write")
+    assert captured["argv"][ws_idx + 1] == str(expected_workspace)
+    # Prompt file landed under the packet workspace, NOT under tmp_path root
+    prompt_file = expected_workspace / ".arena_prompts" / "prompt_task_0001.json"
+    assert prompt_file.exists(), f"prompt file missing at {prompt_file}"
+    # AND the adapter's _cwd should NOT have a stray .arena_prompts dir
+    assert not (tmp_path / ".arena_prompts").exists(), (
+        "adapter wrote prompt to its _cwd instead of the packet workspace — "
+        "PR3 packet-scoped write boundary violated"
+    )
+
+
 def test_invoke_writes_provider_streams_via_tracestore(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

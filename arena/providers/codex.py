@@ -84,7 +84,25 @@ class RealCodexProvider(ProviderAdapter):
         # cheap; CLI also pre-validates).
         validate_schema("task_packet", task_packet)
         task_id = task_packet["task_id"]
-        prompt_dir = self._cwd / ".arena_prompts"
+        # Per-packet workspace resolution. The active workspace is the
+        # packet's first allowed_paths entry (the per-experiment
+        # worktree per controller convention since PR1). Falling back
+        # to self._cwd preserves the test-only path where _packet()
+        # has empty allowed_paths and tests pin the adapter's _cwd to
+        # tmp_path. Production callers (arena run-next + research-proxy)
+        # always populate allowed_paths, so production never falls
+        # through to self._cwd. This guarantees:
+        #   - prompt files live under <packet_workspace>/.arena_prompts/
+        #   - subprocess cwd == packet workspace (so codex --workspace-
+        #     write resolves correctly relative to the per-experiment
+        #     dir, not the repo root)
+        #   - PR3's packet-scoped write boundary is honoured
+        if task_packet.get("allowed_paths"):
+            workspace = Path(task_packet["allowed_paths"][0]).resolve()
+        else:
+            workspace = self._cwd
+        workspace.mkdir(parents=True, exist_ok=True)
+        prompt_dir = workspace / ".arena_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         prompt_file = prompt_dir / f"prompt_{task_id}.json"
         prompt_json = json.dumps(task_packet, ensure_ascii=False)
@@ -95,7 +113,7 @@ class RealCodexProvider(ProviderAdapter):
             "exec",
             "--json",
             "--workspace-write",
-            str(self._cwd),
+            str(workspace),
             "--prompt-file",
             str(prompt_file),
         ]
@@ -114,7 +132,7 @@ class RealCodexProvider(ProviderAdapter):
                 check=False,
                 timeout=self._timeout_seconds,
                 env=effective_env,
-                cwd=str(self._cwd),
+                cwd=str(workspace),
             )
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
