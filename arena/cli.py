@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
+from jsonschema import ValidationError
 from rich.console import Console
 
 from arena.budget.governor import BudgetExceeded, BudgetGovernor, RunAccumulators
@@ -17,6 +18,11 @@ from arena.controller.watchdog import KillSwitchActive, Watchdog
 from arena.controller.worktree import create_workspace
 from arena.fixture.evaluator import evaluate_fixture_submission
 from arena.fixture.manifest import compute_fixture_set_digest, validate_fixture_manifest
+from arena.memory.proposal import (
+    get_next_proposal_id,
+    synthesize_memory_proposal,
+    validate_memory_update,
+)
 from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
@@ -45,6 +51,8 @@ from arena.schemas.validate import validate as validate_schema
 from arena.scoreboard.store import ScoreboardStore
 
 app = typer.Typer(help="Kaggle Agent Arena Phase 0 harness CLI.")
+memory_app = typer.Typer(help="Memory proposal commands.")
+app.add_typer(memory_app, name="memory")
 console = Console()
 
 DB_PATH = Path("scoreboard.sqlite")
@@ -1613,4 +1621,106 @@ def _persist_inflight_blocked(
             f"<message:{message[:200]}>",
         ],
         usage_proxy=usage_proxy,
+    )
+
+
+@memory_app.command("propose")
+def memory_propose(
+    competition_slug: str,
+    review: str = typer.Option(
+        ...,
+        "--review",
+        help="experiment_id of the review row whose research_review.json "
+        "drives the synthesized memory proposal.",
+    ),
+) -> None:
+    """Synthesize a memory_update.json proposal from a review row.
+
+    Deterministic-controller action: NO provider invocation, NO
+    scoreboard row, provider_calls unchanged. Output is a durable
+    artifact at memory/proposals/mem_NNNN.json plus a
+    memory_proposal_created trace event whose payload uses ONLY keys
+    permitted by schemas/event.schema.json.
+    """
+    store = _store()
+
+    # Resolve the review row + its run_id FIRST. The trace event's
+    # run_id MUST be the review row's own run, not _latest_run_id().
+    # Memory proposals don't create scoreboard rows, so the
+    # memory_proposal_created trace event is the durable linkage between
+    # the proposal artifact and the review experiment that drove it.
+    # Mirrors the same fix applied to `arena review` for cross-run
+    # linkage.
+    review_row = (
+        store._require_conn()
+        .execute(
+            "SELECT run_id, artifact_paths FROM experiments "
+            "WHERE competition_slug = ? AND experiment_id = ?",
+            (competition_slug, review),
+        )
+        .fetchone()
+    )
+    if review_row is None:
+        raise typer.BadParameter(f"experiment {review} not found for {competition_slug}")
+    run_id = review_row["run_id"]
+    if not run_id:
+        raise typer.BadParameter(f"experiment {review} has no run_id (corrupt scoreboard?)")
+    review_paths: list[str] = json.loads(review_row["artifact_paths"])
+    if "<step:review>" not in review_paths:
+        raise typer.BadParameter(
+            f"experiment {review} is not a review row (no <step:review> token in artifact_paths)"
+        )
+    research_review_path = next(
+        (p for p in review_paths if p.endswith("research_review.json")),
+        None,
+    )
+    if research_review_path is None:
+        raise typer.BadParameter(
+            f"review row {review} has no research_review.json in "
+            "artifact_paths (corrupt scoreboard?)"
+        )
+
+    try:
+        review_payload = json.loads(Path(research_review_path).read_text(encoding="utf-8"))
+        validate_schema("research_review", review_payload)
+    except (json.JSONDecodeError, FileNotFoundError) as exc:
+        raise typer.BadParameter(
+            f"failed to read research_review.json at {research_review_path}: {exc}"
+        ) from exc
+    except ValidationError as exc:
+        # Schema-invalid research_review.json: surface as a clean
+        # BadParameter rather than letting the ValidationError escape
+        # as an unhandled exception.
+        raise typer.BadParameter(
+            f"research_review.json at {research_review_path} is schema-invalid: {exc.message}"
+        ) from exc
+
+    proposals_dir = Path("memory/proposals")
+    proposals_dir.mkdir(parents=True, exist_ok=True)
+    proposal_id = get_next_proposal_id(proposals_dir)
+    proposal = synthesize_memory_proposal(review_payload, proposal_id=proposal_id)
+    validate_memory_update(proposal)
+    proposal_path = proposals_dir / f"{proposal_id}.json"
+    proposal_path.write_text(json.dumps(proposal, indent=2), encoding="utf-8")
+
+    # Emit trace event with ONLY event.schema.json-permitted keys.
+    trace_store = TraceStore(run_id=run_id, root=TRACES_ROOT)
+    trace_store.emit(
+        event_type="memory_proposal_created",
+        severity="info",
+        payload={
+            "message": f"memory proposal {proposal_id} synthesized from review {review}",
+            "phase": Phase.MEMORY_PROPOSAL_CREATED.value,
+            "proposal_id": proposal_id,
+            "memory_update_id": proposal_id,
+            "experiment_id": review,
+            "review_id": review_payload["review_id"],
+            "path": str(proposal_path),
+            "paths": [research_review_path],
+        },
+    )
+    console.print(
+        f"[green]memory proposal[/green] {proposal_id} "
+        f"({proposal['operation']} in {proposal['namespace']}) "
+        f"written to {proposal_path}"
     )
