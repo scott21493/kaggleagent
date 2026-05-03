@@ -48,6 +48,15 @@ def compare_metrics(champion: Metrics, challenger: Metrics) -> ComparisonResult:
     reasons: list[str] = []
     if challenger.score < champion.score:
         reasons.append(f"score regression: {challenger.score:.4f} < {champion.score:.4f}")
+    # `score_delta <= 0` means "no score gain to justify the cost".
+    # IEEE-754 noise here (e.g., -1e-17 from sum-of-folds arithmetic)
+    # biases toward firing the freeze, which is the safe direction:
+    # spurious freeze on truly-equal scores is far less harmful than
+    # missed freeze on a genuine cost regression. The `> 0` guards on
+    # champion.wall_seconds / champion.provider_calls below skip the
+    # ratio check when the champion is unmeasured (Phase-0 stubs report
+    # 0.0 wall_seconds), preventing trivial regressions like
+    # "0.001 > 1.20 * 0.0 = 0".
     if (
         champion.wall_seconds > 0
         and challenger.wall_seconds > 1.20 * champion.wall_seconds

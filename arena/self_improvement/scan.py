@@ -37,6 +37,7 @@ def scan_runs(
     store: ScoreboardStore,
     runs_root: Path,
     baselines_root: Path,
+    traces_root: Path = Path("traces"),
 ) -> list[Finding]:
     """Scan all scoreboard rows + traces + baselines for `slug` and
     return findings.
@@ -217,7 +218,7 @@ def scan_runs(
     for row in rows:
         if not row["task_id"] or not row["run_id"]:
             continue
-        canonical = Path("traces") / row["run_id"] / row["task_id"] / "events.jsonl"
+        canonical = traces_root / row["run_id"] / row["task_id"] / "events.jsonl"
         nested = runs_root / row["run_id"] / "traces" / row["task_id"] / "events.jsonl"
         target: Path | None
         if canonical.exists():

@@ -16,8 +16,14 @@ def make_self_improvement_proposal(finding: Finding, *, proposal_id: str) -> dic
 
     Phase-0 stub: requires_human_approval is always True;
     protected_files_touched is empty (the proposal observes; PR7+ may
-    propose code changes).
+    propose code changes). The static prose templates (proposed_change,
+    tests_to_add, rollback_plan, champion_challenger_plan) are
+    intentionally generic; PR7+ may template them per finding.kind via
+    a registry once we have richer signal types.
     """
+    # Identity map today; kept as a dict so PR7 can decouple
+    # finding.severity from proposal.risk_level (e.g., dampen "high"
+    # findings to "medium" risk if the pattern is well-understood).
     risk_level_map = {
         "low": "low",
         "medium": "medium",
