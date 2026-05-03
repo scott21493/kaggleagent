@@ -206,7 +206,12 @@ def test_memory_propose_rejects_schema_invalid_review(
 
     result = runner.invoke(app, ["memory", "propose", "tabular_binary_v1", "--review", "exp_0005"])
     assert result.exit_code != 0
-    assert "schema-invalid" in result.output.lower() or "decision" in result.output
+    # Tighten to AND so the test detects a regression where exc.message
+    # stops surfacing the missing-field name. The CLI wraps the schema
+    # error as `... is schema-invalid: <exc.message>`; both the wrapper
+    # phrase AND the missing field name (`decision`) must appear.
+    assert "schema-invalid" in result.output.lower()
+    assert "decision" in result.output
 
 
 def test_memory_propose_id_is_monotonic(
