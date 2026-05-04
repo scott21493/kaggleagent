@@ -227,7 +227,20 @@ def init_fixture(slug: str) -> None:
 
 
 @app.command("plan")
-def plan(slug: str) -> None:
+def plan(
+    slug: str,
+    provider: str = typer.Option(
+        "stub_codex",
+        "--provider",
+        help=(
+            "Provider name to plant in the calibration packet. Default "
+            "stub_codex preserves the pre-PR7 behaviour. eval-harness "
+            "passes 'codex' when --providers real, so the run-next "
+            "packet/adapter name check (peeked['provider'] != "
+            "adapter.name) does not reject the queued packet."
+        ),
+    ),
+) -> None:
     """Create a calibration task packet for the latest run."""
     run_id = _latest_run_id()
     if run_id is None:
@@ -244,7 +257,7 @@ def plan(slug: str) -> None:
         competition_slug=slug,
         task_id="task_0001",
         experiment_id=exp_id,
-        provider="stub_codex",
+        provider=provider,
     )
     queue.enqueue(packet)
     console.print(f"[green]planned task_0001 ({exp_id}) for {run_id}[/green]")
@@ -742,9 +755,10 @@ def research_proxy(
     check_can_invoke) leave the scoreboard untouched. Mirrors
     arena run-next in arena/cli.py:185-377.
     """
-    if provider not in {"stub_claude"}:
+    if provider not in {"stub_claude", "claude"}:
         raise typer.BadParameter(
-            f"unknown research provider {provider!r}; PR5 supports only stub_claude"
+            f"unknown research provider {provider!r}; "
+            "supported: stub_claude (PR5+) | claude (real adapter, PR7+)"
         )
 
     method_note_path = f"fixtures/{competition_slug}/paper_bundle/method_note_001.md"
@@ -1289,7 +1303,10 @@ def review(
     provider: str = typer.Option(
         "stub_claude",
         "--provider",
-        help="Provider to use for the review step. PR6 supports only stub_claude.",
+        help=(
+            "Provider to use for the review step. "
+            "Supported: stub_claude (PR6+) | claude (real adapter, PR7+)."
+        ),
     ),
     experiment: str = typer.Option(
         ...,
@@ -1313,9 +1330,10 @@ def review(
     drift = no row; post-invoke BudgetExceeded with usage_proxy =
     blocked row WITH consumed usage threaded through.
     """
-    if provider not in {"stub_claude"}:
+    if provider not in {"stub_claude", "claude"}:
         raise typer.BadParameter(
-            f"unknown review provider {provider!r}; PR6 supports only stub_claude"
+            f"unknown review provider {provider!r}; "
+            "supported: stub_claude (PR6+) | claude (real adapter, PR7+)"
         )
 
     store = _store()
@@ -2061,16 +2079,44 @@ def eval_harness(
 
     # Capture the run_id init-fixture creates, so all subsequent lookups
     # filter by run_id (avoids cross-run row pickup; spec §3.2).
-    run("init-fixture", init_fixture, competition_slug)
-    harness_run_id = _latest_run_id()
+    #
+    # CRITICAL: only adopt the run_id if init-fixture succeeded. If init
+    # fails while a stale prior run exists on disk, _latest_run_id()
+    # would return that stale run_id and the harness would silently
+    # operate on it (planning into the stale queue, looking up rows in
+    # the stale scoreboard slice, etc.). Capture conditionally; if init
+    # failed, skip every step that has a hard data dependency on a
+    # fresh run.
+    init_ok = run("init-fixture", init_fixture, competition_slug)
+    harness_run_id = _latest_run_id() if init_ok else None
 
-    run("plan", plan, competition_slug)
+    if not init_ok:
+        skip("plan", "init-fixture failed")
+        skip("run-next (calibration)", "init-fixture failed")
+        skip("research-proxy", "init-fixture failed")
+        skip("evaluate", "init-fixture failed")
+        skip("review", "init-fixture failed")
+        skip("memory propose", "init-fixture failed")
+        # self-improve scan and report still run — they handle no-run
+        # state via their own BadParameter paths and are informative
+        # even on a fresh / broken workspace.
+        run("self-improve scan", self_improve_scan, competition_slug)
+        run("report", report, competition_slug)
+        _render_step_table(steps)
+        failed_count = sum(1 for s in steps if s.status == "failed")
+        raise typer.Exit(1 if failed_count > 0 else 0)
+
+    # init succeeded → harness_run_id is the fresh run we just minted.
+    # Pass codex_provider into plan() so the queued calibration packet's
+    # provider field matches what run-next will resolve to. Without this,
+    # `--providers real` mode plants 'stub_codex' in the packet but the
+    # adapter's name is 'codex' → run-next rejects via the
+    # peeked['provider'] != adapter.name check.
+    run("plan", plan, competition_slug, provider=codex_provider)
     run("run-next (calibration)", run_next, competition_slug, provider=codex_provider)
     run("research-proxy", research_proxy, competition_slug, provider=claude_provider)
 
-    impl_exp_id = (
-        _lookup_latest_impl_row(competition_slug, run_id=harness_run_id) if harness_run_id else None
-    )
+    impl_exp_id = _lookup_latest_impl_row(competition_slug, run_id=harness_run_id)
     if impl_exp_id:
         run("evaluate --latest", evaluate, competition_slug, latest=True)
         if run(
@@ -2080,10 +2126,6 @@ def eval_harness(
             provider=claude_provider,
             experiment=impl_exp_id,
         ):
-            # `impl_exp_id is truthy` implies `harness_run_id is truthy`
-            # (the impl lookup is gated on harness_run_id above) — narrow
-            # for mypy.
-            assert harness_run_id is not None
             review_exp_id = _lookup_latest_review_row(
                 competition_slug,
                 run_id=harness_run_id,
