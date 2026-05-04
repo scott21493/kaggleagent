@@ -80,7 +80,7 @@ def scan_runs(
     The +20% triggers use champion_challenger.compare_metrics so the
     comparison logic is a single library helper. In Phase-0 stub mode
     most stubs report zero wall_seconds, so these triggers fire only on
-    test fixtures that synthesize non-zero values (or PR7's real
+    test fixtures that synthesize non-zero values (or production CLI
     adapters). Tests in tests/test_self_improvement_scan.py exercise
     the triggers via direct row inserts.
     """

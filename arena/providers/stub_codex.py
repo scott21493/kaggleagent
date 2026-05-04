@@ -33,8 +33,8 @@ class StubCodexProvider(ProviderAdapter):
     so `arena replay` can reconstruct the chain.
 
     The submission.csv shape is identical to calibration (constant 0.5);
-    PR7 with real Codex will produce non-trivial implementations grounded
-    in the fusion proposal. Backward compat: calibration packets (phase=
+    real Codex produces non-trivial implementations grounded in the fusion
+    proposal. Backward compat: calibration packets (phase=
     CALIBRATION_TASK_CREATED) continue to emit only submission.csv.
 
     Path assumption: invoke() reads `fixtures/<slug>/test.csv` relative to

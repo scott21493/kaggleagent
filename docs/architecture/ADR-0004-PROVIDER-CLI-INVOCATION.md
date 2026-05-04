@@ -1,6 +1,6 @@
 # ADR-0004 — Provider CLI Invocation Conventions
 
-Status: accepted (forward-looking; verified-on-implement at PR7)
+Status: accepted (verified)
 Date: 2026-04-30
 Supersedes: none
 Related: [ADR-0002](ADR-0002-CONTROLLER-AND-PROVIDERS.md), [ADR-0003](ADR-0003-SUBSCRIPTION-ONLY-LIMITS.md), [SECURITY_COST_REPRODUCIBILITY_SPEC](../security/SECURITY_COST_REPRODUCIBILITY_SPEC.md)
@@ -98,16 +98,20 @@ Real providers run with:
 
 Stub providers ignore all of the above and synthesize results in pure Python.
 
-## Open questions to verify at PR7
+## Resolved at PR7
 
-These are deliberate uncertainties. The wrapper PR is responsible for resolving each before merge.
+The wrapper implementations verified the following points and confirmed them inline:
 
-1. **Exact flag spelling** for both CLIs at the version installed on the dev machine. Pin the version in `.env.example` and bump on drift.
-2. **Auth-expiry stderr fingerprint** — the canonical strings the wrapper greps for. May change across CLI versions; treat as a regex-pinnable list, not a single string.
-3. **Whether `codex exec --json` emits a structured "done" event** or terminates silently after the last content event. Affects the `missing_terminal_event` failure path.
-4. **Streaming vs. buffering.** PR7 buffers; if streaming becomes useful for cost-tracking later (e.g. emit trace events as they arrive), this ADR will be superseded.
+1. **Exact flag spelling:** verified against the installed CLI versions.
+   - Codex: `[exec, --json, --workspace-write, <ws>, --prompt-file, <path>]`
+   - Claude: `[-p, --input, <path>, --workspace, <ws>]`
+   - Note: real CLI version drift is detected via `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md`).
 
-These open questions are *not* PR0 work and *not* PR1 work. They are an explicit punch-list for the engineer who lands PR7.
+2. **Auth-expiry stderr fingerprint:** conservative seed list pinned at `arena/providers/auth.py::AUTH_EXPIRY_PATTERNS`. Marked "not real-provider-verified yet"; first real auth-failure observation refreshes the list per the maintenance loop in `docs/phase0/runbooks/auth_expiry.md`.
+
+3. **Codex terminal-event behaviour:** if absent, `_parse_codex_ndjson` returns a sentinel that the wrapper maps to `ProviderResult(status="failure")` with a `<failure:missing_terminal_event>` artifact token (no `reason` field — `ProviderResult` schema is closed).
+
+4. **Streaming vs. buffering:** PR7 buffers, per the ADR's stated default. (No behavior change.)
 
 ## Consequences
 

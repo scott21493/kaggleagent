@@ -13,8 +13,8 @@ def generate_research_question(
     """Build a deterministic schema-valid research_question payload.
 
     Phase 0 stub: returns a fixed question keyed to the tabular_binary_v1
-    fixture's two method notes. PR7's real Claude will replace this with
-    LLM-generated content.
+    fixture's two method notes. Real Claude adapters can replace this
+    deterministic builder in production runs.
     """
     return {
         "schema_version": "research_question.v1",
@@ -58,7 +58,7 @@ def make_research_question_packet(
     question_id: str,
     source_refs: list[str],
 ) -> dict[str, Any]:
-    """Build the task_packet that asks stub_claude (or real Claude in PR7)
+    """Build the task_packet that asks stub_claude (or real Claude in production)
     to emit a research_question.json artifact for `competition_slug`.
 
     The source_refs become the packet's `inputs` so the sandbox sees the
