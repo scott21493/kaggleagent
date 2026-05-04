@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1939,3 +1940,172 @@ def provider_health(name: str) -> None:
     if h.runbook:
         console.print(f"Runbook: {h.runbook}")
     raise typer.Exit(1)
+
+
+@dataclass(frozen=True)
+class _StepResult:
+    name: str
+    status: str  # "ok" | "failed" | "skipped"
+    reason: str | None
+
+
+def _resolve_providers(providers: str) -> tuple[str, str]:
+    if providers == "stub":
+        return "stub_codex", "stub_claude"
+    if providers == "real":
+        return "codex", "claude"
+    raise typer.BadParameter(f"--providers must be 'stub' or 'real', got {providers!r}")
+
+
+def _lookup_latest_impl_row(slug: str, *, run_id: str) -> str | None:
+    store = _store()
+    try:
+        row = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id FROM experiments "
+                "WHERE competition_slug = ? AND run_id = ? "
+                "AND artifact_paths LIKE ? "
+                "ORDER BY experiment_id DESC LIMIT 1",
+                (slug, run_id, '%"<step:implementation>"%'),
+            )
+            .fetchone()
+        )
+    finally:
+        store.close()
+    return row["experiment_id"] if row else None
+
+
+def _lookup_latest_review_row(slug: str, *, run_id: str) -> str | None:
+    store = _store()
+    try:
+        row = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id FROM experiments "
+                "WHERE competition_slug = ? AND run_id = ? "
+                "AND artifact_paths LIKE ? "
+                "ORDER BY experiment_id DESC LIMIT 1",
+                (slug, run_id, '%"<step:review>"%'),
+            )
+            .fetchone()
+        )
+    finally:
+        store.close()
+    return row["experiment_id"] if row else None
+
+
+def _render_step_table(steps: list[_StepResult]) -> None:
+    from rich.table import Table
+
+    table = Table(title="eval-harness step summary")
+    table.add_column("Step")
+    table.add_column("Status")
+    table.add_column("Reason")
+    for s in steps:
+        glyph = {"ok": "✅ ok", "failed": "❌ failed", "skipped": "⊘ skipped"}[s.status]
+        table.add_row(s.name, glyph, s.reason or "")
+    console.print(table)
+    failed = sum(1 for s in steps if s.status == "failed")
+    skipped = sum(1 for s in steps if s.status == "skipped")
+    ok = sum(1 for s in steps if s.status == "ok")
+    if failed == 0 and skipped == 0:
+        console.print(f"{ok}/{len(steps)} steps ok.")
+    else:
+        console.print(f"{ok}/{len(steps)} steps ok; {failed} failed; {skipped} skipped.")
+
+
+@app.command("eval-harness")
+def eval_harness(
+    competition_slug: str,
+    providers: str = typer.Option(
+        "stub",
+        "--providers",
+        help="'stub' (stub_codex + stub_claude) or 'real' (codex + claude).",
+    ),
+) -> None:
+    """Run the full Phase-0 sequence and report per-step status.
+
+    Continue-collect: a failed step does NOT abort the run; subsequent
+    steps with hard data dependencies skip with reason='prerequisite
+    missing in this run'. Status semantics = "step execution status",
+    NOT "no findings/no freeze". Exit 0 iff every step is ok or
+    skipped-by-design.
+    """
+    codex_provider, claude_provider = _resolve_providers(providers)
+    steps: list[_StepResult] = []
+
+    def run(name: str, fn: Any, *args: Any, **kwargs: Any) -> bool:
+        try:
+            fn(*args, **kwargs)
+        except typer.Exit as e:
+            code = e.exit_code or 0
+            if code == 0:
+                steps.append(_StepResult(name, "ok", None))
+                return True
+            steps.append(_StepResult(name, "failed", f"exit {code}"))
+            return False
+        except (
+            typer.BadParameter,
+            BudgetExceeded,
+            KillSwitchActive,
+            ProviderUnavailable,
+        ) as e:
+            steps.append(_StepResult(name, "failed", str(e) or type(e).__name__))
+            return False
+        steps.append(_StepResult(name, "ok", None))
+        return True
+
+    def skip(name: str, reason: str) -> None:
+        steps.append(_StepResult(name, "skipped", reason))
+
+    # Capture the run_id init-fixture creates, so all subsequent lookups
+    # filter by run_id (avoids cross-run row pickup; spec §3.2).
+    run("init-fixture", init_fixture, competition_slug)
+    harness_run_id = _latest_run_id()
+
+    run("plan", plan, competition_slug)
+    run("run-next (calibration)", run_next, competition_slug, provider=codex_provider)
+    run("research-proxy", research_proxy, competition_slug, provider=claude_provider)
+
+    impl_exp_id = (
+        _lookup_latest_impl_row(competition_slug, run_id=harness_run_id) if harness_run_id else None
+    )
+    if impl_exp_id:
+        run("evaluate --latest", evaluate, competition_slug, latest=True)
+        if run(
+            f"review --experiment {impl_exp_id}",
+            review,
+            competition_slug,
+            provider=claude_provider,
+            experiment=impl_exp_id,
+        ):
+            # `impl_exp_id is truthy` implies `harness_run_id is truthy`
+            # (the impl lookup is gated on harness_run_id above) — narrow
+            # for mypy.
+            assert harness_run_id is not None
+            review_exp_id = _lookup_latest_review_row(
+                competition_slug,
+                run_id=harness_run_id,
+            )
+            if review_exp_id:
+                run(
+                    f"memory propose --review {review_exp_id}",
+                    memory_propose,
+                    competition_slug,
+                    review=review_exp_id,
+                )
+            else:
+                skip("memory propose", "review row not found in this run")
+    else:
+        skip("evaluate", "impl row not found in this run")
+        skip("review", "impl row not found in this run")
+        skip("memory propose", "review prerequisite missing in this run")
+
+    run("self-improve scan", self_improve_scan, competition_slug)
+    run("report", report, competition_slug)
+
+    _render_step_table(steps)
+
+    failed_count = sum(1 for s in steps if s.status == "failed")
+    raise typer.Exit(1 if failed_count > 0 else 0)
