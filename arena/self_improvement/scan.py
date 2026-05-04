@@ -11,8 +11,8 @@ from arena.self_improvement.champion_challenger import (
     compare_metrics,
 )
 
-# Phase-0 thresholds. These are deliberate Phase-0-stub defaults; PR7
-# may make them configurable.
+# Phase-0 thresholds. These are deliberate Phase-0-stub defaults; a
+# future PR may make them configurable.
 _CALIBRATION_BASELINE_SCORE = 0.5
 _WASTE_EVENTS_THRESHOLD = 5
 # Fixture success rate threshold: any single row with valid_submission
@@ -45,7 +45,7 @@ def scan_runs(
 
     Phase 0 checks cover the §7.3 triggers that can be derived from
     durable state. Protected-file mutation and schema drift are out of
-    scope until PR7's auto-apply flow exists.
+    scope; an auto-apply flow remains future work.
 
     `baselines_root` is intentionally accepted but unused in Phase 0.
     Spec §3.3 step 2 reserves it for "fixture-digest + provider-version

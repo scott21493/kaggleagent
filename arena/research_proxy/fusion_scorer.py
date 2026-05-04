@@ -93,7 +93,7 @@ def score_fusion_proposal(proposal: dict[str, Any]) -> FusionScore:
     n_mech = len(proposal.get("mechanisms_combined", []))
     fit = min(1.0, n_mech / 3.0)  # 2 mechs → 0.67, 3 → 1.0
 
-    # Equal-weighted average; tweakable in PR7.
+    # Equal-weighted average; tweakable in a future PR.
     score = (cost + risk + fit) / 3.0
     return FusionScore(score=score, risk=risk, cost=cost, fit=fit)
 

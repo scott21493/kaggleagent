@@ -73,7 +73,7 @@ def check(
             code=HealthCode.OK,
             version="stub_codex.v1",
             sandbox_mode="deterministic",
-            detail="no subprocess; deterministic",
+            detail="no subprocess",
             runbook=None,
         )
     if name == "stub_claude":
@@ -82,7 +82,7 @@ def check(
             code=HealthCode.OK,
             version="stub_claude.v1",
             sandbox_mode="deterministic",
-            detail="no subprocess; deterministic",
+            detail="no subprocess",
             runbook=None,
         )
     if name not in ("codex", "claude"):

@@ -2139,11 +2139,15 @@ def eval_harness(
     run("run-next (calibration)", run_next, competition_slug, provider=codex_provider)
     run("research-proxy", research_proxy, competition_slug, provider=claude_provider)
 
+    # Step labels intentionally use bare names (no --experiment / --review
+    # suffixes) so the rendered table column is stable whether a step
+    # ran or skipped. Per-invocation IDs flow through the Reason column
+    # when relevant.
     impl_exp_id = _lookup_latest_impl_row(competition_slug, run_id=harness_run_id)
     if impl_exp_id:
-        run("evaluate --latest", evaluate, competition_slug, latest=True)
+        run("evaluate", evaluate, competition_slug, latest=True)
         if run(
-            f"review --experiment {impl_exp_id}",
+            "review",
             review,
             competition_slug,
             provider=claude_provider,
@@ -2155,7 +2159,7 @@ def eval_harness(
             )
             if review_exp_id:
                 run(
-                    f"memory propose --review {review_exp_id}",
+                    "memory propose",
                     memory_propose,
                     competition_slug,
                     review=review_exp_id,
