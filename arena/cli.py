@@ -2107,6 +2107,14 @@ def eval_harness(
         raise typer.Exit(1 if failed_count > 0 else 0)
 
     # init succeeded → harness_run_id is the fresh run we just minted.
+    # mypy can't propagate `init_ok=True ⇒ harness_run_id is not None`
+    # across the conditional expression (`_latest_run_id() if init_ok
+    # else None`), so narrow explicitly here. The assert is also a
+    # tiny runtime sanity check: init-fixture succeeded but
+    # _latest_run_id() returned None would be a controller bug we'd
+    # want to surface loudly rather than NPE deep inside a lookup.
+    assert harness_run_id is not None, "init-fixture succeeded but _latest_run_id() returned None"
+
     # Pass codex_provider into plan() so the queued calibration packet's
     # provider field matches what run-next will resolve to. Without this,
     # `--providers real` mode plants 'stub_codex' in the packet but the
