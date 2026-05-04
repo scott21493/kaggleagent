@@ -62,3 +62,34 @@ def test_doctor_includes_provider_lines(monkeypatch, fixture_workspace):
     result = runner.invoke(app, ["doctor"])
     assert "codex" in result.output.lower()
     assert "claude" in result.output.lower()
+
+
+def test_doctor_exits_0_with_red_line_when_fixture_manifest_missing(tmp_path, monkeypatch):
+    """The runbook contract is "always exits 0"; missing fixtures/
+    directory used to crash with FileNotFoundError → exit 1, breaking
+    the readiness-inventory semantics. Now wraps the validation in
+    try/except and surfaces the failure as a red ❌ line."""
+    # Isolate to an empty cwd with no fixtures/ dir
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "arena.cli.health_check",
+        lambda name: ProviderHealth(
+            provider=name,
+            code=HealthCode.NOT_FOUND,
+            version=None,
+            sandbox_mode=None,
+            detail="not on PATH",
+            runbook="docs/phase0/runbooks/cli_regression.md",
+        ),
+    )
+    runner = CliRunner()
+    result = runner.invoke(app, ["doctor"])
+    # Inventory contract: always exits 0
+    assert result.exit_code == 0, (
+        f"doctor must exit 0 even when fixture manifest is missing; "
+        f"got exit={result.exit_code}, output={result.output!r}"
+    )
+    # The failure surfaces as a red line in the inventory, not a crash
+    assert "fixture manifest" in result.output.lower()
+    # Doctor still completes the inventory + prints the summary line
+    assert "complete" in result.output.lower()

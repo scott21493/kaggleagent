@@ -177,12 +177,27 @@ def _get_provider(
 
 @app.command()
 def doctor() -> None:
-    """Run lightweight local readiness checks."""
-    validate_fixture_manifest("fixtures/tabular_binary_v1")
-    console.print("[green]✅[/green] fixture manifest")
+    """Run lightweight local readiness checks.
 
-    # Provider CLIs — non-fatal status lines. Doctor is a readiness
-    # inventory; `arena provider health <name>` is the fail-fast check.
+    Doctor is a readiness inventory, NOT a fail-fast gate. Every check
+    becomes a status line (green ✅ / yellow ⚠ / red ❌) and the command
+    always exits 0. The operator scans the printed lines and runs
+    `arena provider health <name>` (fail-fast surface) or `arena
+    fixture-smoke` for the actionable check that drove a red line.
+    """
+    # Fixture manifest. validate_fixture_manifest raises on a missing
+    # fixtures/ directory, missing manifest.yml, or schema-invalid
+    # manifest. Catching here keeps the inventory contract (doctor
+    # exits 0 always) — the operator-actionable signal is the red ❌
+    # line, not a non-zero exit. Per docs/phase0/runbooks/reboot.md.
+    try:
+        validate_fixture_manifest("fixtures/tabular_binary_v1")
+        console.print("[green]✅[/green] fixture manifest")
+    except (FileNotFoundError, ValueError, OSError) as e:
+        console.print(f"[red]❌[/red] fixture manifest: {type(e).__name__}: {e}")
+
+    # Provider CLIs — non-fatal status lines. `arena provider health
+    # <name>` is the fail-fast check.
     for name in ("codex", "claude"):
         h = health_check(name)
         if h.code == HealthCode.OK:
