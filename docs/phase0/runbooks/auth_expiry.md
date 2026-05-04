@@ -1,6 +1,8 @@
 # Auth Expiry and Recovery
 
-**When this fires:** Real provider (Codex or Claude) returns `BLOCKED_AUTH` status—indicated by exit code ≥64, exit code 1 combined with auth-related stderr pattern, or `arena provider health` health-check failure.
+**When this fires:** `arena provider health <name>` reports `BLOCKED_AUTH` (a `HealthCode` enum value), OR a real provider invocation produces `ProviderResult(status="blocked")` with an `<blocked:AuthFailureBreaker>` artifact token. Both modes are documented below; the underlying signals are exit code ≥64, exit code 1 combined with an auth-regex match in stderr, or a non-OK `health_check` result.
+
+Note: `BLOCKED_AUTH` lives only in the `HealthCode` enum and CLI display label namespace — it is NEVER a `ProviderResult.status` (that enum is fixed: `success | failure | blocked | killed | interrupted`). Auth failures are surfaced in artifacts, not as a custom status.
 
 **Severity:** Block — the controller stops launching new real-provider tasks until auth is restored.
 
@@ -16,12 +18,17 @@ The provider wrapper detects authentication failure through three fallback detec
 2. **Stderr pattern fallback:** If exit code is 1 (ambiguous), the wrapper consults the regex pattern list in `arena/providers/auth.py::AUTH_EXPIRY_PATTERNS`. Conservative seed patterns match phrases like "authentication failed," "credential expired," "session expired," "please log in," "not signed in," etc.
 3. **Health-check failure:** The `arena provider health <name>` command fails when the provider is unreachable or auth is invalid.
 
-When any of these layers detect auth expiry, the controller marks the task `BLOCKED_AUTH` and emits a trace event. The scoreboard records the blocked status. Controller stops issuing new real-provider work.
+Two failure modes have **different durable footprints**:
+
+- **Pre-invoke failure** (`arena provider health <name>` returns `BLOCKED_AUTH`, or `_get_provider("codex"/"claude")` raises `ProviderUnavailable(code="blocked_auth")`): the controller raises BEFORE any subprocess invocation. **NO scoreboard row is written, NO trace event is emitted.** Per ADR-0004 §"Process not started." The operator-visible signal is the CLI exit code (1) plus the runbook reference in `arena provider health`'s output.
+- **Within-invoke failure** (the wrapper got past `_get_provider`, ran the subprocess, and detected auth from exit code ≥64 OR exit 1 + matching stderr): the wrapper returns `ProviderResult(status="blocked")` with `<blocked:AuthFailureBreaker>` and `<runbook:docs/phase0/runbooks/auth_expiry.md>` artifact tokens. The scoreboard row is persisted with `status="blocked"`; the trace store has the scrubbed stdout/stderr.
+
+Either way, the controller stops issuing new real-provider work for the affected provider until auth is restored.
 
 ## Symptoms
 
-- Log output or trace event shows `status="blocked"` with `<blocked:auth>` artifact token.
-- `arena provider health codex` or `arena provider health claude` exits with status code indicating auth failure (e.g., stderr contains auth-related text).
+- `arena provider health codex` (or `claude`) exits 1 and prints a red `❌ codex: BLOCKED AUTH (...)` line plus a `Runbook: docs/phase0/runbooks/auth_expiry.md` line.
+- A scoreboard row may show `status="blocked"` with `<blocked:AuthFailureBreaker>` and `<runbook:docs/phase0/runbooks/auth_expiry.md>` tokens in `artifact_paths` (within-invoke mode only — pre-invoke mode produces no row).
 - Console output may show "authentication failed," "credential expired," "Please re-authenticate," or similar phrasing in stderr scrubbed logs.
 
 ## Diagnose

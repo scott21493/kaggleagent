@@ -1,6 +1,8 @@
 # CLI Capability Regression
 
-**When this fires:** Provider CLI (Codex or Claude) has a version change that removes or renames flags, making the arena wrapper's argv construction invalid. The controller marks tasks `BLOCKED_PROVIDER_CAPABILITY` until the wrapper is updated.
+**When this fires:** Provider CLI (Codex or Claude) has a version change that removes or renames flags, making the arena wrapper's argv construction invalid. `arena provider health <name>` returns `HealthCode.BLOCKED_PROVIDER_CAPABILITY`, and `_get_provider("codex"/"claude")` raises `ProviderUnavailable(code="blocked_provider_capability")` BEFORE any subprocess invocation. **No scoreboard row is written, no trace event is emitted** for the blocked task — per ADR-0004 §"Process not started." The operator-visible signal is the failing health-check exit code + runbook reference.
+
+Separately, **provider version drift** (the version changed but `--help` still works) is purely informational — it surfaces as a `<PROVIDER_VERSION_CHANGED:from=...>` artifact-path token on the next successful invocation, not as a blocked task. That drift signal is recorded by PR4's baseline-recording machinery and is intended to flag "you should run a smoke test against the new version" without blocking work.
 
 **Severity:** Block — affected provider tasks cannot run until the wrapper is patched and redeployed.
 
@@ -15,14 +17,14 @@ The provider CLI updates or is manually upgraded, and:
 - A flag that worked in isolation no longer works in combination with others.
 - The flag spelling or behavior subtly changed (e.g., `--input-file` becomes `--input`, or requires a different delimiter).
 
-The health-check command fails because it cannot construct valid argv. The wrapper logs `BLOCKED_PROVIDER_CAPABILITY` status with an artifact token like `<blocked:provider_version_changed>`.
+The health-check probe (`<exe> --version` or `<exe> --help`) returns exit code 2 with stderr matching a capability-related phrase ("unrecognized argument," "unknown flag," "no such option"). `arena/providers/health.py::_classify_nonzero` maps this to `HealthCode.BLOCKED_PROVIDER_CAPABILITY` with `runbook="docs/phase0/runbooks/cli_regression.md"`.
 
 ## Symptoms
 
-- `arena provider health codex` or `arena provider health claude` exits with a non-zero status.
+- `arena provider health codex` or `arena provider health claude` exits with status 1 and prints a red `❌ codex: BLOCKED PROVIDER CAPABILITY (...)` line plus a `Runbook: docs/phase0/runbooks/cli_regression.md` line.
 - Stderr or stdout shows "flag not recognized," "unexpected argument," "unrecognized option," or similar.
-- Trace events show `status="blocked"` with `<blocked:provider_version_changed>` artifact token.
-- New task launches fail with the same provider.
+- New `arena run-next` / `arena research-proxy` / `arena review` invocations against this provider exit with `typer.BadParameter` from `_get_provider`.
+- Older successful invocations may have emitted `<PROVIDER_VERSION_CHANGED:from=...>` artifact tokens on prior scoreboard rows — this is the drift signal, not a capability-blocked marker.
 
 ## Diagnose
 
@@ -31,7 +33,7 @@ The health-check command fails because it cannot construct valid argv. The wrapp
    codex --version
    claude --version
    ```
-   Compare the output to `baselines/provider_versions.json` (or similar file tracked during fixture baseline creation). If the version has advanced, a flag change may have occurred.
+   Compare the output to `runs/.baselines/<slug>/provider_versions.json` (the per-slug baseline file populated by `record_provider_version` from PR4). If the version has advanced, a flag change may have occurred.
 
 2. **Inspect flag list:**
    ```bash
@@ -51,21 +53,21 @@ The health-check command fails because it cannot construct valid argv. The wrapp
 
 ### Step 1: Update the wrapper's argv construction
 
-1. Locate the affected wrapper:
-   - Codex: `arena/providers/codex.py` (function `_build_argv()` or equivalent).
-   - Claude: `arena/providers/claude.py` (function `_build_argv()` or equivalent).
+1. Locate the affected wrapper. The argv list is constructed inline inside `invoke()` — there is no `_build_argv()` helper:
+   - Codex: `arena/providers/codex.py`, look for `argv = [self._executable, "exec", "--json", "--workspace-write", str(workspace), "--prompt-file", str(prompt_file)]`.
+   - Claude: `arena/providers/claude.py`, look for `argv = [self._executable, "-p", "--input", str(prompt_file), "--workspace", str(workspace)]`.
 
-2. Update the `_build_argv()` function to construct argv using the new flag spelling:
+2. Update the inline argv list to construct argv using the new flag spelling:
    ```python
    # Example: if --prompt-file was renamed to --input-file
    argv = [
-       "codex",
+       self._executable,
        "exec",
        "--json",
        "--workspace-write",
-       workspace_path,
+       str(workspace),
        "--input-file",  # renamed from --prompt-file
-       prompt_file_path,
+       str(prompt_file),
    ]
    ```
 
