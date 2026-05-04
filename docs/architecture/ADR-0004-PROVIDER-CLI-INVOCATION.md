@@ -25,11 +25,11 @@ Real Codex and Claude providers are invoked as subprocesses with the conventions
 codex exec --json --workspace-write <workspace> [--prompt-file <path>]
 ```
 
-The exact flag spelling is verified at PR7 against the installed Codex CLI version recorded by `arena provider health codex`. If the spelling differs, the wrapper updates this ADR and bumps `provider_version` baseline; the controller flags `PROVIDER_VERSION_CHANGED` until a human accepts.
+The exact flag spelling was verified at PR7 close-out and is pinned in the §"Resolved at PR7" section below. If a future CLI version changes the spelling, `arena provider health` returns `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md` for the operator update loop) and `record_provider_version` flags drift via `<PROVIDER_VERSION_CHANGED:from=...>` artifact tokens.
 
 **Stdin contract:** the task packet JSON, written to a temp file, passed via `--prompt-file`. Inline stdin is avoided because some Windows + WSL2 + provider-CLI combinations mishandle it.
 
-**Stdout contract:** newline-delimited JSON events. The wrapper buffers all events, applies the scrubber to each line, and persists raw + scrubbed copies to `traces/<run_id>/<task_id>/{stdout.raw, stdout.scrubbed}`. The final event is expected to summarize artifacts and usage; if absent, the wrapper marks the result `failure` with reason `missing_terminal_event`.
+**Stdout contract:** newline-delimited JSON events. The wrapper buffers all events, applies the scrubber to each line, and persists raw + scrubbed copies to `traces/<run_id>/<task_id>/{stdout.raw, stdout.scrubbed}` via `TraceStore.write_provider_streams(...)`. The final event is expected to summarize artifacts and usage; if absent, the wrapper marks the result `status="failure"` and appends a `<failure:missing_terminal_event>` artifact token. (`ProviderResult.status` enum is closed: `success | failure | blocked | killed | interrupted` — sub-status detail flows through artifact tokens, never as a `reason` field, since `provider_result.schema.json` sets `additionalProperties: false`.)
 
 **Stderr contract:** plain text. Captured to `stderr.raw` and `stderr.scrubbed` exactly like stdout. Stderr does not affect status by itself; status comes from exit code.
 
@@ -38,11 +38,11 @@ The exact flag spelling is verified at PR7 against the installed Codex CLI versi
 - `0` → `ProviderResult.status = "success"`.
 - `1` → `failure` (provider ran but produced no usable output).
 - `2` → `blocked` (CLI rejected the request, e.g. unsafe shell).
-- `>= 64` reserved for auth/session errors; wrapper translates these to `BLOCKED_AUTH` and writes a runbook reference. The exact code is verified at PR7.
-- Any signal-induced termination (SIGTERM, SIGKILL) → `killed`.
-- Process not started (binary missing, permission denied) → controller raises before the wrapper logs anything.
+- `>= 64` reserved for auth/session errors; wrapper translates these to `ProviderResult(status="blocked")` plus `<blocked:AuthFailureBreaker>` and `<runbook:docs/phase0/runbooks/auth_expiry.md>` artifact tokens. (`BLOCKED_AUTH` is a `HealthCode` enum value used by `arena provider health` and CLI display labels — it is NOT a `ProviderResult.status`.)
+- Any signal-induced termination (SIGTERM, SIGKILL) → `status="killed"` plus `<killed:wall_clock_timeout>` artifact token when the wrapper raised `subprocess.TimeoutExpired`.
+- Process not started (binary missing, permission denied, etc. — any `OSError`) → wrapper raises `ProviderUnavailable(code="not_found", ...)`; the controller catches at the CLI seam and emits no scoreboard row + no trace event for the blocked task.
 
-**Auth-expiry surface:** any of (a) exit code in the auth range, (b) stderr containing a known auth-expiry phrase pinned at PR7, (c) the `arena provider health codex` precheck failing — all map to `BLOCKED_AUTH`. The runbook in [PHASE_0_SINGLE_SCOPE_PLAN](../phase0/PHASE_0_SINGLE_SCOPE_PLAN.md) §7.3 governs recovery.
+**Auth-expiry surface:** any of (a) exit code in the auth range (`>= 64`, dispositive), (b) exit code 1 + stderr matching a pattern in `arena/providers/auth.py::AUTH_EXPIRY_PATTERNS` (regex fallback), (c) the `arena provider health codex` precheck failing pre-invoke — all surface auth failure. Within-invoke detection (a, b) → `ProviderResult(status="blocked")` + `<blocked:AuthFailureBreaker>` + `<runbook:...>` tokens. Pre-invoke detection (c) → `ProviderUnavailable(code="blocked_auth", ...)` raised before subprocess; no row, no event. The runbook in [PHASE_0_SINGLE_SCOPE_PLAN](../phase0/PHASE_0_SINGLE_SCOPE_PLAN.md) §7.3 + `docs/phase0/runbooks/auth_expiry.md` governs recovery.
 
 ### Claude Code (Anthropic subscription, `claude` CLI)
 
@@ -52,21 +52,32 @@ The exact flag spelling is verified at PR7 against the installed Codex CLI versi
 claude -p [--input <prompt-file>] [--workspace <workspace>]
 ```
 
-The exact flag spelling is verified at PR7. Older docs reference `claude --print`; both are equivalent in current versions.
+The exact flag spelling was verified at PR7 close-out (see §"Resolved at PR7" below). Older docs reference `claude --print`; both are equivalent in current versions.
 
 **Stdin contract:** the task packet JSON or the rendered prompt (depending on role), written to a temp file, passed via `--input`. The wrapper does not pipe via stdin for the same Windows/WSL2 reason.
 
-**Stdout contract:** plain text or JSON depending on the task role. For `role=review`, the prompt template instructs Claude to return a JSON object validating against `review.schema.json`. For `role=advisory_planning`, the schema is `strategist_recommendation.schema.json`. The wrapper:
+**Stdout contract:** single JSON object whose shape depends on the task `(role, phase)`. The wrapper dispatches via the `_ROLE_PHASE_TO_SCHEMA` table in `arena/providers/claude.py`:
 
-1. captures all stdout to `stdout.raw`,
-2. applies the scrubber → `stdout.scrubbed`,
+| `(role, phase)` | Schema |
+|---|---|
+| `("review", "FUSION_PROXY_REVIEWED")` | `research_review.schema.json` |
+| `("research_proxy", "RESEARCH_QUESTION_CREATED")` | `research_question.schema.json` |
+| `("research_proxy", "METHOD_DIGEST_CREATED")` | `paper_digest.schema.json` |
+| `("research_proxy", "FUSION_PROPOSAL_CREATED")` | `fusion_proposal.schema.json` |
+| `("advisory_planning", "STRATEGY_RECOMMENDED")` | `strategist_recommendation.schema.json` |
+
+(Note: `review.schema.json` is a different shape used elsewhere in the codebase for codex-impl reviews; PR7's Claude wrapper consumes `research_review.schema.json` for `role=review`. PR6's `arena review` and the stub provider follow the same dispatch.) The wrapper:
+
+1. captures all stdout to `stdout.raw` via `TraceStore.write_provider_streams(...)`,
+2. applies the scrubber → `stdout.scrubbed` (also via `write_provider_streams`),
 3. attempts to parse the scrubbed output as JSON,
-4. if parse succeeds, validates against the role-appropriate schema,
-5. on parse failure or schema violation, marks the result `failure` and logs the schema error.
+4. if parse succeeds, validates against the `(role, phase)`-appropriate schema,
+5. on parse failure → `status="failure"` + `<failure:json_decode_error>` artifact token; on schema violation OR unmapped `(role, phase)` → `status="failure"` + `<failure:schema_violation>` artifact token,
+6. on success → materialises the validated JSON to `<workspace>/<schema_name>.json` and appends the path to `ProviderResult.artifacts` (real Claude is advisory; the wrapper persists the advisory artifact for downstream `arena review` / `arena research-proxy` consumers via `_require_artifact(suffix=...)`).
 
 **Stderr contract:** captured to `stderr.raw` and `stderr.scrubbed`. Treated like Codex's stderr.
 
-**Exit codes:** mirror Codex semantics (`0` success, `1` failure, `2` blocked, auth-range → `BLOCKED_AUTH`). Verified at PR7.
+**Exit codes:** mirror Codex semantics (`0` success, `1` failure, `2` blocked, auth-range → `status="blocked"` + AuthFailureBreaker tokens). Verified at PR7.
 
 **Auth-expiry surface:** same triple as Codex. The runbook in §7.3 also applies.
 
@@ -76,16 +87,19 @@ The scrubber is the line right after subprocess capture, before any persistence 
 
 ```
 subprocess.run(...) -> raw_stdout, raw_stderr
-  -> trace_store.write_raw(raw_stdout, raw_stderr)
-  -> scrubber.scrub(raw_stdout) -> scrubbed_stdout
-  -> scrubber.scrub(raw_stderr) -> scrubbed_stderr
-  -> trace_store.write_scrubbed(scrubbed_stdout, scrubbed_stderr)
+  -> scrub_text(raw_stdout) -> scrubbed_stdout
+  -> scrub_text(raw_stderr) -> scrubbed_stderr
+  -> trace_store.write_provider_streams(
+         task_id=...,
+         raw_stdout=raw_stdout, raw_stderr=raw_stderr,
+         scrubbed_stdout=scrubbed_stdout, scrubbed_stderr=scrubbed_stderr,
+     ) -> ProviderStreamPaths{stdout_raw, stderr_raw, stdout_scrubbed, stderr_scrubbed}
   -> parser.parse(scrubbed_stdout) -> ProviderResult
 ```
 
-Raw traces are written first (for forensic recovery if scrubbing has a bug) but live under a path that is never included in any provider context, never sent to any LLM, and is treated as sensitive by the sandbox. The path layout matches [SECURITY_COST_REPRODUCIBILITY_SPEC](../security/SECURITY_COST_REPRODUCIBILITY_SPEC.md) §6.4.
+`TraceStore.write_provider_streams(...)` writes the four artifacts to `<root>/<run_id>/<task_id>/{stdout.raw, stderr.raw, stdout.scrubbed, stderr.scrubbed}` in that order — **raw paths are written first** for forensic recovery if the scrubber has a bug. `ProviderResult.stdout_path` / `stderr_path` reference the **scrubbed** paths only; the raw paths NEVER appear in artifacts, are NEVER passed back into provider context, are NEVER emitted to the trace event stream, and are NEVER rendered in `arena report`. PR3's `SandboxPolicy._default_blocked_paths` includes the workspace-root-relative `traces/` directory so providers cannot read these forensic streams. The path layout matches [SECURITY_COST_REPRODUCIBILITY_SPEC](../security/SECURITY_COST_REPRODUCIBILITY_SPEC.md) §6.4.
 
-PR4 lands the scrubber and trace store; until then, PR7's wrappers depend on PR4 being merged first.
+PR4 lands the scrubber and trace store; PR7's wrappers depend on PR4 (already merged).
 
 ### Workspace and environment
 
@@ -123,4 +137,4 @@ The wrapper implementations verified the following points and confirmed them inl
 
 ## Status
 
-Accepted — forward-looking. The wrappers in PR7 are responsible for verifying every "verified at PR7" point in this document and updating it in the same commit if reality differs.
+Accepted — verified at PR7 close-out. The four "verified at PR7" punch-list items are resolved inline in §"Resolved at PR7" above; the body of the ADR no longer carries forward-looking markers. Subsequent CLI version drift is detected via `BLOCKED_PROVIDER_CAPABILITY` and the maintenance loops in `docs/phase0/runbooks/{auth_expiry,cli_regression}.md`, NOT by re-running this ADR.

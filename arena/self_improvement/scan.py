@@ -49,12 +49,13 @@ def scan_runs(
 
     `baselines_root` is intentionally accepted but unused in Phase 0.
     Spec §3.3 step 2 reserves it for "fixture-digest + provider-version
-    baseline" consumption — PR7 will wire it into the score-regression
-    check (currently hard-coded to `_CALIBRATION_BASELINE_SCORE = 0.5`)
-    and into a future drift_baseline trigger. Keeping the parameter in
-    the Phase-0 signature avoids a churning CLI signature when PR7
-    lands. `runs_root` is similarly accepted; the failed_replay trigger
-    consults `runs/<run_id>/traces/...` as a fallback path.
+    baseline" consumption — a future PR will wire it into the
+    score-regression check (currently hard-coded to
+    `_CALIBRATION_BASELINE_SCORE = 0.5`) and into a future
+    drift_baseline trigger. Keeping the parameter in the signature
+    avoids a churning CLI when that work lands. `runs_root` is similarly
+    accepted; the failed_replay trigger consults
+    `runs/<run_id>/traces/...` as a fallback path.
 
     Triggers:
     - blocked_row: any status="blocked" row.

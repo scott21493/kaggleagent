@@ -77,8 +77,8 @@ class Watchdog:
 
         Caller should have already called check_can_invoke(adapter.name);
         this method skips the kill-switch and pre-invoke checks (no
-        re-check during invoke per PR2 plan §8; PR7 will add per-event
-        polling for long-running subprocess providers).
+        re-check during invoke per PR2 plan §8; a future PR may add
+        per-event polling for long-running subprocess providers).
 
         When `sandbox` is set, activates it via runner.context() for the
         duration of adapter.invoke; SandboxViolation propagates and

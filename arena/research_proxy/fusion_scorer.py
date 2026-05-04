@@ -23,10 +23,10 @@ class FusionScore:
 
 
 _COST_RANK = {"tiny": 1.0, "small": 0.8, "medium": 0.5, "large": 0.2}
-# Forward-compat: PR7 will switch the fit component from mechanism-count
-# (the current Phase-0 proxy) to a lookup against the digest's
-# applicability.fit value via this table. Kept here so PR7 doesn't need
-# to reintroduce the constant; safe to leave unused in Phase 0.
+# Forward-compat: a future PR may switch the fit component from
+# mechanism-count (the current Phase-0 proxy) to a lookup against the
+# digest's applicability.fit value via this table. Kept here so the
+# constant doesn't need to be reintroduced; safe to leave unused.
 _FIT_RANK = {"high": 1.0, "medium": 0.6, "low": 0.2}
 
 # Forbidden tokens are scoped: package-style names match exactly against
