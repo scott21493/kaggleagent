@@ -44,6 +44,7 @@ from arena.providers.base import (
     ProviderStatus,
     ProviderUnavailable,
     UsageProxy,
+    resolve_provider_executable,
 )
 from arena.schemas.validate import validate as validate_schema
 
@@ -135,8 +136,21 @@ class RealClaudeProvider(ProviderAdapter):
         prompt_json = json.dumps(task_packet, ensure_ascii=False)
         prompt_file.write_text(prompt_json, encoding="utf-8")
 
+        # Resolve self._executable with Windows PATHEXT awareness.
+        # See codex.py for the rationale (extensionless npm shim
+        # PermissionError on Windows). None →
+        # ProviderUnavailable(code="not_found").
+        resolved_exe = resolve_provider_executable(self._executable)
+        if resolved_exe is None:
+            raise ProviderUnavailable(
+                provider="claude",
+                code="not_found",
+                detail=f"{self._executable} not on PATH",
+                runbook="docs/phase0/runbooks/cli_regression.md",
+            )
+
         argv = [
-            self._executable,
+            resolved_exe,
             "-p",
             "--input",
             str(prompt_file),
@@ -163,11 +177,12 @@ class RealClaudeProvider(ProviderAdapter):
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             exit_code = proc.returncode
-        except FileNotFoundError as e:
+        except OSError as e:
+            # Defense-in-depth — see codex.py for rationale.
             raise ProviderUnavailable(
                 provider="claude",
                 code="not_found",
-                detail=f"{self._executable} not on PATH",
+                detail=f"{self._executable} not executable: {type(e).__name__}: {e}",
                 runbook="docs/phase0/runbooks/cli_regression.md",
             ) from e
         except subprocess.TimeoutExpired as e:

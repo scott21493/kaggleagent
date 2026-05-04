@@ -38,6 +38,7 @@ from arena.providers.base import (
     ProviderStatus,
     ProviderUnavailable,
     UsageProxy,
+    resolve_provider_executable,
 )
 from arena.schemas.validate import validate as validate_schema
 
@@ -119,8 +120,22 @@ class RealCodexProvider(ProviderAdapter):
         prompt_json = json.dumps(task_packet, ensure_ascii=False)
         prompt_file.write_text(prompt_json, encoding="utf-8")
 
+        # Resolve self._executable to a runnable absolute path with
+        # Windows PATHEXT awareness. Without this, "codex" can match
+        # an extensionless npm shim that subprocess.run cannot start
+        # on Windows (PermissionError [WinError 5]). None →
+        # ProviderUnavailable(code="not_found") before subprocess.run.
+        resolved_exe = resolve_provider_executable(self._executable)
+        if resolved_exe is None:
+            raise ProviderUnavailable(
+                provider="codex",
+                code="not_found",
+                detail=f"{self._executable} not on PATH",
+                runbook="docs/phase0/runbooks/cli_regression.md",
+            )
+
         argv = [
-            self._executable,
+            resolved_exe,
             "exec",
             "--json",
             "--workspace-write",
@@ -148,11 +163,17 @@ class RealCodexProvider(ProviderAdapter):
             stdout = proc.stdout or ""
             stderr = proc.stderr or ""
             exit_code = proc.returncode
-        except FileNotFoundError as e:
+        except OSError as e:
+            # Defense-in-depth for the resolve_provider_executable
+            # gate above: shutil.which said the path is on PATH but
+            # subprocess.run still can't start the process. Covers
+            # FileNotFoundError + PermissionError (Windows shim
+            # variants, network drives, sandbox EPERM) + other
+            # process-start failures uniformly.
             raise ProviderUnavailable(
                 provider="codex",
                 code="not_found",
-                detail=f"{self._executable} not on PATH",
+                detail=f"{self._executable} not executable: {type(e).__name__}: {e}",
                 runbook="docs/phase0/runbooks/cli_regression.md",
             ) from e
         except subprocess.TimeoutExpired as e:

@@ -15,6 +15,20 @@ import pytest
 from arena.providers.health import HealthCode, ProviderHealth, check
 
 
+@pytest.fixture(autouse=True)
+def _bypass_resolve_provider_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing subprocess-mock tests assume subprocess.run is reached
+    unconditionally. The new resolve_provider_executable gate (PR7
+    Windows-shim fix) returns None when the bare name isn't on the
+    test environment's PATH, so subprocess.run never gets called. Bypass
+    it for the whole file by default; tests that target the resolution
+    layer specifically can monkeypatch over this fixture."""
+    monkeypatch.setattr(
+        "arena.providers.health.resolve_provider_executable",
+        lambda name: name,
+    )
+
+
 def test_check_stub_codex_short_circuits_to_ok() -> None:
     h = check("stub_codex")
     assert isinstance(h, ProviderHealth)
@@ -71,7 +85,11 @@ def test_check_real_codex_not_found_on_help_probe(monkeypatch: pytest.MonkeyPatc
     assert h.code == HealthCode.NOT_FOUND
     assert h.version == "0.4.2"  # version was parsed before --help failed
     assert h.runbook == "docs/phase0/runbooks/cli_regression.md"
-    assert "disappeared" in h.detail.lower()
+    # Detail wording was generalised when the FileNotFoundError catch
+    # widened to OSError (covers PermissionError too — Windows shim
+    # case). Just confirm the failure was attributed to the second probe.
+    assert "between --version and --help" in h.detail.lower()
+    assert "filenotfounderror" in h.detail.lower()
 
 
 def test_check_real_codex_ok_via_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -208,3 +226,65 @@ def test_check_passes_executable_env_cwd_to_subprocess(
         # env is overlaid on os.environ — PATH gets overridden, but other
         # vars (e.g., HOME on POSIX, USERPROFILE on Windows) survive.
         assert kw["env"]["PATH"] == "/custom/path"
+
+
+def test_check_real_codex_resolve_not_found_returns_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[P1] Windows-aware resolution: if shutil.which returns None for
+    every PATHEXT variant (codex.cmd, codex.bat, codex.exe, codex), the
+    health probe must short-circuit to NOT_FOUND BEFORE invoking
+    subprocess. Override the autouse bypass fixture for this test."""
+    monkeypatch.setattr(
+        "arena.providers.health.resolve_provider_executable",
+        lambda name: None,
+    )
+    # If subprocess.run is reached, the test should fail loudly:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: pytest.fail("subprocess.run must NOT be called when resolve returns None"),
+    )
+    h = check("codex")
+    assert h.code == HealthCode.NOT_FOUND
+    assert h.runbook == "docs/phase0/runbooks/cli_regression.md"
+    assert "not on path" in h.detail.lower()
+
+
+def test_check_real_codex_permissionerror_at_version_probe_returns_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[P1] Defense-in-depth: shutil.which returned a path (e.g., the
+    Windows extensionless npm shim slipped past resolution), but
+    subprocess.run([shim, ...]) raises PermissionError [WinError 5].
+    The OSError catch must surface NOT_FOUND, not crash."""
+
+    def fake_run(*a, **kw):
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    h = check("codex")
+    assert h.code == HealthCode.NOT_FOUND
+    assert h.runbook == "docs/phase0/runbooks/cli_regression.md"
+    # Detail should mention the underlying OSError type so operators
+    # can distinguish PermissionError (Windows shim) from
+    # FileNotFoundError (binary truly missing).
+    assert "permissionerror" in h.detail.lower()
+
+
+def test_check_real_codex_permissionerror_at_help_probe_returns_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as above but at the second probe — PermissionError on
+    --help (after --version succeeded) maps to NOT_FOUND uniformly."""
+
+    def fake_run(argv, **kwargs):
+        if argv[1] == "--version":
+            return MagicMock(returncode=0, stdout="codex 0.4.2\n", stderr="")
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    h = check("codex")
+    assert h.code == HealthCode.NOT_FOUND
+    assert h.version == "0.4.2"
+    assert "permissionerror" in h.detail.lower()

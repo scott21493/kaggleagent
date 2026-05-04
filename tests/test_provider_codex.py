@@ -90,6 +90,61 @@ def test_invoke_file_not_found_raises_provider_unavailable(
     assert exc.value.code == "not_found"
 
 
+def test_invoke_resolve_not_found_raises_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[P1] Windows-aware resolution gate: if shutil.which returns None
+    for every PATHEXT variant, the adapter must raise ProviderUnavailable
+    BEFORE invoking subprocess. Mirrors the health-probe gate."""
+    monkeypatch.setattr(
+        "arena.providers.codex.resolve_provider_executable",
+        lambda name: None,
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *a, **kw: pytest.fail("subprocess.run must NOT be called when resolve returns None"),
+    )
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    with pytest.raises(ProviderUnavailable) as exc:
+        p.invoke(_packet())
+    assert exc.value.code == "not_found"
+    assert "not on path" in str(exc.value).lower()
+
+
+def test_invoke_permissionerror_raises_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[P1] Defense-in-depth: shutil.which returned a path (e.g., the
+    Windows extensionless npm shim) but subprocess.run([shim, ...])
+    raises PermissionError [WinError 5]. The OSError catch must
+    surface ProviderUnavailable, not crash."""
+
+    def fake_run(*a, **kw):
+        raise PermissionError("[WinError 5] Access is denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ts = TraceStore(run_id="run_test", root=tmp_path)
+    p = RealCodexProvider(
+        executable="codex",
+        version="0.4.2",
+        cwd=tmp_path,
+        event_emitter=ts,
+    )
+    with pytest.raises(ProviderUnavailable) as exc:
+        p.invoke(_packet())
+    assert exc.value.code == "not_found"
+    assert "permissionerror" in str(exc.value).lower()
+
+
 def test_invoke_timeout_returns_killed_with_token(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

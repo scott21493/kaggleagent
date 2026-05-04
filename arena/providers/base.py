@@ -1,8 +1,47 @@
 from __future__ import annotations
 
+import shutil
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal, TypedDict
+
+
+def resolve_provider_executable(name: str) -> str | None:
+    """Find a runnable provider executable on PATH, Windows-aware.
+
+    On Windows, ``shutil.which("codex")`` can return an extensionless
+    npm shim that ``subprocess.run([resolved, ...])`` cannot directly
+    execute — it raises ``PermissionError: [WinError 5] Access is
+    denied``. This helper tries ``.cmd``, ``.bat``, and ``.exe``
+    extensions first on Windows, falling back to the bare name only
+    if none match. POSIX is unaffected (extensionless executables are
+    runnable directly).
+
+    Absolute paths (e.g., ``str(shim_codex_executable)`` from the
+    conftest test fixture) bypass the extension search and are
+    returned as-is if the file exists and is executable; this keeps
+    test overrides idempotent.
+
+    Returns the resolved absolute path on success, or ``None`` if no
+    runnable variant exists on PATH. Callers should also catch
+    ``OSError`` from ``subprocess.run`` as defense-in-depth: a path
+    that satisfies ``shutil.which`` may still fail at process start
+    on tight permission setups, network drives, etc.
+    """
+    if Path(name).is_absolute():
+        # Operator/test override — use as-is (shutil.which handles the
+        # exists+executable check and returns None otherwise).
+        return shutil.which(name)
+    if sys.platform == "win32":
+        for candidate in (f"{name}.cmd", f"{name}.bat", f"{name}.exe", name):
+            resolved = shutil.which(candidate)
+            if resolved is not None:
+                return resolved
+        return None
+    return shutil.which(name)
+
 
 ProviderStatus = Literal["success", "failure", "blocked", "killed", "interrupted"]
 

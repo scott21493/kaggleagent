@@ -23,6 +23,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from arena.providers.auth import matches_auth_expiry
+from arena.providers.base import resolve_provider_executable
 
 
 class HealthCode(StrEnum):
@@ -94,7 +95,22 @@ def check(
             runbook=None,
         )
 
-    exe = executable or name
+    requested = executable or name
+    # Windows-aware PATH resolution. shutil.which("codex") can return
+    # an extensionless npm shim that subprocess.run cannot execute
+    # (PermissionError [WinError 5]); resolve_provider_executable
+    # prefers .cmd/.bat/.exe variants on Windows. None → NOT_FOUND
+    # without invoking subprocess.
+    exe = resolve_provider_executable(requested)
+    if exe is None:
+        return ProviderHealth(
+            provider=name,
+            code=HealthCode.NOT_FOUND,
+            version=None,
+            sandbox_mode=None,
+            detail=f"{requested} not on PATH",
+            runbook=_RUNBOOK_REGRESSION,
+        )
     effective_env = {**os.environ, **(env or {})}
     cwd_str = str(cwd) if cwd is not None else None
     sandbox_mode = "workspace-write" if name == "codex" else "workspace"
@@ -112,13 +128,19 @@ def check(
             env=effective_env,
             cwd=cwd_str,
         )
-    except FileNotFoundError:
+    except OSError as e:
+        # Defense-in-depth: shutil.which said the path is on PATH but
+        # subprocess.run still can't start the process (Windows shim
+        # variants, network drive permission failures, sandbox EPERM).
+        # FileNotFoundError + PermissionError both subclass OSError;
+        # treating them all as NOT_FOUND keeps the typed-result
+        # contract intact (no crashes).
         return ProviderHealth(
             provider=name,
             code=HealthCode.NOT_FOUND,
             version=None,
             sandbox_mode=None,
-            detail=f"{exe} not on PATH",
+            detail=f"{exe} not executable: {type(e).__name__}: {e}",
             runbook=_RUNBOOK_REGRESSION,
         )
     except subprocess.TimeoutExpired:
@@ -161,16 +183,18 @@ def check(
             env=effective_env,
             cwd=cwd_str,
         )
-    except FileNotFoundError:
+    except OSError as e:
         # Narrow race: the executable that succeeded for --version is
-        # gone before --help. The contract is cleaner if both probes
-        # map missing-binary to NOT_FOUND uniformly.
+        # gone or no-longer-runnable before --help. Mirrors the
+        # broader OSError catch on Probe 1: PermissionError +
+        # FileNotFoundError + other process-start errors all map to
+        # NOT_FOUND so the typed-result contract holds.
         return ProviderHealth(
             provider=name,
             code=HealthCode.NOT_FOUND,
             version=parsed_version,
             sandbox_mode=None,
-            detail=f"{exe} disappeared between --version and --help",
+            detail=f"{exe} probe failed between --version and --help: {type(e).__name__}: {e}",
             runbook=_RUNBOOK_REGRESSION,
         )
     except subprocess.TimeoutExpired:
