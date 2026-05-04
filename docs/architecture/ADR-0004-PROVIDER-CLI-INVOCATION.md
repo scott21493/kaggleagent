@@ -105,10 +105,12 @@ PR4 lands the scrubber and trace store; PR7's wrappers depend on PR4 (already me
 
 Real providers run with:
 
-- working directory set to the per-experiment worktree (`worktrees/<slug>/<exp_id>/`),
-- `PATH` inherited but `HOME` redirected to a controller-managed temp dir so subscription auth caches outside the repo are not shadowed (the actual `CODEX_HOME` and `CLAUDE_CONFIG_DIR` paths resolve from the .env, per [ADR-0003](ADR-0003-SUBSCRIPTION-ONLY-LIMITS.md)),
-- a clean environment derived from the `.env` allowlist hash recorded in the run manifest (per §6.1 of the security spec),
-- a wall-clock timeout from `task_packet.budgets.max_wall_minutes` enforced by the controller's watchdog (PR2), with a graceful-then-forceful kill sequence per §4.3 of the security spec.
+- **Working directory** set to the per-experiment worktree resolved from `task_packet["allowed_paths"][0]` (relative paths resolve against the adapter's `cwd` constructor argument; absolute paths are honoured as-is). Falls back to the constructor `cwd` when `allowed_paths` is empty (test-only path; production callers always populate `allowed_paths`).
+- **Environment** built as `effective_env = {**os.environ, **env_overlay}` — an overlay on the inherited process environment, where `env_overlay` is the `env=` kwarg supplied at adapter construction. This is what shipped at PR7. The CLI's `_get_provider("codex"/"claude")` resolution path constructs adapters WITHOUT an env overlay, so production inherits the operator's full process environment (including `HOME`, subscription auth caches, `PATH`, etc.). Tests pass `env={...}` to override specific keys (e.g., shim `PATH` redirection) while keeping the rest of `os.environ` intact.
+
+  > **Future hardening (out of PR7 scope):** the original [SECURITY_COST_REPRODUCIBILITY_SPEC](../security/SECURITY_COST_REPRODUCIBILITY_SPEC.md) §6.1 design called for a clean environment derived from a `.env` allowlist hash (recorded in the run manifest) plus `HOME` redirection to a controller-managed temp dir so the per-CLI auth cache (`CODEX_HOME`, `CLAUDE_CONFIG_DIR` per [ADR-0003](ADR-0003-SUBSCRIPTION-ONLY-LIMITS.md)) lives inside the run directory rather than being inherited. PR7 deliberately did not implement that level of isolation — the env-overlay-on-os.environ semantics were locked at brainstorming Q1 ("env overlay" with a refinement note "so PATH and provider auth env survive unless tests explicitly override them"). Adding `HOME` redirection + .env-allowlist-hash filtering is appropriate when an adversarial-prompt or shared-machine threat model becomes Phase-1 scope.
+
+- **Wall-clock timeout** via `subprocess.run(..., timeout=...)` derived from the adapter's `timeout_seconds` constructor argument (default 600.0). The controller's watchdog (PR2) provides the outer process-level enforcement per [SECURITY_COST_REPRODUCIBILITY_SPEC](../security/SECURITY_COST_REPRODUCIBILITY_SPEC.md) §4.3; the in-wrapper timeout exists as the inner ring of a graceful-then-forceful kill sequence. `subprocess.TimeoutExpired` produces `ProviderResult(status="killed")` + `<killed:wall_clock_timeout>` artifact token.
 
 Stub providers ignore all of the above and synthesize results in pure Python.
 
