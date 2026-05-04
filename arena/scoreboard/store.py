@@ -199,8 +199,9 @@ class ScoreboardStore:
         # substring matching ("codex" in name). For the PR2 stub providers
         # (stub_codex, stub_claude) both produce identical counts, but a
         # future provider name like "mock_codex_v2" would be classified
-        # differently by the two paths. PR7's provider-family registry
-        # should unify both call sites — see governor.py TODO(PR7).
+        # differently by the two paths. A future provider-family
+        # registry should unify both call sites — see governor.py
+        # TODO(PR8+).
         conn = self._require_conn()
         row = conn.execute(
             "SELECT "

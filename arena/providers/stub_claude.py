@@ -407,7 +407,7 @@ class StubClaudeProvider(ProviderAdapter):
             ],
             "required_fixes": list(_RESEARCH_REVIEW_DEFAULT_REQUIRED_FIXES),
             "follow_up_recommendations": [
-                "After PR7's real Codex lands, re-run with the same fusion "
+                "When run against real Codex, re-run with the same fusion "
                 "and compare ROC-AUC against the calibration baseline.",
             ],
             "risk_level": _RESEARCH_REVIEW_DEFAULT_RISK_LEVEL,

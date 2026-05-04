@@ -11,8 +11,8 @@ from arena.self_improvement.champion_challenger import (
     compare_metrics,
 )
 
-# Phase-0 thresholds. These are deliberate Phase-0-stub defaults; PR7
-# may make them configurable.
+# Phase-0 thresholds. These are deliberate Phase-0-stub defaults; a
+# future PR may make them configurable.
 _CALIBRATION_BASELINE_SCORE = 0.5
 _WASTE_EVENTS_THRESHOLD = 5
 # Fixture success rate threshold: any single row with valid_submission
@@ -45,16 +45,17 @@ def scan_runs(
 
     Phase 0 checks cover the §7.3 triggers that can be derived from
     durable state. Protected-file mutation and schema drift are out of
-    scope until PR7's auto-apply flow exists.
+    scope; an auto-apply flow remains future work.
 
     `baselines_root` is intentionally accepted but unused in Phase 0.
     Spec §3.3 step 2 reserves it for "fixture-digest + provider-version
-    baseline" consumption — PR7 will wire it into the score-regression
-    check (currently hard-coded to `_CALIBRATION_BASELINE_SCORE = 0.5`)
-    and into a future drift_baseline trigger. Keeping the parameter in
-    the Phase-0 signature avoids a churning CLI signature when PR7
-    lands. `runs_root` is similarly accepted; the failed_replay trigger
-    consults `runs/<run_id>/traces/...` as a fallback path.
+    baseline" consumption — a future PR will wire it into the
+    score-regression check (currently hard-coded to
+    `_CALIBRATION_BASELINE_SCORE = 0.5`) and into a future
+    drift_baseline trigger. Keeping the parameter in the signature
+    avoids a churning CLI when that work lands. `runs_root` is similarly
+    accepted; the failed_replay trigger consults
+    `runs/<run_id>/traces/...` as a fallback path.
 
     Triggers:
     - blocked_row: any status="blocked" row.
@@ -80,7 +81,7 @@ def scan_runs(
     The +20% triggers use champion_challenger.compare_metrics so the
     comparison logic is a single library helper. In Phase-0 stub mode
     most stubs report zero wall_seconds, so these triggers fire only on
-    test fixtures that synthesize non-zero values (or PR7's real
+    test fixtures that synthesize non-zero values (or production CLI
     adapters). Tests in tests/test_self_improvement_scan.py exercise
     the triggers via direct row inserts.
     """

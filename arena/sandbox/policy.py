@@ -11,10 +11,15 @@ def _resolve(p: Path) -> Path:
 
 
 def _default_blocked_paths(workspace_root: Path | None = None) -> frozenset[Path]:
-    """Canonical secret/credential paths that providers must never read."""
+    """Canonical secret/credential/forensic paths providers must never read."""
     home = Path("~").expanduser().resolve()
     env_path = (
         _resolve(workspace_root / ".env") if workspace_root is not None else _resolve(Path(".env"))
+    )
+    traces_path = (
+        _resolve(workspace_root / "traces")
+        if workspace_root is not None
+        else _resolve(Path("traces"))
     )
     return frozenset(
         {
@@ -22,6 +27,7 @@ def _default_blocked_paths(workspace_root: Path | None = None) -> frozenset[Path
             home / ".codex",
             home / ".claude",
             env_path,
+            traces_path,
         }
     )
 
@@ -41,12 +47,15 @@ class SandboxPolicy:
         `worktrees/tabular_binary_v1/exp_0001/`). Anything outside — including
         sibling worktrees and fixtures — trips ProtectedFileBreaker.
     `blocked_paths`: directories the provider MUST NOT read. Two sources:
-        the four canonical secret stores (~/.kaggle, ~/.codex, ~/.claude,
-        .env — installed by every policy via _default_blocked_paths) PLUS
-        any per-packet `blocked_paths` entries (e.g.,
-        fixtures/<slug>/hidden_labels.csv — held-out evaluation labels).
-        Reads against any entry trip SecretAccessBreaker. Reads outside this
-        set are unrestricted (providers may load OS libs, read the rest of
+        the five canonical secret/forensic paths (~/.kaggle, ~/.codex,
+        ~/.claude, .env, traces/ — installed by every policy via
+        _default_blocked_paths) PLUS any per-packet `blocked_paths`
+        entries (e.g., fixtures/<slug>/hidden_labels.csv — held-out
+        evaluation labels). traces/ is the forensic-only stream
+        persistence path per ADR-0004; raw stdout/stderr live there
+        and must never re-enter provider context. Reads against any
+        entry trip SecretAccessBreaker. Reads outside this set are
+        unrestricted (providers may load OS libs, read the rest of
         fixtures/, etc.).
     `allowed_network_domains`: hostnames the provider MAY egress to. Matching
         is EXACT (no wildcards): an entry of `example.com` does NOT cover

@@ -14,8 +14,10 @@ class Breaker(StrEnum):
 
     PR2 owns the first five (provider-call/wall-clock/shell-command/
     repeated-failure/waste-event). PR3 owns secret-access, network-egress,
-    and protected-file. PR4 owns schema-violation. PR7 owns auth-failure.
-    The enum is defined in full now so event payloads stay schema-stable.
+    and protected-file. PR4 owns schema-violation. PR7 owns auth-failure
+    (real-adapter exit ≥64 / matching auth stderr regex; classifier
+    in arena/providers/auth.py). The enum is defined in full now so
+    event payloads stay schema-stable.
     """
 
     PROVIDER_CALL = "ProviderCallBreaker"

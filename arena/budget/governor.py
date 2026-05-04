@@ -36,10 +36,12 @@ class RunAccumulators:
     output_chars: int = 0
 
 
-# TODO(PR7): switch to exact-match or a provider-family registry once
-# real Codex/Claude adapters land. Substring matching is acceptable for
-# PR2 (only stub_codex and stub_claude exist and partition cleanly), but
-# a name like "claude_codex_hybrid" would match both helpers.
+# TODO(PR8+): switch to exact-match or a provider-family registry.
+# Substring matching is currently acceptable: stub_codex / stub_claude
+# (PR1-PR6) and codex / claude (PR7 real adapters) all partition
+# cleanly under "codex" in name / "claude" in name. A pathological
+# future name like "claude_codex_hybrid" would match both helpers
+# and miscount budget — registry would resolve that.
 def _is_codex(provider_name: str) -> bool:
     return "codex" in provider_name
 

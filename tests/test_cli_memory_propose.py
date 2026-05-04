@@ -115,9 +115,9 @@ def test_memory_propose_falls_through_to_follow_up_recommendations_when_required
         (fixture_workspace / "memory" / "proposals" / "mem_0001.json").read_text(encoding="utf-8")
     )
     # Default stub review's first follow_up_recommendation references
-    # PR7's real Codex; the synthesizer's fall-through path lifts that
-    # text verbatim into payload["claim"].
-    assert "pr7" in payload["claim"].lower()
+    # real Codex; the synthesizer's fall-through path lifts that text
+    # verbatim into payload["claim"].
+    assert "real codex" in payload["claim"].lower()
     assert payload["review_status"] == "proposed"
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,9 @@ from arena.observability.replay import replay_run
 from arena.observability.report import render_run_report
 from arena.observability.trace_store import TraceStore
 from arena.observability.version_baseline import record_fixture_hash, record_provider_version
-from arena.providers.base import ProviderAdapter, ProviderResult, UsageProxy
+from arena.providers.base import ProviderAdapter, ProviderResult, ProviderUnavailable, UsageProxy
+from arena.providers.health import HealthCode
+from arena.providers.health import check as health_check
 from arena.providers.stub_claude import StubClaudeProvider
 from arena.providers.stub_codex import StubCodexProvider
 from arena.research_proxy.fusion_proposal import (
@@ -64,6 +67,8 @@ memory_app = typer.Typer(help="Memory proposal commands.")
 app.add_typer(memory_app, name="memory")
 self_improve_app = typer.Typer(help="Self-improvement scan + freeze commands.")
 app.add_typer(self_improve_app, name="self-improve")
+provider_app = typer.Typer(help="Provider commands.")
+app.add_typer(provider_app, name="provider")
 console = Console()
 
 DB_PATH = Path("scoreboard.sqlite")
@@ -133,14 +138,79 @@ def _get_provider(
         return StubCodexProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
     if name == "stub_claude":
         return StubClaudeProvider(workspace_root=WORKTREE_ROOT, event_emitter=event_emitter)
+    if name in ("codex", "claude"):
+        # Local imports avoid pulling the real-adapter modules at CLI
+        # startup. They are only needed when a real provider is actually
+        # resolved, and keeping them lazy mirrors the import pattern used
+        # for arena.research_proxy.* elsewhere in this module.
+        from arena.providers.claude import RealClaudeProvider
+        from arena.providers.codex import RealCodexProvider
+
+        cls = RealCodexProvider if name == "codex" else RealClaudeProvider
+        h = health_check(name)
+        if h.code != HealthCode.OK:
+            raise ProviderUnavailable(
+                provider=name,
+                code=h.code.value,
+                detail=h.detail,
+                runbook=h.runbook,
+            )
+        if h.version is None:
+            # HealthCode.OK + version=None is a degenerate case: the
+            # health probe succeeded but no parseable version was
+            # extracted. Per spec §5, treat as ERROR so the
+            # provider-version baseline file is never written with a
+            # null version (which would silently break drift detection).
+            raise ProviderUnavailable(
+                provider=name,
+                code="error",
+                detail="--version probe returned no parseable version",
+                runbook=None,
+            )
+        return cls(
+            executable=name,
+            version=h.version,
+            event_emitter=event_emitter,
+        )
     raise typer.BadParameter(f"unknown provider: {name}")
 
 
 @app.command()
 def doctor() -> None:
-    """Run lightweight local readiness checks."""
-    validate_fixture_manifest("fixtures/tabular_binary_v1")
-    console.print("[green]arena doctor passed[/green]")
+    """Run lightweight local readiness checks.
+
+    Doctor is a readiness inventory, NOT a fail-fast gate. Every check
+    becomes a status line (green ✅ / yellow ⚠ / red ❌) and the command
+    always exits 0. The operator scans the printed lines and runs
+    `arena provider health <name>` (fail-fast surface) or `arena
+    fixture-smoke` for the actionable check that drove a red line.
+    """
+    # Fixture manifest. validate_fixture_manifest raises on a missing
+    # fixtures/ directory, missing manifest.yml, or schema-invalid
+    # manifest. Catching here keeps the inventory contract (doctor
+    # exits 0 always) — the operator-actionable signal is the red ❌
+    # line, not a non-zero exit. Per docs/phase0/runbooks/reboot.md.
+    try:
+        validate_fixture_manifest("fixtures/tabular_binary_v1")
+        console.print("[green]✅[/green] fixture manifest")
+    except (FileNotFoundError, ValueError, OSError) as e:
+        console.print(f"[red]❌[/red] fixture manifest: {type(e).__name__}: {e}")
+
+    # Provider CLIs — non-fatal status lines. `arena provider health
+    # <name>` is the fail-fast check.
+    for name in ("codex", "claude"):
+        h = health_check(name)
+        if h.code == HealthCode.OK:
+            console.print(f"[green]✅[/green] {h.provider} CLI: {h.version} ({h.detail})")
+        elif h.code == HealthCode.NOT_FOUND:
+            console.print(
+                f"[yellow]⚠[/yellow]  {h.provider} CLI: not installed (stub-only is fine for CI)"
+            )
+        else:
+            label = h.code.value.upper().replace("_", " ")
+            console.print(f"[red]❌[/red] {h.provider} CLI: {label} ({h.detail})")
+
+    console.print("arena doctor complete")
 
 
 @app.command("fixture-smoke")
@@ -172,7 +242,20 @@ def init_fixture(slug: str) -> None:
 
 
 @app.command("plan")
-def plan(slug: str) -> None:
+def plan(
+    slug: str,
+    provider: str = typer.Option(
+        "stub_codex",
+        "--provider",
+        help=(
+            "Provider name to plant in the calibration packet. Default "
+            "stub_codex preserves the pre-PR7 behaviour. eval-harness "
+            "passes 'codex' when --providers real, so the run-next "
+            "packet/adapter name check (peeked['provider'] != "
+            "adapter.name) does not reject the queued packet."
+        ),
+    ),
+) -> None:
     """Create a calibration task packet for the latest run."""
     run_id = _latest_run_id()
     if run_id is None:
@@ -189,7 +272,7 @@ def plan(slug: str) -> None:
         competition_slug=slug,
         task_id="task_0001",
         experiment_id=exp_id,
-        provider="stub_codex",
+        provider=provider,
     )
     queue.enqueue(packet)
     console.print(f"[green]planned task_0001 ({exp_id}) for {run_id}[/green]")
@@ -687,9 +770,10 @@ def research_proxy(
     check_can_invoke) leave the scoreboard untouched. Mirrors
     arena run-next in arena/cli.py:185-377.
     """
-    if provider not in {"stub_claude"}:
+    if provider not in {"stub_claude", "claude"}:
         raise typer.BadParameter(
-            f"unknown research provider {provider!r}; PR5 supports only stub_claude"
+            f"unknown research provider {provider!r}; "
+            "supported: stub_claude (PR5+) | claude (real adapter, PR7+)"
         )
 
     method_note_path = f"fixtures/{competition_slug}/paper_bundle/method_note_001.md"
@@ -1234,7 +1318,10 @@ def review(
     provider: str = typer.Option(
         "stub_claude",
         "--provider",
-        help="Provider to use for the review step. PR6 supports only stub_claude.",
+        help=(
+            "Provider to use for the review step. "
+            "Supported: stub_claude (PR6+) | claude (real adapter, PR7+)."
+        ),
     ),
     experiment: str = typer.Option(
         ...,
@@ -1258,9 +1345,10 @@ def review(
     drift = no row; post-invoke BudgetExceeded with usage_proxy =
     blocked row WITH consumed usage threaded through.
     """
-    if provider not in {"stub_claude"}:
+    if provider not in {"stub_claude", "claude"}:
         raise typer.BadParameter(
-            f"unknown review provider {provider!r}; PR6 supports only stub_claude"
+            f"unknown review provider {provider!r}; "
+            "supported: stub_claude (PR6+) | claude (real adapter, PR7+)"
         )
 
     store = _store()
@@ -1861,3 +1949,232 @@ def _finding_content_hash(problem: str, evidence_refs: list[str]) -> str:
         h.update(b"\x00")
         h.update(ref.encode("utf-8"))
     return h.hexdigest()
+
+
+@provider_app.command("health")
+def provider_health(name: str) -> None:
+    """Run a cheap, non-mutating health check for `<name>`.
+
+    Stubs (stub_codex, stub_claude) short-circuit. Real providers
+    (codex, claude) probe --version + --help. Output is a single line
+    plus an optional runbook reference. Exits 0 on OK, 1 on any other
+    HealthCode."""
+    h = health_check(name)
+    if h.code == HealthCode.OK:
+        line = f"[green]✅[/green] {h.provider}: {h.version}"
+        if h.sandbox_mode:
+            line += f" ({h.sandbox_mode}; {h.detail})"
+        else:
+            line += f" ({h.detail})"
+        console.print(line)
+        raise typer.Exit(0)
+    label = h.code.value.upper().replace("_", " ")
+    console.print(f"[red]❌[/red] {h.provider}: {label} ({h.detail})")
+    if h.runbook:
+        console.print(f"Runbook: {h.runbook}")
+    raise typer.Exit(1)
+
+
+@dataclass(frozen=True)
+class _StepResult:
+    name: str
+    status: str  # "ok" | "failed" | "skipped"
+    reason: str | None
+
+
+def _resolve_providers(providers: str) -> tuple[str, str]:
+    if providers == "stub":
+        return "stub_codex", "stub_claude"
+    if providers == "real":
+        return "codex", "claude"
+    raise typer.BadParameter(f"--providers must be 'stub' or 'real', got {providers!r}")
+
+
+def _lookup_latest_impl_row(slug: str, *, run_id: str) -> str | None:
+    store = _store()
+    try:
+        row = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id FROM experiments "
+                "WHERE competition_slug = ? AND run_id = ? "
+                "AND artifact_paths LIKE ? "
+                "ORDER BY experiment_id DESC LIMIT 1",
+                (slug, run_id, '%"<step:implementation>"%'),
+            )
+            .fetchone()
+        )
+    finally:
+        store.close()
+    return row["experiment_id"] if row else None
+
+
+def _lookup_latest_review_row(slug: str, *, run_id: str) -> str | None:
+    store = _store()
+    try:
+        row = (
+            store._require_conn()
+            .execute(
+                "SELECT experiment_id FROM experiments "
+                "WHERE competition_slug = ? AND run_id = ? "
+                "AND artifact_paths LIKE ? "
+                "ORDER BY experiment_id DESC LIMIT 1",
+                (slug, run_id, '%"<step:review>"%'),
+            )
+            .fetchone()
+        )
+    finally:
+        store.close()
+    return row["experiment_id"] if row else None
+
+
+def _render_step_table(steps: list[_StepResult]) -> None:
+    from rich.table import Table
+
+    table = Table(title="eval-harness step summary")
+    table.add_column("Step")
+    table.add_column("Status")
+    table.add_column("Reason")
+    for s in steps:
+        glyph = {"ok": "✅ ok", "failed": "❌ failed", "skipped": "⊘ skipped"}[s.status]
+        table.add_row(s.name, glyph, s.reason or "")
+    console.print(table)
+    failed = sum(1 for s in steps if s.status == "failed")
+    skipped = sum(1 for s in steps if s.status == "skipped")
+    ok = sum(1 for s in steps if s.status == "ok")
+    if failed == 0 and skipped == 0:
+        console.print(f"{ok}/{len(steps)} steps ok.")
+    else:
+        console.print(f"{ok}/{len(steps)} steps ok; {failed} failed; {skipped} skipped.")
+
+
+@app.command("eval-harness")
+def eval_harness(
+    competition_slug: str,
+    providers: str = typer.Option(
+        "stub",
+        "--providers",
+        help="'stub' (stub_codex + stub_claude) or 'real' (codex + claude).",
+    ),
+) -> None:
+    """Run the full Phase-0 sequence and report per-step status.
+
+    Continue-collect: a failed step does NOT abort the run; subsequent
+    steps with hard data dependencies skip with reason='prerequisite
+    missing in this run'. Status semantics = "step execution status",
+    NOT "no findings/no freeze". Exit 0 iff every step is ok or
+    skipped-by-design.
+    """
+    codex_provider, claude_provider = _resolve_providers(providers)
+    steps: list[_StepResult] = []
+
+    def run(name: str, fn: Any, *args: Any, **kwargs: Any) -> bool:
+        try:
+            fn(*args, **kwargs)
+        except typer.Exit as e:
+            code = e.exit_code or 0
+            if code == 0:
+                steps.append(_StepResult(name, "ok", None))
+                return True
+            steps.append(_StepResult(name, "failed", f"exit {code}"))
+            return False
+        except (
+            typer.BadParameter,
+            BudgetExceeded,
+            KillSwitchActive,
+            ProviderUnavailable,
+        ) as e:
+            steps.append(_StepResult(name, "failed", str(e) or type(e).__name__))
+            return False
+        steps.append(_StepResult(name, "ok", None))
+        return True
+
+    def skip(name: str, reason: str) -> None:
+        steps.append(_StepResult(name, "skipped", reason))
+
+    # Capture the run_id init-fixture creates, so all subsequent lookups
+    # filter by run_id (avoids cross-run row pickup; spec §3.2).
+    #
+    # CRITICAL: only adopt the run_id if init-fixture succeeded. If init
+    # fails while a stale prior run exists on disk, _latest_run_id()
+    # would return that stale run_id and the harness would silently
+    # operate on it (planning into the stale queue, looking up rows in
+    # the stale scoreboard slice, etc.). Capture conditionally; if init
+    # failed, skip every step that has a hard data dependency on a
+    # fresh run.
+    init_ok = run("init-fixture", init_fixture, competition_slug)
+    harness_run_id = _latest_run_id() if init_ok else None
+
+    if not init_ok:
+        skip("plan", "init-fixture failed")
+        skip("run-next (calibration)", "init-fixture failed")
+        skip("research-proxy", "init-fixture failed")
+        skip("evaluate", "init-fixture failed")
+        skip("review", "init-fixture failed")
+        skip("memory propose", "init-fixture failed")
+        # self-improve scan and report still run — they handle no-run
+        # state via their own BadParameter paths and are informative
+        # even on a fresh / broken workspace.
+        run("self-improve scan", self_improve_scan, competition_slug)
+        run("report", report, competition_slug)
+        _render_step_table(steps)
+        failed_count = sum(1 for s in steps if s.status == "failed")
+        raise typer.Exit(1 if failed_count > 0 else 0)
+
+    # init succeeded → harness_run_id is the fresh run we just minted.
+    # mypy can't propagate `init_ok=True ⇒ harness_run_id is not None`
+    # across the conditional expression (`_latest_run_id() if init_ok
+    # else None`), so narrow explicitly here. The assert is also a
+    # tiny runtime sanity check: init-fixture succeeded but
+    # _latest_run_id() returned None would be a controller bug we'd
+    # want to surface loudly rather than NPE deep inside a lookup.
+    assert harness_run_id is not None, "init-fixture succeeded but _latest_run_id() returned None"
+
+    # Pass codex_provider into plan() so the queued calibration packet's
+    # provider field matches what run-next will resolve to. Without this,
+    # `--providers real` mode plants 'stub_codex' in the packet but the
+    # adapter's name is 'codex' → run-next rejects via the
+    # peeked['provider'] != adapter.name check.
+    run("plan", plan, competition_slug, provider=codex_provider)
+    run("run-next (calibration)", run_next, competition_slug, provider=codex_provider)
+    run("research-proxy", research_proxy, competition_slug, provider=claude_provider)
+
+    # Step labels intentionally use bare names (no --experiment / --review
+    # suffixes) so the rendered table column is stable whether a step
+    # ran or skipped. Per-invocation IDs flow through the Reason column
+    # when relevant.
+    impl_exp_id = _lookup_latest_impl_row(competition_slug, run_id=harness_run_id)
+    if impl_exp_id:
+        run("evaluate", evaluate, competition_slug, latest=True)
+        if run(
+            "review",
+            review,
+            competition_slug,
+            provider=claude_provider,
+            experiment=impl_exp_id,
+        ):
+            review_exp_id = _lookup_latest_review_row(
+                competition_slug,
+                run_id=harness_run_id,
+            )
+            if review_exp_id:
+                run(
+                    "memory propose",
+                    memory_propose,
+                    competition_slug,
+                    review=review_exp_id,
+                )
+            else:
+                skip("memory propose", "review row not found in this run")
+    else:
+        skip("evaluate", "impl row not found in this run")
+        skip("review", "impl row not found in this run")
+        skip("memory propose", "review prerequisite missing in this run")
+
+    run("self-improve scan", self_improve_scan, competition_slug)
+    run("report", report, competition_slug)
+
+    _render_step_table(steps)
+
+    failed_count = sum(1 for s in steps if s.status == "failed")
+    raise typer.Exit(1 if failed_count > 0 else 0)
