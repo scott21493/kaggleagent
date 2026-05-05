@@ -18,11 +18,11 @@ arena provider health codex
 arena provider health claude
 ```
 
-- **`arena doctor`**: Readiness inventory — validates the fixture manifest and prints status lines for each provider CLI (green ✅ for OK, yellow ⚠ for NOT_FOUND, red ❌ for BLOCKED_AUTH / BLOCKED_PROVIDER_CAPABILITY / ERROR). **Always exits 0** (intentionally — doctor is an inventory, not a fail-fast gate). Read the printed lines to spot any red ❌ entries.
+- **`arena doctor`**: Readiness inventory — validates the fixture manifest and prints status lines for each provider CLI (green `OK` for OK, yellow `WARN` for NOT_FOUND, red `FAIL` for BLOCKED_AUTH / BLOCKED_PROVIDER_CAPABILITY / ERROR). **Always exits 0** (intentionally — doctor is an inventory, not a fail-fast gate). Read the printed lines to spot any red `FAIL` entries.
 - **`arena provider health codex`**: Fail-fast check — runs `codex --version` + `codex --help` (cheap, non-mutating). Exits 0 on `OK`, exits 1 on any other `HealthCode`. Prints the runbook reference on failure.
 - **`arena provider health claude`**: Same shape for Claude.
 
-`arena doctor` always exits 0; `arena provider health <name>` is the surface that returns non-zero on real auth/capability problems. If either provider health check exits 1 or doctor's output shows a red ❌ line, refer to the `auth_expiry.md` or `cli_regression.md` runbooks to diagnose and resolve.
+`arena doctor` always exits 0; `arena provider health <name>` is the surface that returns non-zero on real auth/capability problems. If either provider health check exits 1 or doctor's output shows a red `FAIL` line, refer to the `auth_expiry.md` or `cli_regression.md` runbooks to diagnose and resolve.
 
 ## State Reconstruction
 
@@ -56,7 +56,7 @@ The controller does **not** provide automatic task restart. This is intentional:
 
 No ongoing action is required after the reboot sequence passes. The controller will resume normal scheduling on the next `arena run-next` or similar command.
 
-If `arena doctor` shows a red ❌ provider line (it still exits 0):
+If `arena doctor` shows a red `FAIL` provider line (it still exits 0):
 - Refer to the error message for the specific repair step.
 - Common issues: missing fixture file, corrupted queue entry (very rare), or stale worktree (safe to delete manually).
 

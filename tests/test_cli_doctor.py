@@ -1,7 +1,7 @@
 # tests/test_cli_doctor.py
 """arena doctor — readiness inventory.
 
-Doctor exits 0 always; only the provider section's color/glyph reflects
+Doctor exits 0 always; only the provider section's color/label reflects
 status. `arena provider health <name>` is the fail-fast surface.
 """
 
@@ -68,7 +68,7 @@ def test_doctor_exits_0_with_red_line_when_fixture_manifest_missing(tmp_path, mo
     """The runbook contract is "always exits 0"; missing fixtures/
     directory used to crash with FileNotFoundError → exit 1, breaking
     the readiness-inventory semantics. Now wraps the validation in
-    try/except and surfaces the failure as a red ❌ line."""
+    try/except and surfaces the failure as a red FAIL line."""
     # Isolate to an empty cwd with no fixtures/ dir
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(

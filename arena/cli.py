@@ -70,6 +70,9 @@ app.add_typer(self_improve_app, name="self-improve")
 provider_app = typer.Typer(help="Provider commands.")
 app.add_typer(provider_app, name="provider")
 console = Console()
+OK_MARK = "[green]OK[/green]"
+WARN_MARK = "[yellow]WARN[/yellow]"
+FAIL_MARK = "[red]FAIL[/red]"
 
 DB_PATH = Path("scoreboard.sqlite")
 RUNS_ROOT = Path("runs")
@@ -180,7 +183,7 @@ def doctor() -> None:
     """Run lightweight local readiness checks.
 
     Doctor is a readiness inventory, NOT a fail-fast gate. Every check
-    becomes a status line (green ✅ / yellow ⚠ / red ❌) and the command
+    becomes a status line (green OK / yellow WARN / red FAIL) and the command
     always exits 0. The operator scans the printed lines and runs
     `arena provider health <name>` (fail-fast surface) or `arena
     fixture-smoke` for the actionable check that drove a red line.
@@ -188,27 +191,25 @@ def doctor() -> None:
     # Fixture manifest. validate_fixture_manifest raises on a missing
     # fixtures/ directory, missing manifest.yml, or schema-invalid
     # manifest. Catching here keeps the inventory contract (doctor
-    # exits 0 always) — the operator-actionable signal is the red ❌
+    # exits 0 always) — the operator-actionable signal is the red FAIL
     # line, not a non-zero exit. Per docs/phase0/runbooks/reboot.md.
     try:
         validate_fixture_manifest("fixtures/tabular_binary_v1")
-        console.print("[green]✅[/green] fixture manifest")
+        console.print(f"{OK_MARK} fixture manifest")
     except (FileNotFoundError, ValueError, OSError) as e:
-        console.print(f"[red]❌[/red] fixture manifest: {type(e).__name__}: {e}")
+        console.print(f"{FAIL_MARK} fixture manifest: {type(e).__name__}: {e}")
 
     # Provider CLIs — non-fatal status lines. `arena provider health
     # <name>` is the fail-fast check.
     for name in ("codex", "claude"):
         h = health_check(name)
         if h.code == HealthCode.OK:
-            console.print(f"[green]✅[/green] {h.provider} CLI: {h.version} ({h.detail})")
+            console.print(f"{OK_MARK} {h.provider} CLI: {h.version} ({h.detail})")
         elif h.code == HealthCode.NOT_FOUND:
-            console.print(
-                f"[yellow]⚠[/yellow]  {h.provider} CLI: not installed (stub-only is fine for CI)"
-            )
+            console.print(f"{WARN_MARK} {h.provider} CLI: not installed (stub-only is fine for CI)")
         else:
             label = h.code.value.upper().replace("_", " ")
-            console.print(f"[red]❌[/red] {h.provider} CLI: {label} ({h.detail})")
+            console.print(f"{FAIL_MARK} {h.provider} CLI: {label} ({h.detail})")
 
     console.print("arena doctor complete")
 
@@ -1961,7 +1962,7 @@ def provider_health(name: str) -> None:
     HealthCode."""
     h = health_check(name)
     if h.code == HealthCode.OK:
-        line = f"[green]✅[/green] {h.provider}: {h.version}"
+        line = f"{OK_MARK} {h.provider}: {h.version}"
         if h.sandbox_mode:
             line += f" ({h.sandbox_mode}; {h.detail})"
         else:
@@ -1969,7 +1970,7 @@ def provider_health(name: str) -> None:
         console.print(line)
         raise typer.Exit(0)
     label = h.code.value.upper().replace("_", " ")
-    console.print(f"[red]❌[/red] {h.provider}: {label} ({h.detail})")
+    console.print(f"{FAIL_MARK} {h.provider}: {label} ({h.detail})")
     if h.runbook:
         console.print(f"Runbook: {h.runbook}")
     raise typer.Exit(1)
@@ -2036,8 +2037,8 @@ def _render_step_table(steps: list[_StepResult]) -> None:
     table.add_column("Status")
     table.add_column("Reason")
     for s in steps:
-        glyph = {"ok": "✅ ok", "failed": "❌ failed", "skipped": "⊘ skipped"}[s.status]
-        table.add_row(s.name, glyph, s.reason or "")
+        status_label = {"ok": "ok", "failed": "failed", "skipped": "skipped"}[s.status]
+        table.add_row(s.name, status_label, s.reason or "")
     console.print(table)
     failed = sum(1 for s in steps if s.status == "failed")
     skipped = sum(1 for s in steps if s.status == "skipped")

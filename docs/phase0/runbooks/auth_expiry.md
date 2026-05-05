@@ -27,7 +27,7 @@ Either way, the controller stops issuing new real-provider work for the affected
 
 ## Symptoms
 
-- `arena provider health codex` (or `claude`) exits 1 and prints a red `❌ codex: BLOCKED AUTH (...)` line plus a `Runbook: docs/phase0/runbooks/auth_expiry.md` line.
+- `arena provider health codex` (or `claude`) exits 1 and prints a red `FAIL codex: BLOCKED AUTH (...)` line plus a `Runbook: docs/phase0/runbooks/auth_expiry.md` line.
 - A scoreboard row may show `status="blocked"` with `<blocked:AuthFailureBreaker>` and `<runbook:docs/phase0/runbooks/auth_expiry.md>` tokens in `artifact_paths` (within-invoke mode only — pre-invoke mode produces no row).
 - Console output may show "authentication failed," "credential expired," "Please re-authenticate," or similar phrasing in stderr scrubbed logs.
 

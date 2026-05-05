@@ -21,7 +21,7 @@ The health-check probe (`<exe> --version` or `<exe> --help`) returns exit code 2
 
 ## Symptoms
 
-- `arena provider health codex` or `arena provider health claude` exits with status 1 and prints a red `❌ codex: BLOCKED PROVIDER CAPABILITY (...)` line plus a `Runbook: docs/phase0/runbooks/cli_regression.md` line.
+- `arena provider health codex` or `arena provider health claude` exits with status 1 and prints a red `FAIL codex: BLOCKED PROVIDER CAPABILITY (...)` line plus a `Runbook: docs/phase0/runbooks/cli_regression.md` line.
 - Stderr or stdout shows "flag not recognized," "unexpected argument," "unrecognized option," or similar.
 - New `arena run-next` / `arena research-proxy` / `arena review` invocations against this provider exit with `typer.BadParameter` from `_get_provider`.
 - Older successful invocations may have emitted `<PROVIDER_VERSION_CHANGED:from=...>` artifact tokens on prior scoreboard rows — this is the drift signal, not a capability-blocked marker.

@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import pytest
+import typer
+from rich.console import Console
 from typer.testing import CliRunner
 
-from arena.cli import app
+from arena.cli import app, doctor, provider_health
+from arena.providers.health import HealthCode, ProviderHealth
+
+
+def _cp1252_console() -> tuple[Console, io.BytesIO, io.TextIOWrapper]:
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
+    return Console(file=stream, force_terminal=True, legacy_windows=True, width=100), buffer, stream
 
 
 def test_doctor_command() -> None:
@@ -17,6 +27,59 @@ def test_doctor_command() -> None:
     result = CliRunner().invoke(app, ["doctor"])
     assert result.exit_code == 0
     assert "arena doctor complete" in result.output
+
+
+def test_doctor_renders_on_cp1252_console(fixture_workspace, monkeypatch) -> None:
+    console, buffer, stream = _cp1252_console()
+    monkeypatch.setattr("arena.cli.console", console)
+
+    responses = iter(
+        [
+            ProviderHealth("codex", HealthCode.OK, "1.0.0", "workspace", "auth ok", None),
+            ProviderHealth("claude", HealthCode.NOT_FOUND, None, None, "missing", None),
+        ]
+    )
+    monkeypatch.setattr("arena.cli.health_check", lambda _name: next(responses))
+
+    doctor()
+    stream.flush()
+    output = buffer.getvalue().decode("cp1252")
+    assert "fixture manifest" in output
+    assert "arena doctor complete" in output
+
+
+def test_provider_health_renders_ok_on_cp1252_console(monkeypatch) -> None:
+    console, buffer, stream = _cp1252_console()
+    monkeypatch.setattr("arena.cli.console", console)
+    monkeypatch.setattr(
+        "arena.cli.health_check",
+        lambda _name: ProviderHealth("codex", HealthCode.OK, "1.0.0", "workspace", "auth ok", None),
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        provider_health("codex")
+    assert exc.value.exit_code == 0
+    stream.flush()
+    output = buffer.getvalue().decode("cp1252")
+    assert "codex" in output
+    assert "auth ok" in output
+
+
+def test_provider_health_renders_failure_on_cp1252_console(monkeypatch) -> None:
+    console, buffer, stream = _cp1252_console()
+    monkeypatch.setattr("arena.cli.console", console)
+    monkeypatch.setattr(
+        "arena.cli.health_check",
+        lambda _name: ProviderHealth("codex", HealthCode.ERROR, None, None, "boom", None),
+    )
+
+    with pytest.raises(typer.Exit) as exc:
+        provider_health("codex")
+    assert exc.value.exit_code == 1
+    stream.flush()
+    output = buffer.getvalue().decode("cp1252")
+    assert "codex" in output
+    assert "boom" in output
 
 
 def test_fixture_smoke_command() -> None:

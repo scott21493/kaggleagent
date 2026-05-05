@@ -7,9 +7,12 @@ full table.
 
 from __future__ import annotations
 
+import io
+
+from rich.console import Console
 from typer.testing import CliRunner
 
-from arena.cli import app
+from arena.cli import _render_step_table, _StepResult, app
 
 
 def test_eval_harness_stub_happy_path_exits_0(fixture_workspace, monkeypatch):
@@ -96,6 +99,29 @@ def test_eval_harness_si_freeze_does_not_mark_step_failed(
     assert "self-improve scan" in result.output
     # The 9/9 ok line still holds in the happy path
     assert "9/9 steps ok" in result.output or "ok" in result.output.lower()
+
+
+def test_eval_harness_step_table_renders_on_cp1252_console(monkeypatch) -> None:
+    """Windows cp1252 terminals must not crash on the final step table."""
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", errors="strict")
+    monkeypatch.setattr(
+        "arena.cli.console",
+        Console(file=stream, force_terminal=True, legacy_windows=True, width=80),
+    )
+
+    _render_step_table(
+        [
+            _StepResult("init-fixture", "ok", None),
+            _StepResult("review", "failed", "exit 1"),
+            _StepResult("memory propose", "skipped", "review failed"),
+        ]
+    )
+    stream.flush()
+    output = buffer.getvalue().decode("cp1252")
+    assert "init-fixture" in output
+    assert "review" in output
+    assert "memory propose" in output
 
 
 def test_eval_harness_real_mode_routes_packets_to_codex(
