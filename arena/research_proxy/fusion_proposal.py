@@ -14,13 +14,16 @@ def make_fusion_proposal_packet(
     task_id: str,
     fusion_id: str,
     digest_path: str,
+    provider: str = "stub_claude",
 ) -> dict[str, Any]:
-    """Build the task_packet that asks stub_claude to propose a method
-    fusion grounded in a previously-emitted paper_digest.
+    """Build the task_packet that asks the configured Claude provider
+    (stub_claude or real claude) to propose a method fusion grounded
+    in a previously-emitted paper_digest. See question_generator.py
+    for the rationale behind the `provider` parameter.
 
     The digest path is included in `inputs` so the sandbox treats it
     as a readable input (it lives under the experiment's own worktree
-    after the previous step's stub_claude invocation). The output
+    after the previous step's Claude invocation). The output
     (fusion_proposal.json) lands alongside it.
     """
     return {
@@ -28,7 +31,7 @@ def make_fusion_proposal_packet(
         "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
-        "provider": "stub_claude",
+        "provider": provider,
         "role": "research_proxy",
         "phase": "FUSION_PROPOSAL_CREATED",
         "objective": (

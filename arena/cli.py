@@ -1028,6 +1028,7 @@ def research_proxy(
             task_id=rq_task,
             question_id="rq_0001",
             source_refs=[method_note_path],
+            provider=research_adapter.name,
         )
         rq_result = _guarded_invoke(research_adapter, rq_packet)
         rq_artifact = _require_artifact(
@@ -1066,6 +1067,7 @@ def research_proxy(
             task_id=digest_task,
             digest_id="pd_0001",
             method_note_path=method_note_path,
+            provider=research_adapter.name,
         )
         digest_result = _guarded_invoke(research_adapter, digest_packet)
         digest_artifact = _require_artifact(
@@ -1104,6 +1106,7 @@ def research_proxy(
             task_id=fp_task,
             fusion_id="fusion_0001",
             digest_path=digest_artifact,
+            provider=research_adapter.name,
         )
         fp_result = _guarded_invoke(research_adapter, fp_packet)
         fp_artifact = _require_artifact(
@@ -1533,6 +1536,7 @@ def review(
         subject_experiment_id=experiment,
         fusion_proposal_path=fusion_proposal_path,
         submission_path=submission_path,
+        provider=review_adapter.name,
     )
 
     in_flight: dict[str, str | bool | None] = {

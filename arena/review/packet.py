@@ -16,10 +16,17 @@ def make_review_packet(
     subject_experiment_id: str,
     fusion_proposal_path: str,
     submission_path: str,
+    provider: str = "stub_claude",
 ) -> dict[str, Any]:
-    """Build the task_packet that asks stub_claude to emit a
-    research_review.json reviewing the implementation row identified by
+    """Build the task_packet that asks the configured Claude provider
+    (stub_claude or real claude) to emit a research_review.json
+    reviewing the implementation row identified by
     `subject_experiment_id`.
+
+    `provider` defaults to ``"stub_claude"`` for backward compatibility
+    with PR6 callers; PR7's `arena review --provider claude` threads
+    ``"claude"`` through so the queued packet's provider field matches
+    the resolved adapter.
 
     `submission_path` is placed at inputs[0] so the stub can extract
     subject_id via _read_subject_id_from_inputs (parses the worktree
@@ -36,7 +43,7 @@ def make_review_packet(
         "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
-        "provider": "stub_claude",
+        "provider": provider,
         "role": "review",
         "phase": "FUSION_PROXY_REVIEWED",
         "objective": (

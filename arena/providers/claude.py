@@ -149,12 +149,29 @@ class RealClaudeProvider(ProviderAdapter):
                 runbook="docs/phase0/runbooks/cli_regression.md",
             )
 
+        # Claude CLI argv per `claude --help` (verified against the real
+        # @anthropic-ai/claude-code CLI, post-PR7 polish). Prior wrapper
+        # used --input <file> + --workspace <dir>; both flags do NOT
+        # exist on the real CLI. Correct shape:
+        #   -p / --print           : non-interactive mode
+        #   --output-format json   : single-JSON response (stdout parser
+        #                            assumes one JSON object — without
+        #                            this the model can emit prose)
+        #   --add-dir <DIR>        : grant tool access to the workspace
+        #                            directory; cwd is the implicit
+        #                            workspace
+        # Prompt is passed via stdin (subprocess input=...) — the CLI
+        # supports either a positional prompt arg OR stdin; we use stdin
+        # to avoid argv-length limits on long task packets and to keep
+        # the prompt out of the process listing.
+        # The prompt_file written above remains as an audit artifact in
+        # the workspace; it is no longer referenced in argv.
         argv = [
             resolved_exe,
             "-p",
-            "--input",
-            str(prompt_file),
-            "--workspace",
+            "--output-format",
+            "json",
+            "--add-dir",
             str(workspace),
         ]
         effective_env = {**os.environ, **self._env_overlay}
@@ -165,6 +182,7 @@ class RealClaudeProvider(ProviderAdapter):
         try:
             proc = subprocess.run(
                 argv,
+                input=prompt_json,  # prompt → stdin (see argv comment)
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

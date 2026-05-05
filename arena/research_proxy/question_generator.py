@@ -57,9 +57,18 @@ def make_research_question_packet(
     task_id: str,
     question_id: str,
     source_refs: list[str],
+    provider: str = "stub_claude",
 ) -> dict[str, Any]:
-    """Build the task_packet that asks stub_claude (or real Claude in production)
-    to emit a research_question.json artifact for `competition_slug`.
+    """Build the task_packet that asks the configured Claude provider
+    (stub_claude or real claude) to emit a research_question.json
+    artifact for `competition_slug`.
+
+    `provider` defaults to ``"stub_claude"`` for backward compatibility
+    with PR5/PR6 callers; PR7's `arena research-proxy --provider claude`
+    threads ``"claude"`` through so the queued packet's provider field
+    matches the resolved adapter (the run-next-style validation
+    `peeked["provider"] != adapter.name` would otherwise reject the
+    packet for real-mode users).
 
     The source_refs become the packet's `inputs` so the sandbox sees the
     method notes as readable. The packet's allowed_paths is the experiment's
@@ -70,7 +79,7 @@ def make_research_question_packet(
         "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
-        "provider": "stub_claude",
+        "provider": provider,
         "role": "research_proxy",
         "phase": "RESEARCH_QUESTION_CREATED",
         "objective": (

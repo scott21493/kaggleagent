@@ -22,12 +22,17 @@ Real Codex and Claude providers are invoked as subprocesses with the conventions
 **Invocation form:**
 
 ```text
-codex exec --json --workspace-write <workspace> [--prompt-file <path>]
+codex exec --json -s workspace-write -C <workspace> --skip-git-repo-check
+  ↑ prompt JSON piped via stdin
 ```
 
-The exact flag spelling was verified at PR7 close-out and is pinned in the §"Resolved at PR7" section below. If a future CLI version changes the spelling, `arena provider health` returns `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md` for the operator update loop) and `record_provider_version` flags drift via `<PROVIDER_VERSION_CHANGED:from=...>` artifact tokens.
+Verified against the real `@openai/codex-cli` (post-PR7-close polish, 2026-05-05). The PR7-shipped wrapper used `--workspace-write <workspace>` and `--prompt-file <path>` — neither is a real flag on `codex exec`:
+- `--workspace-write` is NOT a top-level flag; it is a **value** of `-s/--sandbox` (e.g. `-s workspace-write`).
+- `--prompt-file` does not exist; the prompt is the positional `[PROMPT]` arg OR via stdin.
 
-**Stdin contract:** the task packet JSON, written to a temp file, passed via `--prompt-file`. Inline stdin is avoided because some Windows + WSL2 + provider-CLI combinations mishandle it.
+If a future CLI version changes the spelling, `arena provider health` returns `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md` for the operator update loop) and `record_provider_version` flags drift via `<PROVIDER_VERSION_CHANGED:from=...>` artifact tokens.
+
+**Stdin contract:** the task packet JSON is written to an audit copy at `<workspace>/.arena_prompts/prompt_<task_id>.json` (forensic trail) AND piped to the subprocess via `subprocess.run(..., input=prompt_json, ...)`. The earlier ADR draft preferred a `--prompt-file` indirection to avoid a Windows + WSL2 + stdin edge case; that flag does not exist on the real CLI, so we use stdin and accept the platform risk. The audit copy on disk preserves the prior reproducibility benefit.
 
 **Stdout contract:** newline-delimited JSON events. The wrapper buffers all events, applies the scrubber to each line, and persists raw + scrubbed copies to `traces/<run_id>/<task_id>/{stdout.raw, stdout.scrubbed}` via `TraceStore.write_provider_streams(...)`. The final event is expected to summarize artifacts and usage; if absent, the wrapper marks the result `status="failure"` and appends a `<failure:missing_terminal_event>` artifact token. (`ProviderResult.status` enum is closed: `success | failure | blocked | killed | interrupted` — sub-status detail flows through artifact tokens, never as a `reason` field, since `provider_result.schema.json` sets `additionalProperties: false`.)
 
@@ -49,12 +54,18 @@ The exact flag spelling was verified at PR7 close-out and is pinned in the §"Re
 **Invocation form:**
 
 ```text
-claude -p [--input <prompt-file>] [--workspace <workspace>]
+claude -p --output-format json --add-dir <workspace>
+  ↑ prompt JSON piped via stdin
 ```
 
-The exact flag spelling was verified at PR7 close-out (see §"Resolved at PR7" below). Older docs reference `claude --print`; both are equivalent in current versions.
+Verified against the real `@anthropic-ai/claude-code` CLI (post-PR7-close polish, 2026-05-05). The PR7-shipped wrapper used `--input <prompt-file>` and `--workspace <workspace>` — neither flag exists on the real CLI:
+- `--input` does not exist; `--input-format` is a different flag (controls input encoding format, not file path). The prompt is supplied as the positional `[prompt]` arg OR via stdin.
+- `--workspace` does not exist; the workspace concept is implicit (the cwd) and additional access is granted via `--add-dir <DIR>`.
+- `--output-format json` was added so the model is forced to return a single JSON object that the wrapper's parser can consume reliably (closes a brittleness gap caught in the post-PR7 review).
 
-**Stdin contract:** the task packet JSON or the rendered prompt (depending on role), written to a temp file, passed via `--input`. The wrapper does not pipe via stdin for the same Windows/WSL2 reason.
+Older docs reference `claude --print`; that flag is now `-p`/`--print` (both forms accepted in current versions).
+
+**Stdin contract:** the task packet JSON is written to an audit copy at `<workspace>/.arena_prompts/prompt_<task_id>.json` (forensic trail) AND piped to the subprocess via `subprocess.run(..., input=prompt_json, ...)`. Same shape as Codex.
 
 **Stdout contract:** single JSON object whose shape depends on the task `(role, phase)`. The wrapper dispatches via the `_ROLE_PHASE_TO_SCHEMA` table in `arena/providers/claude.py`:
 
@@ -118,10 +129,11 @@ Stub providers ignore all of the above and synthesize results in pure Python.
 
 The wrapper implementations verified the following points and confirmed them inline:
 
-1. **Exact flag spelling:** verified against the installed CLI versions.
-   - Codex: `[exec, --json, --workspace-write, <ws>, --prompt-file, <path>]`
-   - Claude: `[-p, --input, <path>, --workspace, <ws>]`
-   - Note: real CLI version drift is detected via `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md`).
+1. **Exact flag spelling.** PR7 originally pinned a flag set against our own shims, NOT against the installed real CLIs. A post-close review caught the drift; the wrappers were corrected and the flags below were verified against `claude --help` and `codex exec --help` on 2026-05-05.
+   - **Codex:** `[exec, --json, -s, workspace-write, --cd, <ws>, --skip-git-repo-check]`; prompt via stdin. (PR7 shipped `[exec, --json, --workspace-write, <ws>, --prompt-file, <path>]`, which the real CLI rejects: `--workspace-write` is a value of `-s/--sandbox`, and `--prompt-file` does not exist.)
+   - **Claude:** `[-p, --output-format, json, --add-dir, <ws>]`; prompt via stdin. (PR7 shipped `[-p, --input, <path>, --workspace, <ws>]`, which the real CLI rejects: `--input` and `--workspace` do not exist; the workspace is implicit cwd + `--add-dir` for additional access; `--output-format json` is recommended to force a parseable single-JSON response.)
+   - Real CLI version drift is detected via `BLOCKED_PROVIDER_CAPABILITY` (see `docs/phase0/runbooks/cli_regression.md`).
+   - Lesson: shim-only verification is necessary but not sufficient. The shim accepts whatever argv we throw at it; only `<exe> --help` against the actual installed CLI catches drift between our wrapper and the real flag set. The cli_regression.md maintenance loop is the right home for catching future drift.
 
 2. **Auth-expiry stderr fingerprint:** conservative seed list pinned at `arena/providers/auth.py::AUTH_EXPIRY_PATTERNS`. Marked "not real-provider-verified yet"; first real auth-failure observation refreshes the list per the maintenance loop in `docs/phase0/runbooks/auth_expiry.md`.
 
