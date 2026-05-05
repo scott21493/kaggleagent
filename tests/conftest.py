@@ -32,8 +32,11 @@ def shim_codex_executable(tmp_path: Path) -> Path:
       - ARENA_SHIM_EXIT_CODE: integer exit code (default 0)
       - ARENA_SHIM_STDOUT: NDJSON event stream to emit on stdout
       - ARENA_SHIM_STDERR: stderr text to emit
-      - ARENA_SHIM_PROMPT_FILE_VAR: env var name to write the prompt
-        path into (so tests can verify --prompt-file argv handling)
+      - ARENA_SHIM_RECORD_PATH: file path; if set, the shim writes the
+        full stdin contents (the prompt JSON) here so tests can assert
+        the wrapper passed the prompt correctly. Replaces the old
+        --prompt-file argv-recording mechanism (post-PR7-polish: real
+        codex exec has no --prompt-file flag; prompt is via stdin).
 
     Returns the absolute path to the executable. On Windows, a .cmd
     wrapper points at python invoking the script."""
@@ -44,14 +47,12 @@ import os, sys
 exit_code = int(os.environ.get("ARENA_SHIM_EXIT_CODE", "0"))
 sys.stdout.write(os.environ.get("ARENA_SHIM_STDOUT", ""))
 sys.stderr.write(os.environ.get("ARENA_SHIM_STDERR", ""))
-# Record the --prompt-file argv slot if requested:
-var = os.environ.get("ARENA_SHIM_PROMPT_FILE_VAR")
-if var:
-    for i, a in enumerate(sys.argv):
-        if a == "--prompt-file" and i + 1 < len(sys.argv):
-            with open(os.environ.get("ARENA_SHIM_RECORD_PATH", os.devnull), "w") as f:
-                f.write(sys.argv[i + 1])
-            break
+# Record stdin (the prompt JSON) if a path is configured. Real codex
+# exec receives the prompt via stdin; the shim mirrors that contract.
+record_path = os.environ.get("ARENA_SHIM_RECORD_PATH")
+if record_path:
+    with open(record_path, "w", encoding="utf-8") as f:
+        f.write(sys.stdin.read())
 sys.exit(exit_code)
 """,
         encoding="utf-8",

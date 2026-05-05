@@ -352,8 +352,8 @@ def test_invoke_uses_packet_allowed_paths_workspace(
     """Production callers (run-next, research-proxy) populate
     packet.allowed_paths[0] with the per-experiment worktree. The
     adapter MUST use that path for prompt files, subprocess cwd, and
-    --workspace-write — NOT the static self._cwd. Otherwise codex runs
-    from the repo root and PR3's packet-scoped write boundary breaks.
+    --cd — NOT the static self._cwd. Otherwise codex runs from the
+    repo root and PR3's packet-scoped write boundary breaks.
     """
     captured: dict = {}
 
@@ -386,9 +386,15 @@ def test_invoke_uses_packet_allowed_paths_workspace(
     assert captured["cwd"] == str(expected_workspace), (
         f"subprocess cwd must be packet workspace, got {captured['cwd']!r}"
     )
-    # --workspace-write argument also points at the packet workspace
-    ws_idx = captured["argv"].index("--workspace-write")
-    assert captured["argv"][ws_idx + 1] == str(expected_workspace)
+    # --cd argument points at the packet workspace (PR7-polish: real
+    # codex exec has no --workspace-write top-level flag; --cd is the
+    # working-directory selector and -s workspace-write is the sandbox
+    # mode value).
+    cd_idx = captured["argv"].index("--cd")
+    assert captured["argv"][cd_idx + 1] == str(expected_workspace)
+    # Sandbox mode is the -s value, not a standalone flag.
+    s_idx = captured["argv"].index("-s")
+    assert captured["argv"][s_idx + 1] == "workspace-write"
     # Prompt file landed under the packet workspace, NOT under tmp_path root
     prompt_file = expected_workspace / ".arena_prompts" / "prompt_task_0001.json"
     assert prompt_file.exists(), f"prompt file missing at {prompt_file}"
@@ -506,8 +512,12 @@ def test_shim_invoke_argv_is_correct(
     tmp_path: Path,
     shim_codex_executable: Path,
 ) -> None:
-    """Real subprocess: codex shim sees the right argv structure."""
-    record_path = tmp_path / "argv_record.txt"
+    """Real subprocess: codex shim sees the right argv structure AND
+    receives the prompt JSON via stdin (post-PR7-polish: real codex
+    exec has no --prompt-file flag; prompt is via stdin or positional).
+    The shim writes its received stdin to ARENA_SHIM_RECORD_PATH so we
+    can assert the wrapper passed the full task packet."""
+    record_path = tmp_path / "stdin_record.txt"
     ts = TraceStore(run_id="run_test", root=tmp_path)
     p = RealCodexProvider(
         executable=str(shim_codex_executable),
@@ -515,17 +525,20 @@ def test_shim_invoke_argv_is_correct(
         cwd=tmp_path,
         env={
             "ARENA_SHIM_STDOUT": '{"event":"done","artifacts":[],"usage":{}}\n',
-            "ARENA_SHIM_PROMPT_FILE_VAR": "1",
             "ARENA_SHIM_RECORD_PATH": str(record_path),
         },
         event_emitter=ts,
     )
-    result = p.invoke(_packet())
+    packet = _packet()
+    result = p.invoke(packet)
     assert result.status == "success"
-    # Shim recorded the prompt-file path; should point inside .arena_prompts/
+    # Shim recorded its stdin; the wrapper must have piped the full
+    # task_packet JSON through subprocess.run(input=...).
     recorded = record_path.read_text(encoding="utf-8")
-    assert ".arena_prompts" in recorded
-    assert recorded.endswith("prompt_task_0001.json")
+    assert recorded, "shim received empty stdin; wrapper failed to pipe prompt"
+    parsed = json.loads(recorded)
+    assert parsed["task_id"] == packet["task_id"]
+    assert parsed["schema_version"] == "task_packet.v1"
 
 
 def test_shim_invoke_full_pipeline_writes_traces(

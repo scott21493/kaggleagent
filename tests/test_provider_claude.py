@@ -2,7 +2,7 @@
 """RealClaudeProvider: monkeypatch unit tests + shim integration tests.
 
 Mirrors test_provider_codex.py with Claude-specific assertions:
-  - argv shape (`-p --input <path> --workspace <ws>`)
+  - argv shape (`-p --output-format json --add-dir <ws>`; prompt via stdin)
   - stdout is a SINGLE JSON object (not NDJSON)
   - role+phase dispatch to research_review / paper_digest / etc.
 """
@@ -200,7 +200,7 @@ def test_invoke_uses_packet_allowed_paths_workspace(
 ) -> None:
     """Production callers populate packet.allowed_paths[0] with the
     per-experiment worktree. The adapter MUST use that path for prompt
-    files, subprocess cwd, --workspace flag, AND advisory artifact
+    files, subprocess cwd, --add-dir flag, AND advisory artifact
     materialization. Without this, repeated invocations would
     overwrite a shared root-level <schema>.json file across runs;
     scoreboard rows from older runs would point at mutated artifacts.
@@ -246,9 +246,16 @@ def test_invoke_uses_packet_allowed_paths_workspace(
     assert captured["cwd"] == str(expected_workspace), (
         f"subprocess cwd must be packet workspace, got {captured['cwd']!r}"
     )
-    # --workspace argument also points at the packet workspace
-    ws_idx = captured["argv"].index("--workspace")
-    assert captured["argv"][ws_idx + 1] == str(expected_workspace)
+    # --add-dir argument points at the packet workspace (PR7-polish:
+    # real claude CLI has no --workspace flag; --add-dir grants the
+    # workspace tool access and cwd is the implicit workspace).
+    add_idx = captured["argv"].index("--add-dir")
+    assert captured["argv"][add_idx + 1] == str(expected_workspace)
+    # --output-format json forces single-JSON stdout (without it the
+    # model can emit prose and the parser falls into json_decode_error)
+    assert "--output-format" in captured["argv"]
+    fmt_idx = captured["argv"].index("--output-format")
+    assert captured["argv"][fmt_idx + 1] == "json"
     # Prompt file lands under the packet workspace
     prompt_file = expected_workspace / ".arena_prompts" / "prompt_task_0001.json"
     assert prompt_file.exists(), f"prompt file missing at {prompt_file}"

@@ -134,14 +134,36 @@ class RealCodexProvider(ProviderAdapter):
                 runbook="docs/phase0/runbooks/cli_regression.md",
             )
 
+        # Codex CLI argv per `codex exec --help` (verified against the
+        # real @openai/codex-cli, post-PR7 polish). Prior wrapper used
+        # --workspace-write <dir> and --prompt-file <path>; neither is a
+        # real flag on `codex exec`:
+        #   - "--workspace-write" is not a top-level flag; it is a VALUE
+        #     of -s/--sandbox, e.g. `-s workspace-write`.
+        #   - "--prompt-file" does not exist; the prompt is the
+        #     positional [PROMPT] arg OR stdin (we use stdin).
+        # Correct shape:
+        #   exec                      : non-interactive subcommand
+        #   --json                    : NDJSON event stream on stdout
+        #   -s workspace-write        : sandbox mode (matches our intent
+        #                               "let codex modify files in cwd")
+        #   -C / --cd <DIR>           : working directory the agent uses
+        #                               as its workspace root
+        #   --skip-git-repo-check     : workspaces are per-experiment
+        #                               worktrees, not git repos
+        # Prompt is passed via stdin (subprocess input=...) — same
+        # rationale as claude.py.
+        # The prompt_file remains as an audit artifact in the workspace;
+        # it is no longer referenced in argv.
         argv = [
             resolved_exe,
             "exec",
             "--json",
-            "--workspace-write",
+            "-s",
+            "workspace-write",
+            "--cd",
             str(workspace),
-            "--prompt-file",
-            str(prompt_file),
+            "--skip-git-repo-check",
         ]
         effective_env = {**os.environ, **self._env_overlay}
 
@@ -151,6 +173,7 @@ class RealCodexProvider(ProviderAdapter):
         try:
             proc = subprocess.run(
                 argv,
+                input=prompt_json,  # prompt → stdin (see argv comment)
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

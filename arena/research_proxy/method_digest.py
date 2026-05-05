@@ -29,9 +29,12 @@ def make_method_digest_packet(
     task_id: str,
     digest_id: str,
     method_note_path: str,
+    provider: str = "stub_claude",
 ) -> dict[str, Any]:
-    """Build the task_packet that asks stub_claude to digest one local
-    method note into a paper_digest.json artifact.
+    """Build the task_packet that asks the configured Claude provider
+    (stub_claude or real claude) to digest one local method note into
+    a paper_digest.json artifact. See question_generator.py for the
+    rationale behind the `provider` parameter.
 
     The method note path is included in `inputs` so the sandbox treats
     it as a readable input. The output (paper_digest.json) lands under
@@ -42,7 +45,7 @@ def make_method_digest_packet(
         "task_id": task_id,
         "competition_slug": competition_slug,
         "experiment_id": experiment_id,
-        "provider": "stub_claude",
+        "provider": provider,
         "role": "research_proxy",
         "phase": "METHOD_DIGEST_CREATED",
         "objective": (
